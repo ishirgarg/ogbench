@@ -9,7 +9,7 @@ import ml_collections
 import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCDiscreteActor, MLP, TransformedWithMode
+from utils.networks import GCActor, GCDiscreteActor, MLP, TransformedWithMode, default_init
 
 
 # ── Network modules ──────────────────────────────────────────────────────────
@@ -42,8 +42,15 @@ class EmpowermentValueNetwork(nn.Module):
         acts = jnp.eye(self.action_dim)[actions] if self.discrete else actions
         future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
         inputs = jnp.concatenate([obs, acts, skills, future], axis=-1)
-        logits = MLP((*self.hidden_dims, 1),
-                    activate_final=False, layer_norm=self.layer_norm)(inputs)
+        
+        # Build hidden layers
+        x = MLP(self.hidden_dims, activate_final=False, layer_norm=self.layer_norm)(inputs)
+        
+        logits = nn.Dense(
+            1,
+            kernel_init=default_init(scale=0.1),  # Smaller scale for final layer
+            bias_init=nn.initializers.constant(4.0)  # Bias to center around 0.5
+        )(x)
         # Apply negative softplus to ensure output is always negative
         return -jax.nn.softplus(logits[..., 0])
 
@@ -129,12 +136,12 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         return self.network.select('value')(observations, actions, skills_onehot,
                                             future_extracted, params=params)
 
-    def compute_v_logits(self, observations, skills_onehot, future_states, params=None):
+    def compute_v_logits(self, observations, skills_onehot, future_states, params=None, policy_params=None):
         """log V^z(s^+ | s) = MLP(s, π(s,z), z, s^+) with negative softplus.
 
         Wraps compute_q_logits with stop-gradient policy actions.
         """
-        policy_actions = self._policy_actions(observations, skills_onehot, params=None)
+        policy_actions = self._policy_actions(observations, skills_onehot, params=policy_params)
         return self.compute_q_logits(observations, policy_actions, skills_onehot,
                                      future_states, params=params)
 
@@ -146,11 +153,16 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         _, skills_onehot = self._sample_skills(rng, batch_size)
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
-        log_v = self.compute_v_logits(batch['observations'], skills_onehot, future)
+        log_v = self.compute_v_logits(batch['next_observations'], skills_onehot, future)
         log_q = self.compute_q_logits(batch['observations'], batch['actions'],
                                       skills_onehot, future, params=grad_params)
-        loss = -(jax.lax.stop_gradient(jnp.exp(log_v)) * log_q).mean()
-        return loss, {'q_loss': loss, 'q_log_mean': log_q.mean()}
+        v = jnp.exp(log_v)
+        _ = jax.debug.print("q_loss - log_v: mean={mean}, min={min}, max={max}", 
+                           mean=log_v.mean(), min=log_v.min(), max=log_v.max(), ordered=True)
+        _ = jax.debug.print("q_loss - v: mean={mean}, min={min}, max={max}", 
+                           mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
+        loss = -(jax.lax.stop_gradient(v) * log_q).mean()
+        return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean()}
 
     def v_loss(self, batch, grad_params, rng):
         """L_V from eqs. 16-17: Bellman backup for the occupancy V."""
@@ -165,13 +177,23 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                                            skills_onehot, future)
         log_v = self.compute_v_logits(batch['observations'], skills_onehot,
                                       future, params=grad_params)
+        v = jnp.exp(log_v)
+        _ = jax.debug.print("v_loss - log_v: mean={mean}, min={min}, max={max}", 
+                           mean=log_v.mean(), min=log_v.min(), max=log_v.max(), ordered=True)
+        _ = jax.debug.print("v_loss - v: mean={mean}, min={min}, max={max}", 
+                           mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
         loss_1 = -(self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_next)) * log_v).mean()
 
         # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s)
-        log_q_self = self.compute_q_logits(batch['observations'], actions_self,
+        log_q_self = self.compute_q_logits(batch['observations'], actions_next,
                                            skills_onehot, batch['observations'])
         log_v_self = self.compute_v_logits(batch['observations'], skills_onehot,
                                            batch['observations'], params=grad_params)
+        v_self = jnp.exp(log_v_self)
+        _ = jax.debug.print("v_loss - log_v_self: mean={mean}, min={min}, max={max}", 
+                           mean=log_v_self.mean(), min=log_v_self.min(), max=log_v_self.max(), ordered=True)
+        _ = jax.debug.print("v_loss - v_self: mean={mean}, min={min}, max={max}", 
+                           mean=v_self.mean(), min=v_self.min(), max=v_self.max(), ordered=True)
         target_self = (1 - self.config['discount']) + \
                       self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_self))
         loss_2 = -(target_self * log_v_self).mean()
@@ -192,13 +214,20 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         log_q_pi = self.compute_q_logits(batch['observations'], policy_actions,
                                          skills_onehot, future, params=None)
         q_pi = jnp.exp(log_q_pi)
+        # Debug: log q_pi values (force evaluation by using in a way that can't be optimized away)
+        _ = jax.debug.print("log_q_pi: mean={mean}, min={min}, max={max}", 
+                           mean=log_q_pi.mean(), min=log_q_pi.min(), max=log_q_pi.max(),
+                           ordered=True)
+        _ = jax.debug.print("q_pi: mean={mean}, min={min}, max={max}", 
+                           mean=q_pi.mean(), min=q_pi.min(), max=q_pi.max(),
+                           ordered=True)
 
         # V^{z'}(s^+ | s) for all K skills — stop-gradient, computed in parallel
         all_skills_onehot = jnp.eye(self.config['num_skills'])   # [K, K]
 
         def v_for_skill(skill_onehot):
             s_batch = jnp.repeat(skill_onehot[None, :], batch_size, axis=0)
-            return jnp.exp(self.compute_v_logits(batch['observations'], s_batch, future))
+            return jnp.exp(self.compute_v_logits(batch['observations'], s_batch, future, policy_params=grad_params))
 
         v_all = jax.vmap(v_for_skill)(all_skills_onehot)         # [K, batch]
 
