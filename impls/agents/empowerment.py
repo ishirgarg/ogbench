@@ -1,4 +1,5 @@
 from typing import Any, Optional, Sequence
+import copy
 
 import distrax
 import flax
@@ -144,6 +145,23 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         policy_actions = self._policy_actions(observations, skills_onehot, params=policy_params)
         return self.compute_q_logits(observations, policy_actions, skills_onehot,
                                      future_states, params=params)
+    
+    def compute_q_logits_target(self, observations, actions, skills_onehot, future_states):
+        """log Q^z(s^+ | s, a) using target network for stability.
+        
+        Uses target value network instead of main value network.
+        """
+        future_extracted = self._extract_future(future_states)
+        return self.network.select('target_value')(observations, actions, skills_onehot,
+                                                   future_extracted, params=None)
+    
+    def compute_v_logits_target(self, observations, skills_onehot, future_states, policy_params=None):
+        """log V^z(s^+ | s) using target network for stability.
+        
+        Uses target value network instead of main value network.
+        """
+        policy_actions = self._policy_actions(observations, skills_onehot, params=policy_params)
+        return self.compute_q_logits_target(observations, policy_actions, skills_onehot, future_states)
 
     # ── Losses ────────────────────────────────────────────────────────────────
 
@@ -151,7 +169,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         """L_Q = -V^z(s^+ | s) ⊳ log Q^z(s^+ | s, a)  (eq. 15)."""
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
-        log_v = self.compute_v_logits(batch['next_observations'], skills_onehot, future)
+        # Use target network for V from next_observations for stability
+        log_v = self.compute_v_logits_target(batch['next_observations'], skills_onehot, future)
         log_q = self.compute_q_logits(batch['observations'], batch['actions'],
                                       skills_onehot, future, params=grad_params)
         v = jnp.exp(log_v)
@@ -169,8 +188,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         actions_next = self._policy_actions(batch['observations'], skills_onehot, params=None)
         
         # Eq. 16: -γ Q^z(s^+ | s, π(s, z)) ⊳ log V^z(s^+ | s)
-        log_q_next = self.compute_q_logits(batch['observations'], actions_next,
-                                           skills_onehot, future)
+        # Use target network for Q in Bellman backup for stability
+        log_q_next = self.compute_q_logits_target(batch['observations'], actions_next,
+                                                  skills_onehot, future)
         log_v = self.compute_v_logits(batch['observations'], skills_onehot,
                                       future, params=grad_params)
         v = jnp.exp(log_v)
@@ -181,8 +201,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         loss_1 = - (jax.lax.stop_gradient(self.config['discount'] * jnp.exp(log_q_next)) * log_v + jax.lax.stop_gradient(1 - self.config['discount'] * jnp.exp(log_q_next)) * jnp.log(1 - jnp.exp(log_v))).mean()
 
         # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s)
-        log_q_self = self.compute_q_logits(batch['observations'], actions_next,
-                                           skills_onehot, batch['observations'])
+        # Use target network for Q in Bellman backup for stability
+        log_q_self = self.compute_q_logits_target(batch['observations'], actions_next,
+                                                  skills_onehot, batch['observations'])
         log_v_self = self.compute_v_logits(batch['observations'], skills_onehot,
                                            batch['observations'], params=grad_params)
         v_self = jnp.exp(log_v_self)
@@ -204,10 +225,11 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
         # Q^z(s^+ | s, π(s, z)) — gradients only through the policy (φ/ψ are fixed per eq. 12)
+        # Use target network for Q to prevent gradients through value network
         policy_actions = self._policy_actions(batch['observations'], skills_onehot,
                                               params=grad_params)
-        log_q_pi = self.compute_q_logits(batch['observations'], policy_actions,
-                                         skills_onehot, future, params=None)
+        log_q_pi = self.compute_q_logits_target(batch['observations'], policy_actions,
+                                                skills_onehot, future)
         q_pi = jnp.exp(log_q_pi)
         # Debug: log q_pi values (force evaluation by using in a way that can't be optimized away)
         _ = jax.debug.print("log_q_pi: mean={mean}, min={min}, max={max}", 
@@ -222,7 +244,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         def v_for_skill(skill_onehot):
             s_batch = jnp.repeat(skill_onehot[None, :], batch_size, axis=0)
-            return jnp.exp(self.compute_v_logits(batch['observations'], s_batch, future, policy_params=grad_params))
+            return jnp.exp(self.compute_v_logits_target(batch['observations'], s_batch, future, policy_params=grad_params))
 
         v_all = jax.vmap(v_for_skill)(all_skills_onehot)         # [K, batch]
 
@@ -257,12 +279,22 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         total = q_loss + v_loss + pi_loss
         return total, info
 
+    def target_update(self, network, module_name):
+        """Update the target network using soft update with tau."""
+        new_target_params = jax.tree_util.tree_map(
+            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
+            self.network.params[f'modules_{module_name}'],
+            self.network.params[f'modules_target_{module_name}'],
+        )
+        network.params[f'modules_target_{module_name}'] = new_target_params
+
     @jax.jit
     def update(self, batch):
         new_rng, rng = jax.random.split(self.rng)
         new_network, info = self.network.apply_loss_fn(
             loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
         )
+        self.target_update(new_network, 'value')
         return self.replace(network=new_network, rng=new_rng), info
 
     # ── Evaluation ────────────────────────────────────────────────────────────
@@ -347,10 +379,16 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         ex_future  = (ex_observations[:, jnp.array(obs_indices)]
                       if obs_indices is not None else ex_observations)
 
-        network_def = ModuleDict(dict(value=value_def, policy=policy_def))
+        # Create target value network (copy of value network)
+        target_value_def = copy.deepcopy(value_def)
+        
+        network_def = ModuleDict(dict(value=value_def, target_value=target_value_def, policy=policy_def))
         network_params = network_def.init(init_rng,
                                           value=(ex_observations, ex_actions, ex_skills, ex_future),
+                                          target_value=(ex_observations, ex_actions, ex_skills, ex_future),
                                           policy=(ex_observations, ex_skills))['params']
+        # Initialize target network with same params as main network
+        network_params['modules_target_value'] = network_params['modules_value']
         network = TrainState.create(network_def, network_params,
                                     tx=optax.adam(config.get('lr', 3e-4)))
 
@@ -371,6 +409,7 @@ def get_config():
         actor_hidden_dims=(512, 512, 512),
         layer_norm=True,
         discount=0.99,
+        tau=0.005,                   # Soft update coefficient for target network
         num_skills=5,                 # K: number of skills
         obs_indices=ml_collections.config_dict.placeholder(tuple),  # e.g. (0,1) for x,y
         discrete=False,
