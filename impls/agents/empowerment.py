@@ -147,10 +147,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
     # ── Losses ────────────────────────────────────────────────────────────────
 
-    def q_loss(self, batch, grad_params, rng):
+    def q_loss(self, batch, grad_params, skills_onehot):
         """L_Q = -V^z(s^+ | s) ⊳ log Q^z(s^+ | s, a)  (eq. 15)."""
-        batch_size = batch['observations'].shape[0]
-        _, skills_onehot = self._sample_skills(rng, batch_size)
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
         log_v = self.compute_v_logits(batch['next_observations'], skills_onehot, future)
@@ -164,10 +162,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         loss = -(jax.lax.stop_gradient(v) * log_q + jax.lax.stop_gradient(1 - v) * jnp.log(1 - jnp.exp(log_q))).mean()
         return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean()}
 
-    def v_loss(self, batch, grad_params, rng):
+    def v_loss(self, batch, grad_params, skills_onehot):
         """L_V from eqs. 16-17: Bellman backup for the occupancy V."""
-        batch_size = batch['observations'].shape[0]
-        _, skills_onehot = self._sample_skills(rng, batch_size)
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
         actions_next = self._policy_actions(batch['observations'], skills_onehot, params=None)
@@ -202,10 +198,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         return loss, {'v_loss': loss, 'v_loss_1': loss_1, 'v_loss_2': loss_2,
                       'v_log_mean': log_v.mean()}
 
-    def policy_loss(self, batch, grad_params, rng):
+    def policy_loss(self, batch, grad_params, skills, skills_onehot):
         """L_π = M log M - (1/K) Q^z log Q^z  (eq. 18)."""
         batch_size = batch['observations'].shape[0]
-        skills, skills_onehot = self._sample_skills(rng, batch_size)
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
         # Q^z(s^+ | s, π(s, z)) — gradients only through the policy (φ/ψ are fixed per eq. 12)
@@ -245,16 +240,18 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         rng = rng if rng is not None else self.rng
-        rng, q_rng, v_rng, pi_rng = jax.random.split(rng, 4)
+        # Sample skills once for all three losses
+        batch_size = batch['observations'].shape[0]
+        skills, skills_onehot = self._sample_skills(rng, batch_size)
         info = {}
 
-        q_loss, q_info = self.q_loss(batch, grad_params, q_rng)
+        q_loss, q_info = self.q_loss(batch, grad_params, skills_onehot)
         info.update({f'q/{k}': v for k, v in q_info.items()})
 
-        v_loss, v_info = self.v_loss(batch, grad_params, v_rng)
+        v_loss, v_info = self.v_loss(batch, grad_params, skills_onehot)
         info.update({f'v/{k}': v for k, v in v_info.items()})
 
-        pi_loss, pi_info = self.policy_loss(batch, grad_params, pi_rng)
+        pi_loss, pi_info = self.policy_loss(batch, grad_params, skills, skills_onehot)
         info.update({f'policy/{k}': v for k, v in pi_info.items()})
 
         total = q_loss + v_loss + pi_loss
