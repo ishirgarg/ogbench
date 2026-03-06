@@ -182,7 +182,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                            mean=log_v.mean(), min=log_v.min(), max=log_v.max(), ordered=True)
         _ = jax.debug.print("v_loss - v: mean={mean}, min={min}, max={max}", 
                            mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
-        loss_1 = -self.config['discount'] * (jax.lax.stop_gradient(jnp.exp(log_q_next)) * log_v + jax.lax.stop_gradient(1 - jnp.exp(log_q_next)) * jnp.log(1 - jnp.exp(log_v))).mean()
+        loss_1 = - (jax.lax.stop_gradient(self.config['discount'] * jnp.exp(log_q_next)) * log_v + jax.lax.stop_gradient(1 - self.config['discount'] * jnp.exp(log_q_next)) * jnp.log(1 - jnp.exp(log_v))).mean()
 
         # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s)
         log_q_self = self.compute_q_logits(batch['observations'], actions_next,
@@ -196,7 +196,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                            mean=v_self.mean(), min=v_self.min(), max=v_self.max(), ordered=True)
         target_self = (1 - self.config['discount']) + \
                       self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_self))
-        loss_2 = -(target_self * log_v_self + jax.lax.stop_gradient(1 - target_self) * jnp.log(1 - jnp.exp(log_v_self))).mean()
+        loss_2 = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(1 - target_self) * jnp.log(1 - jnp.exp(log_v_self))).mean()
 
         loss = loss_1 + loss_2
         return loss, {'v_loss': loss, 'v_loss_1': loss_1, 'v_loss_2': loss_2,
