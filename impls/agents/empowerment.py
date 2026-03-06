@@ -179,7 +179,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         _ = jax.debug.print("q_loss - v: mean={mean}, min={min}, max={max}", 
                            mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
         loss = -(jax.lax.stop_gradient(v) * log_q + jax.lax.stop_gradient(1 - v) * jnp.log(1 - jnp.exp(log_q))).mean()
-        return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean()}
+        return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean(), 'v_max': v.max(), 'v_min': v.min()}
 
     def v_loss(self, batch, grad_params, skills_onehot):
         """L_V from eqs. 16-17: Bellman backup for the occupancy V."""
@@ -217,7 +217,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         loss = loss_1 + loss_2
         return loss, {'v_loss': loss, 'v_loss_1': loss_1, 'v_loss_2': loss_2,
-                      'v_log_mean': log_v.mean()}
+                      'v_log_mean': log_v.mean(), 'v_max': v.max(), 'v_min': v.min()}
 
     def policy_loss(self, batch, grad_params, skills, skills_onehot):
         """L_π = M log M - (1/K) Q^z log Q^z  (eq. 18)."""
@@ -255,7 +255,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         m_log_m = m * jnp.log(m)
         q_log_q = (1.0 / self.config['num_skills']) * q_pi * jnp.log(q_pi)
         loss = -(m_log_m - q_log_q).mean()
-        return loss, {'policy_loss': loss, 'm_mean': m.mean(), 'q_pi_mean': q_pi.mean()}
+        return loss, {'policy_loss': loss, 'm_mean': m.mean(), 'q_pi_mean': q_pi.mean(), 'q_pi_max': q_pi.max(), 'q_pi_min': q_pi.min()}
 
     # ── Training ──────────────────────────────────────────────────────────────
 
