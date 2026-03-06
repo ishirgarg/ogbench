@@ -279,22 +279,20 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         total = q_loss + v_loss + pi_loss
         return total, info
 
-    def target_update(self, network, module_name):
-        """Update the target network using soft update with tau."""
-        new_target_params = jax.tree_util.tree_map(
-            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
-            self.network.params[f'modules_{module_name}'],
-            self.network.params[f'modules_target_{module_name}'],
-        )
-        network.params[f'modules_target_{module_name}'] = new_target_params
-
     @jax.jit
     def update(self, batch):
         new_rng, rng = jax.random.split(self.rng)
         new_network, info = self.network.apply_loss_fn(
             loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
         )
-        self.target_update(new_network, 'value')
+        # Update target network using soft update
+        new_target_params = jax.tree_util.tree_map(
+            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
+            new_network.params[f'modules_value'],
+            new_network.params[f'modules_target_value'],
+        )
+        new_params = {**new_network.params, f'modules_target_value': new_target_params}
+        new_network = new_network.replace(params=new_params)
         return self.replace(network=new_network, rng=new_rng), info
 
     # ── Evaluation ────────────────────────────────────────────────────────────
