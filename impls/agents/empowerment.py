@@ -9,67 +9,50 @@ import ml_collections
 import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCDiscreteActor, MLP, TransformedWithMode, default_init, GCBilinearValue
+from utils.networks import GCActor, GCDiscreteActor, MLP, TransformedWithMode, default_init
 
 
 # ── Network modules ──────────────────────────────────────────────────────────
 
 
-class EmpowermentBilinearNetwork(nn.Module):
-    """Bilinear discriminator h_θ(s,a,z,s^+) = φ(s,a,z)^T ψ(s^+) / √d.
-    
-    This represents the log-ratio of occupancy Q^z relative to the buffer distribution.
-    """
+class EmpowermentValueNetwork(nn.Module):
+    """MLP that computes log Q^z(s^+ | s, a) or log V^z(s^+ | s) from all 4 inputs."""
 
     hidden_dims: Sequence[int]
-    latent_dim: int
     action_dim: int
     num_skills: int
     layer_norm: bool = True
     discrete: bool = False
     gc_encoder: Optional[nn.Module] = None
 
-    def setup(self):
-        # φ(s, a, z) encoder
-        phi_input_dim = self.action_dim if self.discrete else self.action_dim
-        # We'll concatenate obs, action, and skill in the phi MLP
-        self.phi_mlp = MLP((*self.hidden_dims, self.latent_dim), 
-                          activate_final=False, layer_norm=self.layer_norm)
-        # ψ(s^+) encoder  
-        self.psi_mlp = MLP((*self.hidden_dims, self.latent_dim),
-                          activate_final=False, layer_norm=self.layer_norm)
-
-    def __call__(self, observations, actions, skills, future_states, params=None):
-        """Compute h_θ(s,a,z,s^+) = φ(s,a,z)^T ψ(s^+) / √d.
+    @nn.compact
+    def __call__(self, observations, actions, skills, future_states):
+        """Compute log Q^z(s^+ | s, a) or log V^z(s^+ | s).
         
         Args:
             observations: Current state s
-            actions: Action a
+            actions: Action a (or π(s, z) for V)
             skills: Skill one-hot z
             future_states: Future state s^+ (already extracted if obs_indices is set)
-            params: Optional parameters (for stop-gradient)
         
         Returns:
-            Scalar logit value
+            Scalar log value (always negative due to negative softplus)
         """
-        # Encode observations
         obs = self.gc_encoder(observations, None) if self.gc_encoder else observations
-        
-        # Encode actions
         acts = jnp.eye(self.action_dim)[actions] if self.discrete else actions
-        
-        # Concatenate [obs, action, skill] for phi
-        phi_input = jnp.concatenate([obs, acts, skills], axis=-1)
-        phi = self.phi_mlp(phi_input)
-        
-        # Encode future states for psi
         future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
-        psi = self.psi_mlp(future)
+        inputs = jnp.concatenate([obs, acts, skills, future], axis=-1)
         
-        # Bilinear form: φ^T ψ / √d
-        h = (phi * psi).sum(axis=-1) / jnp.sqrt(self.latent_dim)
+        # Build hidden layers
+        x = MLP(self.hidden_dims, activate_final=False, layer_norm=self.layer_norm)(inputs)
         
-        return h
+        logits = nn.Dense(
+            1,
+            kernel_init=default_init(scale=0.1),  # Smaller scale for final layer
+            bias_init=nn.initializers.constant(4.0)  # Bias to center around 0.5
+        )(x)
+        # Apply negative softplus to ensure output is always negative
+        return -jax.nn.softplus(logits[..., 0])
 
 
 class SkillConditionedActor(GCActor):
@@ -146,126 +129,110 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
     # ── Core value computations ────────────────────────────────────────────
 
-    def compute_h_theta(self, observations, actions, skills_onehot,
-                        future_states, params=None):
-        """h_θ(s,a,z,s^+) = φ(s,a,z)^T ψ(s^+) / √d (bilinear discriminator)."""
+    def compute_q_logits(self, observations, actions, skills_onehot,
+                         future_states, params=None):
+        """log Q^z(s^+ | s, a) = MLP(s, a, z, s^+) with negative softplus."""
         future_extracted = self._extract_future(future_states)
         return self.network.select('value')(observations, actions, skills_onehot,
                                             future_extracted, params=params)
-    
-    def compute_q_logits(self, observations, actions, skills_onehot,
-                         future_states, params=None):
-        """Alias for compute_h_theta for compatibility."""
-        return self.compute_h_theta(observations, actions, skills_onehot,
-                                    future_states, params=params)
-    
-    def compute_v_logits(self, observations, skills_onehot, future_states, 
-                         params=None, policy_params=None):
-        """V^z(s^+ | s) = Q^z(s^+ | s, π(s,z)) = h_θ(s, π(s,z), z, s^+).
-        
-        Wraps compute_h_theta with policy-sampled actions.
+
+    def compute_v_logits(self, observations, skills_onehot, future_states, params=None, policy_params=None):
+        """log V^z(s^+ | s) = MLP(s, π(s,z), z, s^+) with negative softplus.
+
+        Wraps compute_q_logits with stop-gradient policy actions.
         """
         policy_actions = self._policy_actions(observations, skills_onehot, params=policy_params)
-        return self.compute_h_theta(observations, policy_actions, skills_onehot,
-                                   future_states, params=params)
+        return self.compute_q_logits(observations, policy_actions, skills_onehot,
+                                     future_states, params=params)
 
     # ── Losses ────────────────────────────────────────────────────────────────
 
     def q_loss(self, batch, grad_params, rng):
-        """InfoNCE loss for Q: L_Q = -E[log exp(h_θ(s,a,z,s^+)) / (exp(h_θ(s,a,z,s^+)) + Σ exp(h_θ(s,a,z,s^-)))].
-        
-        Positive sampling:
-        - s^+ = value_goals (already discounted future samples from GCDataset)
-        
-        Negative sampling:
-        - Sample N random states from the batch
-        """
+        """L_Q = -V^z(s^+ | s) ⊳ log Q^z(s^+ | s, a)  (eq. 15)."""
         batch_size = batch['observations'].shape[0]
-        rng, skill_rng, neg_rng = jax.random.split(rng, 3)
-        _, skills_onehot = self._sample_skills(skill_rng, batch_size)
-        
-        # Use value_goals as positive future states (already discounted samples)
-        future_pos = batch['value_goals']
-        
-        # Sample negative future states (random states from batch)
-        num_negatives = self.config.get('num_negatives', batch_size)
-        neg_idxs = jax.random.randint(neg_rng, (batch_size, num_negatives), 0, batch_size)
-        neg_futures = batch['observations'][neg_idxs]  # [batch_size, num_negatives, obs_dim]
-        
-        # Compute h_θ for positive pairs
-        h_pos = self.compute_h_theta(batch['observations'], batch['actions'],
-                                     skills_onehot, future_pos, params=grad_params)
-        
-        # Compute h_θ for negative pairs
-        # Expand for broadcasting: [batch_size, 1, ...]
-        obs_expanded = jnp.expand_dims(batch['observations'], 1)
-        acts_expanded = jnp.expand_dims(batch['actions'], 1)
-        skills_expanded = jnp.expand_dims(skills_onehot, 1)
-        
-        # Reshape for batch processing: [batch_size * num_negatives, ...]
-        obs_flat = jnp.reshape(obs_expanded, (batch_size * num_negatives, -1))
-        acts_flat = jnp.reshape(acts_expanded, (batch_size * num_negatives, -1))
-        skills_flat = jnp.reshape(skills_expanded, (batch_size * num_negatives, -1))
-        neg_futures_flat = jnp.reshape(neg_futures, (batch_size * num_negatives, -1))
-        
-        h_neg_flat = self.compute_h_theta(obs_flat, acts_flat, skills_flat,
-                                          neg_futures_flat, params=grad_params)
-        h_neg = jnp.reshape(h_neg_flat, (batch_size, num_negatives))
-        
-        # InfoNCE loss: -log(exp(pos) / (exp(pos) + sum(exp(neg))))
-        # = -pos + log(exp(pos) + sum(exp(neg)))
-        h_neg_sum = jax.scipy.special.logsumexp(h_neg, axis=1)  # log(sum(exp(neg)))
-        h_pos_neg = jax.scipy.special.logsumexp(
-            jnp.stack([h_pos, h_neg_sum], axis=1), axis=1
-        )  # log(exp(pos) + sum(exp(neg)))
-        loss = -(h_pos - h_pos_neg).mean()
-        
-        q_pos = jnp.exp(h_pos)
-        _ = jax.debug.print("q_loss - h_pos: mean={mean}, min={min}, max={max}", 
-                           mean=h_pos.mean(), min=h_pos.min(), max=h_pos.max(), ordered=True)
-        _ = jax.debug.print("q_loss - q_pos: mean={mean}, min={min}, max={max}", 
-                           mean=q_pos.mean(), min=q_pos.min(), max=q_pos.max(), ordered=True)
-        
-        return loss, {'q_loss': loss, 'h_pos_mean': h_pos.mean(), 'q_pos_mean': q_pos.mean()}
+        _, skills_onehot = self._sample_skills(rng, batch_size)
+        future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
+        log_v = self.compute_v_logits(batch['next_observations'], skills_onehot, future)
+        log_q = self.compute_q_logits(batch['observations'], batch['actions'],
+                                      skills_onehot, future, params=grad_params)
+        v = jnp.exp(log_v)
+        _ = jax.debug.print("q_loss - log_v: mean={mean}, min={min}, max={max}", 
+                           mean=log_v.mean(), min=log_v.min(), max=log_v.max(), ordered=True)
+        _ = jax.debug.print("q_loss - v: mean={mean}, min={min}, max={max}", 
+                           mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
+        loss = -(jax.lax.stop_gradient(v) * log_q).mean()
+        return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean()}
+
+    def v_loss(self, batch, grad_params, rng):
+        """L_V from eqs. 16-17: Bellman backup for the occupancy V."""
+        batch_size = batch['observations'].shape[0]
+        _, skills_onehot = self._sample_skills(rng, batch_size)
+        future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
+
+        actions_next = self._policy_actions(batch['observations'], skills_onehot, params=None)
+        
+        # Eq. 16: -γ Q^z(s^+ | s, π(s, z)) ⊳ log V^z(s^+ | s)
+        log_q_next = self.compute_q_logits(batch['observations'], actions_next,
+                                           skills_onehot, future)
+        log_v = self.compute_v_logits(batch['observations'], skills_onehot,
+                                      future, params=grad_params)
+        v = jnp.exp(log_v)
+        _ = jax.debug.print("v_loss - log_v: mean={mean}, min={min}, max={max}", 
+                           mean=log_v.mean(), min=log_v.min(), max=log_v.max(), ordered=True)
+        _ = jax.debug.print("v_loss - v: mean={mean}, min={min}, max={max}", 
+                           mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
+        loss_1 = -(self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_next)) * log_v).mean()
+
+        # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s)
+        log_q_self = self.compute_q_logits(batch['observations'], actions_next,
+                                           skills_onehot, batch['observations'])
+        log_v_self = self.compute_v_logits(batch['observations'], skills_onehot,
+                                           batch['observations'], params=grad_params)
+        v_self = jnp.exp(log_v_self)
+        _ = jax.debug.print("v_loss - log_v_self: mean={mean}, min={min}, max={max}", 
+                           mean=log_v_self.mean(), min=log_v_self.min(), max=log_v_self.max(), ordered=True)
+        _ = jax.debug.print("v_loss - v_self: mean={mean}, min={min}, max={max}", 
+                           mean=v_self.mean(), min=v_self.min(), max=v_self.max(), ordered=True)
+        target_self = (1 - self.config['discount']) + \
+                      self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_self))
+        loss_2 = -(target_self * log_v_self).mean()
+
+        loss = loss_1 + loss_2
+        return loss, {'v_loss': loss, 'v_loss_1': loss_1, 'v_loss_2': loss_2,
+                      'v_log_mean': log_v.mean()}
 
     def policy_loss(self, batch, grad_params, rng):
-        """L_π = E_{s^+ ~ D} [M(s^+ | s, π(s,z), z) log M - (1/K) Q^z(s^+ | s, π(s,z)) log Q^z].
-        
-        Since V^z(s^+ | s) = Q^z(s^+ | s, π(s,z)), we only need Q.
-        M(s^+ | s, a, z) = (1/K) Σ_{z'} Q^{z'}(s^+ | s, π(s,z'))
-        """
+        """L_π = M log M - (1/K) Q^z log Q^z  (eq. 18)."""
         batch_size = batch['observations'].shape[0]
         skills, skills_onehot = self._sample_skills(rng, batch_size)
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
 
-        # Q^z(s^+ | s, π(s, z)) — gradients only through the policy (φ/ψ are fixed)
+        # Q^z(s^+ | s, π(s, z)) — gradients only through the policy (φ/ψ are fixed per eq. 12)
         policy_actions = self._policy_actions(batch['observations'], skills_onehot,
                                               params=grad_params)
-        h_pi = self.compute_h_theta(batch['observations'], policy_actions,
-                                    skills_onehot, future, params=None)
-        q_pi = jnp.exp(h_pi)
-        
-        _ = jax.debug.print("policy_loss - h_pi: mean={mean}, min={min}, max={max}", 
-                           mean=h_pi.mean(), min=h_pi.min(), max=h_pi.max(), ordered=True)
-        _ = jax.debug.print("policy_loss - q_pi: mean={mean}, min={min}, max={max}", 
-                           mean=q_pi.mean(), min=q_pi.min(), max=q_pi.max(), ordered=True)
+        log_q_pi = self.compute_q_logits(batch['observations'], policy_actions,
+                                         skills_onehot, future, params=None)
+        q_pi = jnp.exp(log_q_pi)
+        # Debug: log q_pi values (force evaluation by using in a way that can't be optimized away)
+        _ = jax.debug.print("log_q_pi: mean={mean}, min={min}, max={max}", 
+                           mean=log_q_pi.mean(), min=log_q_pi.min(), max=log_q_pi.max(),
+                           ordered=True)
+        _ = jax.debug.print("q_pi: mean={mean}, min={min}, max={max}", 
+                           mean=q_pi.mean(), min=q_pi.min(), max=q_pi.max(),
+                           ordered=True)
 
-        # V^{z'}(s^+ | s) = Q^{z'}(s^+ | s, π(s, z')) for all K skills — stop-gradient
+        # V^{z'}(s^+ | s) for all K skills — stop-gradient, computed in parallel
         all_skills_onehot = jnp.eye(self.config['num_skills'])   # [K, K]
 
         def v_for_skill(skill_onehot):
             s_batch = jnp.repeat(skill_onehot[None, :], batch_size, axis=0)
-            h = self.compute_v_logits(batch['observations'], s_batch, future, 
-                                     params=None, policy_params=grad_params)
-            return jnp.exp(h)
+            return jnp.exp(self.compute_v_logits(batch['observations'], s_batch, future, policy_params=grad_params))
 
         v_all = jax.vmap(v_for_skill)(all_skills_onehot)         # [K, batch]
 
         # M(s^+ | s, a, z) = (1/K) [Q^z + Σ_{z'≠z} V^{z'}]  (eq. 5)
-        # v_all[skills, jnp.arange(batch_size)] selects V^z for each sample
-        v_z = v_all[skills, jnp.arange(batch_size)]  # [batch]
-        v_others = v_all.sum(axis=0) - v_z  # Sum of all V^{z'} minus V^z
+        v_others = v_all.sum(axis=0) - v_all[skills, jnp.arange(batch_size)]
         m = (q_pi + v_others) / self.config['num_skills']
 
         m_log_m = m * jnp.log(m)
@@ -278,42 +245,27 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         rng = rng if rng is not None else self.rng
-        rng, q_rng, pi_rng = jax.random.split(rng, 3)
+        rng, q_rng, v_rng, pi_rng = jax.random.split(rng, 4)
         info = {}
 
         q_loss, q_info = self.q_loss(batch, grad_params, q_rng)
         info.update({f'q/{k}': v for k, v in q_info.items()})
 
+        v_loss, v_info = self.v_loss(batch, grad_params, v_rng)
+        info.update({f'v/{k}': v for k, v in v_info.items()})
+
         pi_loss, pi_info = self.policy_loss(batch, grad_params, pi_rng)
         info.update({f'policy/{k}': v for k, v in pi_info.items()})
 
-        total = q_loss + pi_loss
+        total = q_loss + v_loss + pi_loss
         return total, info
 
     @jax.jit
     def update(self, batch):
         new_rng, rng = jax.random.split(self.rng)
-        
-        # Compute gradients
-        grads, info = jax.grad(lambda p: self.total_loss(batch, p, rng=rng), has_aux=True)(self.network.params)
-        
-        # Compute gradient norms for each module
-        def compute_grad_norm(grad_tree):
-            """Compute L2 norm of gradients for a parameter tree."""
-            if not grad_tree:
-                return 0.0
-            grad_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_tree)], axis=0)
-            return jnp.linalg.norm(grad_flat)
-        
-        # Extract gradients for each module and compute norms
-        value_grads = grads.get('value', {})
-        policy_grads = grads.get('policy', {})
-        info['grad/value_norm'] = compute_grad_norm(value_grads)
-        info['grad/policy_norm'] = compute_grad_norm(policy_grads)
-        
-        # Apply gradients
-        new_network = self.network.apply_gradients(grads=grads)
-        
+        new_network, info = self.network.apply_loss_fn(
+            loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
+        )
         return self.replace(network=new_network, rng=new_rng), info
 
     # ── Evaluation ────────────────────────────────────────────────────────────
@@ -371,10 +323,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             enc = encoder_modules[config['encoder']]
             encoders = {k: GCEncoder(concat_encoder=enc()) for k in ('value', 'policy')}
 
-        latent_dim = config.get('latent_dim', 256)
-        value_def = EmpowermentBilinearNetwork(
+        value_def = EmpowermentValueNetwork(
             hidden_dims=config.get('value_hidden_dims', None) or hidden_dims,
-            latent_dim=latent_dim,
             action_dim=action_dim,
             num_skills=num_skills,
             layer_norm=config.get('layer_norm', True),
@@ -425,8 +375,6 @@ def get_config():
         layer_norm=True,
         discount=0.99,
         num_skills=5,                 # K: number of skills
-        latent_dim=256,               # d: latent dimension for bilinear form
-        num_negatives=256,            # N: number of negative samples for InfoNCE
         obs_indices=ml_collections.config_dict.placeholder(tuple),  # e.g. (0,1) for x,y
         discrete=False,
         const_std=True,
