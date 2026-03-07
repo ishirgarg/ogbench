@@ -219,6 +219,13 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         return loss, {'v_loss': loss, 'v_loss_1': loss_1, 'v_loss_2': loss_2,
                       'v_log_mean': log_v.mean(), 'v_max': v.max(), 'v_min': v.min()}
 
+    def bc_loss(self, batch, grad_params, skills_onehot):
+        """Behavioral cloning loss: -log π(a_expert | s, z)."""
+        dist = self.network.select('policy')(batch['observations'], skills_onehot, params=grad_params)
+        log_prob = dist.log_prob(batch['actions'])
+        loss = -log_prob.mean()
+        return loss, {'bc_loss': loss, 'bc_log_prob_mean': log_prob.mean()}
+
     def policy_loss(self, batch, grad_params, skills, skills_onehot):
         """L_π = M log M - (1/K) Q^z log Q^z  (eq. 18)."""
         batch_size = batch['observations'].shape[0]
@@ -262,7 +269,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         rng = rng if rng is not None else self.rng
-        # Sample skills once for all three losses
+        # Sample skills once for all losses
         batch_size = batch['observations'].shape[0]
         skills, skills_onehot = self._sample_skills(rng, batch_size)
         info = {}
@@ -276,7 +283,11 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         pi_loss, pi_info = self.policy_loss(batch, grad_params, skills, skills_onehot)
         info.update({f'policy/{k}': v for k, v in pi_info.items()})
 
-        total = q_loss + v_loss + pi_loss
+        bc_loss, bc_info = self.bc_loss(batch, grad_params, skills_onehot)
+        info.update({f'bc/{k}': v for k, v in bc_info.items()})
+
+        alpha = self.config.get('bc_alpha', 0.0)
+        total = q_loss + v_loss + pi_loss + alpha * bc_loss
         return total, info
 
     @jax.jit
@@ -410,6 +421,7 @@ def get_config():
         tau=0.005,                   # Soft update coefficient for target network
         num_skills=5,                 # K: number of skills
         obs_indices=ml_collections.config_dict.placeholder(tuple),  # e.g. (0,1) for x,y
+        bc_alpha=0.0,                 # Weight for behavioral cloning loss
         discrete=False,
         const_std=True,
         encoder=ml_collections.config_dict.placeholder(str),
