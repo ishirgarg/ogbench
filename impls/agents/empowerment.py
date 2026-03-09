@@ -224,7 +224,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         dist = self.network.select('policy')(batch['observations'], skills_onehot, params=grad_params)
         log_prob = dist.log_prob(batch['actions'])
         loss = -log_prob.mean()
-        return loss, {'bc_loss': loss, 'bc_log_prob_mean': log_prob.mean()}
+        return loss, {'bc_loss': loss, 'bc_log_prob_mean': log_prob.mean(), 
+                     'bc_log_prob_max': log_prob.max(), 'bc_log_prob_min': log_prob.min()}
 
     def policy_loss(self, batch, grad_params, skills, skills_onehot):
         """L_π = M log M - (1/K) Q^z log Q^z  (eq. 18)."""
