@@ -174,10 +174,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         log_q = self.compute_q_logits(batch['observations'], batch['actions'],
                                       skills_onehot, future, params=grad_params)
         v = jnp.exp(log_v)
-        _ = jax.debug.print("q_loss - log_v: mean={mean}, min={min}, max={max}", 
-                           mean=log_v.mean(), min=log_v.min(), max=log_v.max(), ordered=True)
-        _ = jax.debug.print("q_loss - v: mean={mean}, min={min}, max={max}", 
-                           mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
+      
         loss = -(jax.lax.stop_gradient(v) * log_q + jax.lax.stop_gradient(1 - v) * jnp.log(1 - jnp.exp(log_q))).mean()
         return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean(), 'v_max': v.max(), 'v_min': v.min()}
 
@@ -194,10 +191,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         log_v = self.compute_v_logits(batch['observations'], skills_onehot,
                                       future, params=grad_params)
         v = jnp.exp(log_v)
-        _ = jax.debug.print("v_loss - log_v: mean={mean}, min={min}, max={max}", 
-                           mean=log_v.mean(), min=log_v.min(), max=log_v.max(), ordered=True)
-        _ = jax.debug.print("v_loss - v: mean={mean}, min={min}, max={max}", 
-                           mean=v.mean(), min=v.min(), max=v.max(), ordered=True)
+       
         loss_1 = - (jax.lax.stop_gradient(self.config['discount'] * jnp.exp(log_q_next)) * log_v + jax.lax.stop_gradient(1 - self.config['discount'] * jnp.exp(log_q_next)) * jnp.log(1 - jnp.exp(log_v))).mean()
 
         # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s)
@@ -207,10 +201,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         log_v_self = self.compute_v_logits(batch['observations'], skills_onehot,
                                            batch['observations'], params=grad_params)
         v_self = jnp.exp(log_v_self)
-        _ = jax.debug.print("v_loss - log_v_self: mean={mean}, min={min}, max={max}", 
-                           mean=log_v_self.mean(), min=log_v_self.min(), max=log_v_self.max(), ordered=True)
-        _ = jax.debug.print("v_loss - v_self: mean={mean}, min={min}, max={max}", 
-                           mean=v_self.mean(), min=v_self.min(), max=v_self.max(), ordered=True)
+     
         target_self = (1 - self.config['discount']) + \
                       self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_self))
         loss_2 = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(1 - target_self) * jnp.log(1 - jnp.exp(log_v_self))).mean()
@@ -239,13 +230,6 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         log_q_pi = self.compute_q_logits_target(batch['observations'], policy_actions,
                                                 skills_onehot, future)
         q_pi = jnp.exp(log_q_pi)
-        # Debug: log q_pi values (force evaluation by using in a way that can't be optimized away)
-        _ = jax.debug.print("log_q_pi: mean={mean}, min={min}, max={max}", 
-                           mean=log_q_pi.mean(), min=log_q_pi.min(), max=log_q_pi.max(),
-                           ordered=True)
-        _ = jax.debug.print("q_pi: mean={mean}, min={min}, max={max}", 
-                           mean=q_pi.mean(), min=q_pi.min(), max=q_pi.max(),
-                           ordered=True)
 
         # V^{z'}(s^+ | s) for all K skills — stop-gradient, computed in parallel
         all_skills_onehot = jnp.eye(self.config['num_skills'])   # [K, K]
