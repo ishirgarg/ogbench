@@ -1,4 +1,6 @@
+from agents.bc import BCAgent
 from agents.crl import CRLAgent
+from agents.ddpgbc import DDPGBCAgent
 from agents.empowerment import EmpowermentAgent
 from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
@@ -8,7 +10,9 @@ from agents.qrl import QRLAgent
 from agents.sac import SACAgent
 
 agents = dict(
+    bc=BCAgent,
     crl=CRLAgent,
+    ddpgbc=DDPGBCAgent,
     empowerment=EmpowermentAgent,
     gcbc=GCBCAgent,
     gciql=GCIQLAgent,
