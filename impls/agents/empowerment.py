@@ -181,10 +181,11 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     def v_loss(self, batch, grad_params, skills_onehot):
         """L_V from eqs. 16-17: Bellman backup for the occupancy V."""
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
+        masks = batch['masks']  # 0.0 if future == current, 1.0 if future != current
 
         actions_next = self._policy_actions(batch['observations'], skills_onehot, params=None)
         
-        # Eq. 16: -γ Q^z(s^+ | s, π(s, z)) ⊳ log V^z(s^+ | s)
+        # Eq. 16: -γ Q^z(s^+ | s, π(s, z)) ⊳ log V^z(s^+ | s) (for future != current)
         # Use target network for Q in Bellman backup for stability
         log_q_next = self.compute_q_logits_target(batch['observations'], actions_next,
                                                   skills_onehot, future)
@@ -192,9 +193,10 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                                       future, params=grad_params)
         v = jnp.exp(log_v)
        
-        loss_1 = - (jax.lax.stop_gradient(self.config['discount'] * jnp.exp(log_q_next)) * log_v + jax.lax.stop_gradient(1 - self.config['discount'] * jnp.exp(log_q_next)) * jnp.log(1 - jnp.exp(log_v))).mean()
+        # Compute loss_1 per sample (for when future != current, i.e., masks == 1.0)
+        loss_1_per_sample = - (jax.lax.stop_gradient(self.config['discount'] * jnp.exp(log_q_next)) * log_v + jax.lax.stop_gradient(1 - self.config['discount'] * jnp.exp(log_q_next)) * jnp.log(1 - jnp.exp(log_v)))
 
-        # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s)
+        # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s) (for future == current)
         # Use target network for Q in Bellman backup for stability
         log_q_self = self.compute_q_logits_target(batch['observations'], actions_next,
                                                   skills_onehot, batch['observations'])
@@ -204,9 +206,21 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
      
         target_self = (1 - self.config['discount']) + \
                       self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_self))
-        loss_2 = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(1 - target_self) * jnp.log(1 - jnp.exp(log_v_self))).mean()
+        # Compute loss_2 per sample (for when future == current, i.e., masks == 0.0)
+        loss_2_per_sample = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(1 - target_self) * jnp.log(1 - jnp.exp(log_v_self)))
 
-        loss = loss_1 + loss_2
+        # Select loss_1 when masks == 1.0 (future != current), loss_2 when masks == 0.0 (future == current)
+        # masks is 0.0 when future == current, 1.0 when future != current
+        loss_per_sample = jnp.where(masks > 0.5, loss_1_per_sample, loss_2_per_sample)
+        loss = loss_per_sample.mean()
+        
+        # Compute mean losses for logging (only for samples where they're actually used)
+        mask_1 = masks > 0.5  # True for samples using loss_1
+        mask_2 = masks <= 0.5  # True for samples using loss_2
+        # Compute mean only over samples where each loss is used
+        loss_1 = jnp.where(mask_1, loss_1_per_sample, 0.0).sum() / (mask_1.sum() + 1e-8)
+        loss_2 = jnp.where(mask_2, loss_2_per_sample, 0.0).sum() / (mask_2.sum() + 1e-8)
+        
         return loss, {'v_loss': loss, 'v_loss_1': loss_1, 'v_loss_2': loss_2,
                       'v_log_mean': log_v.mean(), 'v_max': v.max(), 'v_min': v.min()}
 
