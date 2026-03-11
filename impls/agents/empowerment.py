@@ -17,43 +17,52 @@ from utils.networks import GCActor, GCDiscreteActor, MLP, TransformedWithMode, d
 
 
 class EmpowermentValueNetwork(nn.Module):
-    """MLP that computes log Q^z(s^+ | s, a) or log V^z(s^+ | s) from all 4 inputs."""
-
     hidden_dims: Sequence[int]
     action_dim: int
     num_skills: int
+    latent_dim: int = 128
     layer_norm: bool = True
     discrete: bool = False
     gc_encoder: Optional[nn.Module] = None
 
-    @nn.compact
-    def __call__(self, observations, actions, skills, future_states):
-        """Compute log Q^z(s^+ | s, a) or log V^z(s^+ | s).
-        
-        Args:
-            observations: Current state s
-            actions: Action a (or π(s, z) for V)
-            skills: Skill one-hot z
-            future_states: Future state s^+ (already extracted if obs_indices is set)
-        
-        Returns:
-            Scalar log value (always negative due to negative softplus)
-        """
+    def setup(self):
+
+        self.phi_net = MLP(
+            (*self.hidden_dims, self.latent_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm
+        )
+
+        self.psi_net = MLP(
+            (*self.hidden_dims, self.latent_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm
+        )
+
+    def phi(self, observations, actions, skills):
+
         obs = self.gc_encoder(observations, None) if self.gc_encoder else observations
         acts = jnp.eye(self.action_dim)[actions] if self.discrete else actions
+
+        saz_inputs = jnp.concatenate([obs, acts, skills], axis=-1)
+
+        return self.phi_net(saz_inputs)
+
+    def psi(self, future_states):
+
         future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
-        inputs = jnp.concatenate([obs, acts, skills, future], axis=-1)
-        
-        # Build hidden layers
-        x = MLP(self.hidden_dims, activate_final=False, layer_norm=self.layer_norm)(inputs)
-        
-        logits = nn.Dense(
-            1,
-            kernel_init=default_init(scale=0.1),  # Smaller scale for final layer
-            bias_init=nn.initializers.constant(4.0)  # Bias to center around 0.5
-        )(x)
-        # Apply negative softplus to ensure output is always negative
-        return -jax.nn.softplus(logits[..., 0])
+
+        return self.psi_net(future)
+
+    def __call__(self, observations, actions, skills, future_states):
+
+        phi_embedding = self.phi(observations, actions, skills)
+        psi_embedding = self.psi(future_states)
+
+        diff = phi_embedding - psi_embedding
+        l2_squared = jnp.sum(diff ** 2, axis=-1)
+
+        return -l2_squared
 
 
 class SkillConditionedActor(GCActor):
@@ -129,6 +138,50 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         return dist.mode()
 
     # ── Core value computations ────────────────────────────────────────────
+
+    def empowerment(self, observations, rng):
+        batch_size = observations.shape[0]
+        K = self.config['num_skills']
+        num_samples = self.config['num_splus_samples']
+
+        rng, sample_rng = jax.random.split(rng)
+        skill_rngs = jax.random.split(sample_rng, K)  # [K, 2] — one key per skill
+
+        skills_onehot = jnp.eye(K)
+
+        value_def = self.network.model_def.modules['value']
+        variables = {'params': self.network.params['modules_value']}
+
+        def phi_for_skill(z_onehot):
+            z_batch = jnp.repeat(z_onehot[None, :], batch_size, axis=0)
+            actions = self._policy_actions(observations, z_batch, params=None)
+            return value_def.apply(variables, observations, actions, z_batch, method=value_def.phi)
+
+        phi_all = jax.vmap(phi_for_skill)(skills_onehot)
+
+        def empowerment_for_skill(phi_z, skill_rng):  # <-- now takes its own rng
+            noise = jax.random.normal(skill_rng, (num_samples, *phi_z.shape))
+            psi_samples = phi_z[None] + noise / jnp.sqrt(2.0)
+
+            def contribution(psi_splus):
+                diff = phi_z - psi_splus
+                log_v = -jnp.sum(diff**2, axis=-1)
+                v = jnp.exp(log_v)
+
+                diff_all = phi_all - psi_splus
+                log_v_all = -jnp.sum(diff_all**2, axis=-1)
+                v_all = jnp.exp(log_v_all)
+                denom = v_all.mean(axis=0)
+
+                return v * (log_v - jnp.log(denom + 1e-8))
+
+            contributions = jax.vmap(contribution)(psi_samples)
+            return contributions.sum(axis=0)
+
+        emp_per_skill = jax.vmap(empowerment_for_skill, in_axes=(0, 0))(phi_all, skill_rngs)  # <-- pass keys
+        empowerment = emp_per_skill.mean(axis=0)
+        return empowerment
+       
 
     def compute_q_logits(self, observations, actions, skills_onehot,
                          future_states, params=None):
@@ -268,9 +321,10 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         rng = rng if rng is not None else self.rng
+        skills_rng, empowerment_rng = jax.random.split(rng, 2)
         # Sample skills once for all losses
         batch_size = batch['observations'].shape[0]
-        skills, skills_onehot = self._sample_skills(rng, batch_size)
+        skills, skills_onehot = self._sample_skills(skills_rng, batch_size)
         info = {}
 
         q_loss, q_info = self.q_loss(batch, grad_params, skills_onehot)
@@ -284,6 +338,12 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         bc_loss, bc_info = self.bc_loss(batch, grad_params, skills_onehot)
         info.update({f'bc/{k}': v for k, v in bc_info.items()})
+
+        # Compute empowerment for the batch (with stop_gradient to avoid affecting gradients)
+        empowerment_vals = jax.lax.stop_gradient(self.empowerment(batch['observations'], rng=empowerment_rng))
+        info['empowerment/mean'] = empowerment_vals.mean()
+        info['empowerment/min'] = empowerment_vals.min()
+        info['empowerment/max'] = empowerment_vals.max()
 
         alpha = self.config.get('bc_alpha', 0.0)
         total = q_loss + v_loss + pi_loss + alpha * bc_loss
@@ -364,6 +424,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             hidden_dims=config.get('value_hidden_dims', None) or hidden_dims,
             action_dim=action_dim,
             num_skills=num_skills,
+            latent_dim=config.get('value_latent_dim', 128),
             layer_norm=config.get('layer_norm', True),
             discrete=config['discrete'],
             gc_encoder=encoders.get('value'),
@@ -414,11 +475,13 @@ def get_config():
         batch_size=1024,
         hidden_dims=(512, 512, 512),        # default for value network (overridable)
         value_hidden_dims=ml_collections.config_dict.placeholder(tuple),
+        value_latent_dim=128,                # Latent dimension for L2 distance embeddings
         actor_hidden_dims=(512, 512, 512),
         layer_norm=True,
         discount=0.99,
         tau=0.005,                   # Soft update coefficient for target network
         num_skills=5,                 # K: number of skills
+        num_splus_samples=8,
         obs_indices=ml_collections.config_dict.placeholder(tuple),  # e.g. (0,1) for x,y
         bc_alpha=0.0,                 # Weight for behavioral cloning loss
         discrete=False,
