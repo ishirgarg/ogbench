@@ -165,11 +165,12 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
             def contribution(psi_splus):
                 diff = phi_z - psi_splus
-                log_v = -jnp.sum(diff**2, axis=-1)
+                log_v = -jnp.sum(diff**2, axis=-1) / self.config['value_latent_dim']
                 v = jnp.exp(log_v)
 
+                # Compute log_v_all for all skills, matching value network normalization
                 diff_all = phi_all - psi_splus
-                log_v_all = -jnp.sum(diff_all**2, axis=-1)
+                log_v_all = -jnp.sum(diff_all**2, axis=-1) / self.config['value_latent_dim']
                 v_all = jnp.exp(log_v_all)
                 # Add epsilon to prevent division by zero and ensure positive denominator
                 denom = v_all.mean(axis=0) + 1e-8
