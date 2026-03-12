@@ -62,7 +62,7 @@ class EmpowermentValueNetwork(nn.Module):
         diff = phi_embedding - psi_embedding
         l2_squared = jnp.sum(diff ** 2, axis=-1)
 
-        return -l2_squared
+        return -l2_squared / self.latent_dim
 
 
 class SkillConditionedActor(GCActor):
@@ -161,7 +161,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         def empowerment_for_skill(phi_z, skill_rng):  # <-- now takes its own rng
             noise = jax.random.normal(skill_rng, (num_samples, *phi_z.shape))
-            psi_samples = phi_z[None] + noise / jnp.sqrt(2.0)
+            psi_samples = phi_z[None] + noise * jnp.sqrt(self.config['value_latent_dim'] / 2.0)
 
             def contribution(psi_splus):
                 diff = phi_z - psi_splus
