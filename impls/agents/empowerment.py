@@ -232,7 +232,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # Numerically stable: log(1 - exp(x)) = log1p(-exp(x)) for x < 0
         # Add epsilon to ensure 1 - exp(log_q) > 0
         exp_q = jnp.exp(log_q)
-        one_minus_exp_q = 1.0 - exp_q + 1e-8
+        one_minus_exp_q = 1.0 - exp_q
         log_one_minus_exp_q = jnp.log(one_minus_exp_q)
         
         loss = -(jax.lax.stop_gradient(v) * log_q + jax.lax.stop_gradient(1 - v) * log_one_minus_exp_q).mean()
@@ -257,9 +257,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # Numerically stable computation
         exp_q_next = jnp.exp(log_q_next)
         discount_exp_q = self.config['discount'] * exp_q_next
-        one_minus_discount_exp_q = 1.0 - discount_exp_q + 1e-8
+        one_minus_discount_exp_q = 1.0 - discount_exp_q
         exp_v = jnp.exp(log_v)
-        one_minus_exp_v = 1.0 - exp_v + 1e-8
+        one_minus_exp_v = 1.0 - exp_v
         loss_1_per_sample = - (jax.lax.stop_gradient(discount_exp_q) * log_v + jax.lax.stop_gradient(one_minus_discount_exp_q) * jnp.log(one_minus_exp_v))
 
         # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s) (for future == current)
@@ -275,9 +275,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                       self.config['discount'] * jax.lax.stop_gradient(exp_q_self)
         # Compute loss_2 per sample (for when future == current, i.e., masks == 0.0)
         # Numerically stable computation
-        one_minus_target = 1.0 - target_self + 1e-8
+        one_minus_target = 1.0 - target_self
         exp_v_self = jnp.exp(log_v_self)
-        one_minus_exp_v_self = 1.0 - exp_v_self + 1e-8
+        one_minus_exp_v_self = 1.0 - exp_v_self
         loss_2_per_sample = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(one_minus_target) * jnp.log(one_minus_exp_v_self))
 
         # Select loss_1 when masks == 1.0 (future != current), loss_2 when masks == 0.0 (future == current)
