@@ -171,9 +171,10 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                 diff_all = phi_all - psi_splus
                 log_v_all = -jnp.sum(diff_all**2, axis=-1)
                 v_all = jnp.exp(log_v_all)
-                denom = v_all.mean(axis=0)
+                # Add epsilon to prevent division by zero and ensure positive denominator
+                denom = v_all.mean(axis=0) + 1e-8
 
-                return v * (log_v - jnp.log(denom + 1e-8))
+                return v * (log_v - jnp.log(denom))
 
             contributions = jax.vmap(contribution)(psi_samples)
             return contributions.sum(axis=0)
@@ -228,7 +229,13 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                                       skills_onehot, future, params=grad_params)
         v = jnp.exp(log_v)
       
-        loss = -(jax.lax.stop_gradient(v) * log_q + jax.lax.stop_gradient(1 - v) * jnp.log(1 - jnp.exp(log_q))).mean()
+        # Numerically stable: log(1 - exp(x)) = log1p(-exp(x)) for x < 0
+        # Add epsilon to ensure 1 - exp(log_q) > 0
+        exp_q = jnp.exp(log_q)
+        one_minus_exp_q = 1.0 - exp_q + 1e-8
+        log_one_minus_exp_q = jnp.log(one_minus_exp_q)
+        
+        loss = -(jax.lax.stop_gradient(v) * log_q + jax.lax.stop_gradient(1 - v) * log_one_minus_exp_q).mean()
         return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean(), 'v_max': v.max(), 'v_min': v.min()}
 
     def v_loss(self, batch, grad_params, skills_onehot):
@@ -247,7 +254,13 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         v = jnp.exp(log_v)
        
         # Compute loss_1 per sample (for when future != current, i.e., masks == 1.0)
-        loss_1_per_sample = - (jax.lax.stop_gradient(self.config['discount'] * jnp.exp(log_q_next)) * log_v + jax.lax.stop_gradient(1 - self.config['discount'] * jnp.exp(log_q_next)) * jnp.log(1 - jnp.exp(log_v)))
+        # Numerically stable computation
+        exp_q_next = jnp.exp(log_q_next)
+        discount_exp_q = self.config['discount'] * exp_q_next
+        one_minus_discount_exp_q = 1.0 - discount_exp_q + 1e-8
+        exp_v = jnp.exp(log_v)
+        one_minus_exp_v = 1.0 - exp_v + 1e-8
+        loss_1_per_sample = - (jax.lax.stop_gradient(discount_exp_q) * log_v + jax.lax.stop_gradient(one_minus_discount_exp_q) * jnp.log(one_minus_exp_v))
 
         # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s) (for future == current)
         # Use target network for Q in Bellman backup for stability
@@ -257,10 +270,15 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                                            batch['observations'], params=grad_params)
         v_self = jnp.exp(log_v_self)
      
+        exp_q_self = jnp.exp(log_q_self)
         target_self = (1 - self.config['discount']) + \
-                      self.config['discount'] * jax.lax.stop_gradient(jnp.exp(log_q_self))
+                      self.config['discount'] * jax.lax.stop_gradient(exp_q_self)
         # Compute loss_2 per sample (for when future == current, i.e., masks == 0.0)
-        loss_2_per_sample = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(1 - target_self) * jnp.log(1 - jnp.exp(log_v_self)))
+        # Numerically stable computation
+        one_minus_target = 1.0 - target_self + 1e-8
+        exp_v_self = jnp.exp(log_v_self)
+        one_minus_exp_v_self = 1.0 - exp_v_self + 1e-8
+        loss_2_per_sample = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(one_minus_target) * jnp.log(one_minus_exp_v_self))
 
         # Select loss_1 when masks == 1.0 (future != current), loss_2 when masks == 0.0 (future == current)
         # masks is 0.0 when future == current, 1.0 when future != current
@@ -311,8 +329,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         v_others = v_all.sum(axis=0) - v_all[skills, jnp.arange(batch_size)]
         m = (q_pi + v_others) / self.config['num_skills']
 
-        m_log_m = m * jnp.log(m)
-        q_log_q = (1.0 / self.config['num_skills']) * q_pi * jnp.log(q_pi)
+        # Numerically stable: add epsilon before taking log to prevent log(0)
+        m_log_m = m * jnp.log(m + 1e-8)
+        q_log_q = (1.0 / self.config['num_skills']) * q_pi * jnp.log(q_pi + 1e-8)
         loss = -(m_log_m - q_log_q).mean()
         return loss, {'policy_loss': loss, 'm_mean': m.mean(), 'q_pi_mean': q_pi.mean(), 'q_pi_max': q_pi.max(), 'q_pi_min': q_pi.min()}
 
