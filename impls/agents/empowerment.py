@@ -300,9 +300,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                 method=value_def.phi,
             )  # [batch, d]
 
-        phi_all = jax.lax.stop_gradient(
-            jax.vmap(phi_for_skill)(all_skills_onehot)
-        )  # [K, batch, d]
+        phi_all = jax.vmap(phi_for_skill)(all_skills_onehot) # [K, batch, d]
 
         # ψ_j ~ N(φ_z, d/2 · I)   [N, batch, d]
         rng, sample_rng = jax.random.split(self.rng)
@@ -325,7 +323,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         # M̄ = (Q^z + Σ_{z'≠z} V^{z'}) / K   [N, batch]
         v_all_sum = v_all.sum(axis=1)        # [N, batch]
-        m_bar     = (q + v_all_sum - v_z) / K
+        m_bar     = (q + jax.lax.stop_gradient(v_all_sum - v_z)) / K
         log_m_bar = jnp.log(m_bar + 1e-8)   # [N, batch]
 
         # Q^z · log(Q^z / M̄)   [N, batch]
@@ -333,9 +331,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         # Σ_{z'≠z} V^{z'} · log(V^{z'} / M̄)   [N, batch]
         # = Σ_all V^{z'} log(V^{z'}/M̄) − V^z log(V^z/M̄)
-        v_log_v_sum   = (v_all * log_v_all).sum(axis=1)   # [N, batch]
-        v_log_m_sum   = v_all_sum * log_m_bar             # [N, batch]
-        v_others_term = (v_log_v_sum - v_log_m_sum) - v_z * (log_v_z - log_m_bar)
+        v_log_v_sum   = jax.lax.stop_gradient((v_all * log_v_all).sum(axis=1))   # [N, batch]
+        v_log_m_sum   = jax.lax.stop_gradient(v_all_sum) * log_m_bar             # [N, batch]
+        v_others_term = (v_log_v_sum - v_log_m_sum) - jax.lax.stop_gradient(v_z) * (jax.lax.stop_gradient(log_v_z) - log_m_bar)
 
         # E_Δ per batch element: sum over N samples, then mean over batch
         e_delta = ((q_term + v_others_term) / K).sum(axis=0)  # [batch]
