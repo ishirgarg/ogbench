@@ -242,7 +242,6 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     def v_loss(self, batch, grad_params, skills_onehot):
         """L_V from eqs. 16-17: Bellman backup for the occupancy V."""
         future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
-        masks = batch['masks']  # 0.0 if future == current, 1.0 if future != current
 
         actions_next = self._policy_actions(batch['observations'], skills_onehot, params=None)
         
@@ -256,45 +255,11 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
        
         # Compute loss_1 per sample (for when future != current, i.e., masks == 1.0)
         # Numerically stable computation
-        exp_q_next = jnp.exp(log_q_next)
-        discount_exp_q = self.config['discount'] * exp_q_next
-        one_minus_discount_exp_q = 1.0 - discount_exp_q
-        exp_v = jnp.exp(log_v)
-        one_minus_exp_v = 1.0 - exp_v
-        loss_1_per_sample = - (jax.lax.stop_gradient(discount_exp_q) * log_v + jax.lax.stop_gradient(one_minus_discount_exp_q) * jnp.log(one_minus_exp_v))
-
-        # Eq. 17: -[(1-γ) + γ Q^z(s | s, π(s, z))] ⊳ log V^z(s | s) (for future == current)
-        # Use target network for Q in Bellman backup for stability
-        log_q_self = self.compute_q_logits_target(batch['observations'], actions_next,
-                                                  skills_onehot, batch['observations'])
-        log_v_self = self.compute_v_logits(batch['observations'], skills_onehot,
-                                           batch['observations'], params=grad_params)
-        v_self = jnp.exp(log_v_self)
-     
-        exp_q_self = jnp.exp(log_q_self)
-        target_self = (1 - self.config['discount']) + \
-                      self.config['discount'] * jax.lax.stop_gradient(exp_q_self)
-        # Compute loss_2 per sample (for when future == current, i.e., masks == 0.0)
-        # Numerically stable computation
-        one_minus_target = 1.0 - target_self
-        exp_v_self = jnp.exp(log_v_self)
-        one_minus_exp_v_self = 1.0 - exp_v_self
-        loss_2_per_sample = -(jax.lax.stop_gradient(target_self) * log_v_self + jax.lax.stop_gradient(one_minus_target) * jnp.log(one_minus_exp_v_self))
-
-        # Select loss_1 when masks == 1.0 (future != current), loss_2 when masks == 0.0 (future == current)
-        # masks is 0.0 when future == current, 1.0 when future != current
-        loss_per_sample = jnp.where(masks > 0.5, loss_1_per_sample, loss_2_per_sample)
+        discount_exp_q = self.config['discount'] * jnp.exp(log_q_next)
+        loss_per_sample = - (jax.lax.stop_gradient(discount_exp_q) * log_v + jax.lax.stop_gradient(1 - discount_exp_q) * jnp.log(1.0 - jnp.exp(log_v)))
+        
         loss = loss_per_sample.mean()
-        
-        # Compute mean losses for logging (only for samples where they're actually used)
-        mask_1 = masks > 0.5  # True for samples using loss_1
-        mask_2 = masks <= 0.5  # True for samples using loss_2
-        # Compute mean only over samples where each loss is used
-        loss_1 = jnp.where(mask_1, loss_1_per_sample, 0.0).sum() / (mask_1.sum() + 1e-8)
-        loss_2 = jnp.where(mask_2, loss_2_per_sample, 0.0).sum() / (mask_2.sum() + 1e-8)
-        
-        return loss, {'v_loss': loss, 'v_loss_1': loss_1, 'v_loss_2': loss_2,
-                      'v_log_mean': log_v.mean(), 'v_max': v.max(), 'v_min': v.min()}
+        return loss, {'v_loss': loss, 'v_log_mean': log_v.mean(), 'v_max': v.max(), 'v_min': v.min()}
 
     def bc_loss(self, batch, grad_params, skills_onehot):
         """Behavioral cloning loss: -log π(a_expert | s, z)."""
@@ -305,36 +270,83 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                      'bc_log_prob_max': log_prob.max(), 'bc_log_prob_min': log_prob.min()}
 
     def policy_loss(self, batch, grad_params, skills, skills_onehot):
-        """L_π = M log M - (1/K) Q^z log Q^z  (eq. 18)."""
         batch_size = batch['observations'].shape[0]
-        future = batch['value_goals']  # s^+ ~ Unif(S), sampled geometrically by GCDataset
+        K = self.config['num_skills']
+        N = self.config['num_splus_samples']
+        d = self.config['value_latent_dim']
 
-        # Q^z(s^+ | s, π(s, z)) — gradients only through the policy (φ/ψ are fixed per eq. 12)
-        # Use target network for Q to prevent gradients through value network
-        policy_actions = self._policy_actions(batch['observations'], skills_onehot,
-                                              params=grad_params)
-        log_q_pi = self.compute_q_logits_target(batch['observations'], policy_actions,
-                                                skills_onehot, future)
-        q_pi = jnp.exp(log_q_pi)
+        value_def  = self.network.model_def.modules['value']
+        target_vars = jax.lax.stop_gradient(
+            {'params': self.network.params['modules_target_value']}
+        )
 
-        # V^{z'}(s^+ | s) for all K skills — stop-gradient, computed in parallel
-        all_skills_onehot = jnp.eye(self.config['num_skills'])   # [K, K]
+        # φ_z(s, π_θ(s,z), z)  [batch, d] — grad flows through policy only
+        policy_actions = self._policy_actions(
+            batch['observations'], skills_onehot, params=grad_params
+        )
+        phi_z = value_def.apply(
+            target_vars, batch['observations'], policy_actions, skills_onehot,
+            method=value_def.phi,
+        )  # [batch, d]
 
-        def v_for_skill(skill_onehot):
-            s_batch = jnp.repeat(skill_onehot[None, :], batch_size, axis=0)
-            return jnp.exp(self.compute_v_logits_target(batch['observations'], s_batch, future, policy_params=grad_params))
+        # φ_{z'}(s) for ALL skills  [K, batch, d] — fully stop-gradient
+        all_skills_onehot = jnp.eye(K)  # [K, K]
 
-        v_all = jax.vmap(v_for_skill)(all_skills_onehot)         # [K, batch]
+        def phi_for_skill(z_onehot):
+            z_batch = jnp.repeat(z_onehot[None, :], batch_size, axis=0)
+            acts = self._policy_actions(batch['observations'], z_batch, params=grad_params)
+            return value_def.apply(
+                target_vars, batch['observations'], acts, z_batch,
+                method=value_def.phi,
+            )  # [batch, d]
 
-        # M(s^+ | s, a, z) = (1/K) [Q^z + Σ_{z'≠z} V^{z'}]  (eq. 5)
-        v_others = v_all.sum(axis=0) - v_all[skills, jnp.arange(batch_size)]
-        m = (q_pi + v_others) / self.config['num_skills']
+        phi_all = jax.lax.stop_gradient(
+            jax.vmap(phi_for_skill)(all_skills_onehot)
+        )  # [K, batch, d]
 
-        # Numerically stable: add epsilon before taking log to prevent log(0)
-        m_log_m = m * jnp.log(m + 1e-8)
-        q_log_q = (1.0 / self.config['num_skills']) * q_pi * jnp.log(q_pi + 1e-8)
-        loss = -(m_log_m - q_log_q).mean()
-        return loss, {'policy_loss': loss, 'm_mean': m.mean(), 'q_pi_mean': q_pi.mean(), 'q_pi_max': q_pi.max(), 'q_pi_min': q_pi.min()}
+        # ψ_j ~ N(φ_z, d/2 · I)   [N, batch, d]
+        rng, sample_rng = jax.random.split(self.rng)
+        psi = phi_z[None] + jax.random.normal(sample_rng, (N, *phi_z.shape)) * jnp.sqrt(d / 2.0)
+
+        # log Q^z: [N, batch]
+        log_q = -jnp.sum((psi - phi_z[None]) ** 2, axis=-1) / d
+
+        # log V^{z'} for all skills: [N, K, batch]
+        # psi[:, None]:    [N, 1, batch, d]
+        # phi_all[None]:   [1, K, batch, d]
+        log_v_all = -jnp.sum((psi[:, None] - phi_all[None]) ** 2, axis=-1) / d
+
+        q       = jnp.exp(log_q)            # [N, batch]
+        v_all   = jnp.exp(log_v_all)        # [N, K, batch]
+
+        # Pick out V^z (the skill each batch element is using)
+        v_z     = v_all[:, skills, jnp.arange(batch_size)]      # [N, batch]
+        log_v_z = log_v_all[:, skills, jnp.arange(batch_size)]  # [N, batch]
+
+        # M̄ = (Q^z + Σ_{z'≠z} V^{z'}) / K   [N, batch]
+        v_all_sum = v_all.sum(axis=1)        # [N, batch]
+        m_bar     = (q + v_all_sum - v_z) / K
+        log_m_bar = jnp.log(m_bar + 1e-8)   # [N, batch]
+
+        # Q^z · log(Q^z / M̄)   [N, batch]
+        q_term = q * (log_q - log_m_bar)
+
+        # Σ_{z'≠z} V^{z'} · log(V^{z'} / M̄)   [N, batch]
+        # = Σ_all V^{z'} log(V^{z'}/M̄) − V^z log(V^z/M̄)
+        v_log_v_sum   = (v_all * log_v_all).sum(axis=1)   # [N, batch]
+        v_log_m_sum   = v_all_sum * log_m_bar             # [N, batch]
+        v_others_term = (v_log_v_sum - v_log_m_sum) - v_z * (log_v_z - log_m_bar)
+
+        # E_Δ per batch element: sum over N samples, then mean over batch
+        e_delta = ((q_term + v_others_term) / K).sum(axis=0)  # [batch]
+
+        loss = -e_delta.mean()
+        return loss, {
+            'policy_loss': loss,
+            'e_delta_mean': e_delta.mean(),
+            'e_delta_max':  e_delta.max(),
+            'e_delta_min':  e_delta.min(),
+        }
 
     # ── Training ──────────────────────────────────────────────────────────────
 
