@@ -16,7 +16,8 @@ from utils.networks import GCActor, GCDiscreteActor, MLP, TransformedWithMode, d
 # ── Network modules ──────────────────────────────────────────────────────────
 
 
-class EmpowermentValueNetwork(nn.Module):
+class EmpowermentQNetwork(nn.Module):
+    """Q network: Q^z(s^+ | s, a) - takes (s, a, z, s^+)."""
     hidden_dims: Sequence[int]
     action_dim: int
     num_skills: int
@@ -60,6 +61,58 @@ class EmpowermentValueNetwork(nn.Module):
         psi_embedding = self.psi(future_states)
 
         # Compute log Q with proper Gaussian normalization
+        # For psi ~ N(phi, (d/2) * I): log p(psi | phi) = -0.5 * d * log(π * d) - ||phi - psi||^2 / d
+        diff = phi_embedding - psi_embedding
+        l2_squared = jnp.sum(diff ** 2, axis=-1)
+        # Normalization constant for N(phi, (d/2) * I): -0.5 * d * log(π * d)
+        normalization = -0.5 * self.latent_dim * jnp.log(jnp.pi * self.latent_dim)
+        return normalization - l2_squared / self.latent_dim
+
+
+class EmpowermentVNetwork(nn.Module):
+    """V network: V^z(s^+ | s) - takes (s, z, s^+)."""
+    hidden_dims: Sequence[int]
+    action_dim: int
+    num_skills: int
+    latent_dim: int = 128
+    layer_norm: bool = True
+    discrete: bool = False
+    gc_encoder: Optional[nn.Module] = None
+
+    def setup(self):
+
+        self.phi_net = MLP(
+            (*self.hidden_dims, self.latent_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm
+        )
+
+        self.psi_net = MLP(
+            (*self.hidden_dims, self.latent_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm
+        )
+
+    def phi(self, observations, skills):
+
+        obs = self.gc_encoder(observations, None) if self.gc_encoder else observations
+
+        sz_inputs = jnp.concatenate([obs, skills], axis=-1)
+
+        return self.phi_net(sz_inputs)
+
+    def psi(self, future_states):
+
+        future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
+
+        return self.psi_net(future)
+
+    def __call__(self, observations, skills, future_states):
+
+        phi_embedding = self.phi(observations, skills)
+        psi_embedding = self.psi(future_states)
+
+        # Compute log V with proper Gaussian normalization
         # For psi ~ N(phi, (d/2) * I): log p(psi | phi) = -0.5 * d * log(π * d) - ||phi - psi||^2 / d
         diff = phi_embedding - psi_embedding
         l2_squared = jnp.sum(diff ** 2, axis=-1)
@@ -140,7 +193,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             return dist.probs.argmax(axis=-1)
         return dist.mode()
 
-    def compute_q_logits_from_embedding(self, phi_embedding, psi_embedding, latent_dim):
+    def compute_logits_from_embedding(self, phi_embedding, psi_embedding, latent_dim):
         """Compute log Q^z(s^+ | s, a) from phi and psi embeddings.
         
         For psi ~ N(phi, (d/2) * I), the log probability density is:
@@ -166,51 +219,56 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         batch_size = observations.shape[0]
         K = self.config['num_skills']
         num_samples = self.config['num_splus_samples']
-        d = self.config['value_latent_dim']
 
         rng, sample_rng = jax.random.split(rng)
         skill_rngs = jax.random.split(sample_rng, K)
 
         skills_onehot = jnp.eye(K)
 
-        value_def = self.network.model_def.modules['value']
-        variables = {'params': self.network.params['modules_value']}
+        v_def = self.network.model_def.modules['v']
+        v_variables = {'params': self.network.params['modules_v']}
 
         def phi_for_skill(z_onehot):
             z_batch = jnp.repeat(z_onehot[None, :], batch_size, axis=0)
-            actions = self._policy_actions(observations, z_batch, params=None)
-            return value_def.apply(
-                variables, observations, actions, z_batch, method=value_def.phi
-            )
+            return v_def.apply(v_variables, observations, z_batch, method=v_def.phi)
 
-        # φ_z(s,π(s,z),z) for every skill
         phi_all = jax.vmap(phi_for_skill)(skills_onehot)  # [K, batch, d]
 
         def empowerment_for_skill(phi_z, skill_rng):
 
-            noise = jax.random.normal(skill_rng, (num_samples, *phi_z.shape))
-            psi_samples = phi_z[None] + noise * jnp.sqrt(d / 2.0)  # [N, batch, d]
+            noise = jax.random.normal(
+                skill_rng,
+                (num_samples, *phi_z.shape)
+            )
+
+            psi_samples = phi_z[None] + noise * jnp.sqrt(self.config['value_latent_dim'] / 2.0)
 
             def contribution(psi_splus):
 
-                log_v = self.compute_q_logits_from_embedding(
-                    phi_z, psi_splus, d
+                log_v = self.compute_logits_from_embedding(
+                    phi_z,
+                    psi_splus,
+                    self.config['value_latent_dim']
                 )  # [batch]
 
-                log_v_all = self.compute_q_logits_from_embedding(
-                    phi_all, psi_splus, d
+                log_v_all = self.compute_logits_from_embedding(
+                    phi_all,
+                    psi_splus,
+                    self.config['value_latent_dim']
                 )  # [K, batch]
 
-                # log mixture density
                 log_denom = jnp.log(jnp.exp(log_v_all).mean(axis=0) + 1e-8)
 
-                return log_v - log_denom  # <-- removed density weighting
+                return log_v - log_denom
 
             contributions = jax.vmap(contribution)(psi_samples)  # [N, batch]
 
             return contributions.mean(axis=0)  # average over samples
 
-        emp_per_skill = jax.vmap(empowerment_for_skill, in_axes=(0, 0))(phi_all, skill_rngs)
+        emp_per_skill = jax.vmap(
+            empowerment_for_skill,
+            in_axes=(0, 0)
+        )(phi_all, skill_rngs)  # [K, batch]
 
         empowerment = emp_per_skill.mean(axis=0)  # average over skills
 
@@ -219,36 +277,28 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
     def compute_q_logits(self, observations, actions, skills_onehot,
                          future_states, params=None):
-        """log Q^z(s^+ | s, a) = MLP(s, a, z, s^+) with negative softplus."""
+        """log Q^z(s^+ | s, a) using Q network."""
         future_extracted = self._extract_future(future_states)
-        return self.network.select('value')(observations, actions, skills_onehot,
-                                            future_extracted, params=params)
+        return self.network.select('q')(observations, actions, skills_onehot,
+                                        future_extracted, params=params)
 
     def compute_v_logits(self, observations, skills_onehot, future_states, params=None, policy_params=None):
-        """log V^z(s^+ | s) = MLP(s, π(s,z), z, s^+) with negative softplus.
-
-        Wraps compute_q_logits with stop-gradient policy actions.
-        """
-        policy_actions = self._policy_actions(observations, skills_onehot, params=policy_params)
-        return self.compute_q_logits(observations, policy_actions, skills_onehot,
-                                     future_states, params=params)
+        """log V^z(s^+ | s) using V network directly (not derived from Q)."""
+        future_extracted = self._extract_future(future_states)
+        return self.network.select('v')(observations, skills_onehot,
+                                        future_extracted, params=params)
     
     def compute_q_logits_target(self, observations, actions, skills_onehot, future_states):
-        """log Q^z(s^+ | s, a) using target network for stability.
-        
-        Uses target value network instead of main value network.
-        """
+        """log Q^z(s^+ | s, a) using target Q network for stability."""
         future_extracted = self._extract_future(future_states)
-        return self.network.select('target_value')(observations, actions, skills_onehot,
-                                                   future_extracted, params=None)
+        return self.network.select('target_q')(observations, actions, skills_onehot,
+                                               future_extracted, params=None)
     
     def compute_v_logits_target(self, observations, skills_onehot, future_states, policy_params=None):
-        """log V^z(s^+ | s) using target network for stability.
-        
-        Uses target value network instead of main value network.
-        """
-        policy_actions = self._policy_actions(observations, skills_onehot, params=policy_params)
-        return self.compute_q_logits_target(observations, policy_actions, skills_onehot, future_states)
+        """log V^z(s^+ | s) using target V network for stability."""
+        future_extracted = self._extract_future(future_states)
+        return self.network.select('target_v')(observations, skills_onehot,
+                                               future_extracted, params=None)
 
     # ── Losses ────────────────────────────────────────────────────────────────
 
@@ -307,99 +357,99 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         N = self.config['num_splus_samples']
         d = self.config['value_latent_dim']
 
-        value_def = self.network.model_def.modules['value']
-        target_vars = jax.lax.stop_gradient(
-            {'params': self.network.params['modules_target_value']}
+        rng, sample_rng = jax.random.split(self.rng)
+
+        # ----- sample s+ from V^z(s+ | s) -----
+
+        v_def = self.network.model_def.modules['v']
+        target_v_vars = jax.lax.stop_gradient(
+            {'params': self.network.params['modules_target_v']}
         )
 
-        # φ_z(s, π_θ(s,z), z)
+        phi_z = v_def.apply(
+            target_v_vars,
+            batch['observations'],
+            skills_onehot,
+            method=v_def.phi,
+        )  # [batch, d]
+
+        psi = phi_z[None] + jax.random.normal(
+            sample_rng, (N, *phi_z.shape)
+        ) * jnp.sqrt(d / 2.0)
+
+        # ----- compute Q^z(s+ | s, π(s,z)) -----
+
+        q_def = self.network.model_def.modules['q']
+        target_q_vars = jax.lax.stop_gradient(
+            {'params': self.network.params['modules_target_q']}
+        )
+
         policy_actions = self._policy_actions(
             batch['observations'], skills_onehot, params=grad_params
         )
 
-        phi_z = value_def.apply(
-            target_vars,
+        phi_z_q = q_def.apply(
+            target_q_vars,
             batch['observations'],
             policy_actions,
             skills_onehot,
-            method=value_def.phi,
+            method=q_def.phi,
         )  # [batch, d]
 
-        # φ_{z'}(s) for all skills
+        log_q = self.compute_logits_from_embedding(
+            phi_z_q[None], psi, d
+        )  # [N, batch]
+
+        # ----- compute V^{z'}(s+ | s) for all skills -----
+
         all_skills_onehot = jnp.eye(K)
 
         def phi_for_skill(z_onehot):
             z_batch = jnp.repeat(z_onehot[None, :], batch_size, axis=0)
-
-            acts = self._policy_actions(
-                batch['observations'], z_batch, params=grad_params
-            )
-
-            return value_def.apply(
-                target_vars,
+            return v_def.apply(
+                target_v_vars,
                 batch['observations'],
-                acts,
                 z_batch,
-                method=value_def.phi,
+                method=v_def.phi,
             )
 
         phi_all = jax.vmap(phi_for_skill)(all_skills_onehot)  # [K, batch, d]
 
-        # sample ψ ~ N(φ_z, d/2 I)
-        rng, sample_rng = jax.random.split(self.rng)
-
-        psi = phi_z[None] + jax.random.normal(
-            sample_rng, (N, *phi_z.shape)
-        ) * jnp.sqrt(d / 2.0)  # [N, batch, d]
-
-        # log Q^z
-        log_q = self.compute_q_logits_from_embedding(
-            phi_z[None], psi, d
-        )  # [N, batch]
-
-        # log V^{z'}
-        log_v_all = self.compute_q_logits_from_embedding(
+        log_v_all = self.compute_logits_from_embedding(
             phi_all[None], psi[:, None], d
         )  # [N, K, batch]
 
-        q = jnp.exp(log_q)            # [N, batch]
-        v_all = jnp.exp(log_v_all)    # [N, K, batch]
+        # ----- convert to densities -----
 
-        # V^z for each batch element
-        v_z = v_all[:, skills, jnp.arange(batch_size)]         # [N, batch]
-        log_v_z = log_v_all[:, skills, jnp.arange(batch_size)] # [N, batch]
+        q = jnp.exp(log_q)           # [N, batch]
+        v_all = jnp.exp(log_v_all)   # [N, K, batch]
 
-        # mixture
-        v_all_sum = v_all.sum(axis=1)  # [N, batch]
+        # select V^z
+        v_z = v_all[:, skills, jnp.arange(batch_size)]  # [N, batch]
 
-        m_bar = (q + jax.lax.stop_gradient(v_all_sum - v_z)) / K
+        # mixture denominator
+        m_bar = (q + (v_all.sum(axis=1) - v_z)) / K
         log_m_bar = jnp.log(m_bar)
 
-        # importance weight
+        # ----- importance weights -----
+
         inv_v_z = 1.0 / v_z
 
-        # Q term
+        # ----- compute E_delta -----
+
+        # Q^z term
         q_term = (q * inv_v_z) * (log_q - log_m_bar)
 
-        # V terms
+        # V^{z'} terms
         v_weighted = v_all * inv_v_z[:, None, :]
+        v_terms = v_weighted * (log_v_all - log_m_bar[:, None])
 
-        v_log_v_sum = jax.lax.stop_gradient(
-            (v_weighted * log_v_all).sum(axis=1)
-        )
+        # remove z skill contribution
+        v_terms = v_terms.at[:, skills, jnp.arange(batch_size)].set(0.0)
 
-        v_log_m_sum = jax.lax.stop_gradient(
-            v_weighted.sum(axis=1)
-        ) * log_m_bar
+        v_term_sum = jnp.sum(v_terms, axis=1)  # [N, batch]
 
-        v_others_term = (
-            v_log_v_sum - v_log_m_sum
-        ) - (
-            jax.lax.stop_gradient(v_z * inv_v_z)
-            * (jax.lax.stop_gradient(log_v_z) - log_m_bar)
-        )
-
-        e_delta = ((q_term + v_others_term) / K).sum(axis=0)
+        e_delta = ((q_term + v_term_sum) / K).sum(axis=0)  # [batch]
 
         loss = -e_delta.mean()
 
@@ -449,13 +499,22 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(
             loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
         )
-        # Update target network using soft update
-        new_target_params = jax.tree_util.tree_map(
+        # Update target networks using soft update
+        new_target_q_params = jax.tree_util.tree_map(
             lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
-            new_network.params[f'modules_value'],
-            new_network.params[f'modules_target_value'],
+            new_network.params[f'modules_q'],
+            new_network.params[f'modules_target_q'],
         )
-        new_params = {**new_network.params, f'modules_target_value': new_target_params}
+        new_target_v_params = jax.tree_util.tree_map(
+            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
+            new_network.params[f'modules_v'],
+            new_network.params[f'modules_target_v'],
+        )
+        new_params = {
+            **new_network.params,
+            f'modules_target_q': new_target_q_params,
+            f'modules_target_v': new_target_v_params,
+        }
         new_network = new_network.replace(params=new_params)
         return self.replace(network=new_network, rng=new_rng), info
 
@@ -512,16 +571,27 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         encoders = {}
         if config.get('encoder') is not None:
             enc = encoder_modules[config['encoder']]
-            encoders = {k: GCEncoder(concat_encoder=enc()) for k in ('value', 'policy')}
+            encoders = {k: GCEncoder(concat_encoder=enc()) for k in ('q', 'v', 'policy')}
 
-        value_def = EmpowermentValueNetwork(
+        # Create separate Q and V networks
+        q_def = EmpowermentQNetwork(
             hidden_dims=config.get('value_hidden_dims', None) or hidden_dims,
             action_dim=action_dim,
             num_skills=num_skills,
             latent_dim=config.get('value_latent_dim', 128),
             layer_norm=config.get('layer_norm', True),
             discrete=config['discrete'],
-            gc_encoder=encoders.get('value'),
+            gc_encoder=encoders.get('q'),
+        )
+
+        v_def = EmpowermentVNetwork(
+            hidden_dims=config.get('value_hidden_dims', None) or hidden_dims,
+            action_dim=action_dim,
+            num_skills=num_skills,
+            latent_dim=config.get('value_latent_dim', 128),
+            layer_norm=config.get('layer_norm', True),
+            discrete=config['discrete'],
+            gc_encoder=encoders.get('v'),
         )
 
         actor_cls  = SkillConditionedDiscreteActor if config['discrete'] else SkillConditionedActor
@@ -542,16 +612,26 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         ex_future  = (ex_observations[:, jnp.array(obs_indices)]
                       if obs_indices is not None else ex_observations)
 
-        # Create target value network (copy of value network)
-        target_value_def = copy.deepcopy(value_def)
+        # Create target networks (copies of Q and V networks)
+        target_q_def = copy.deepcopy(q_def)
+        target_v_def = copy.deepcopy(v_def)
         
-        network_def = ModuleDict(dict(value=value_def, target_value=target_value_def, policy=policy_def))
+        network_def = ModuleDict(dict(
+            q=q_def,
+            v=v_def,
+            target_q=target_q_def,
+            target_v=target_v_def,
+            policy=policy_def
+        ))
         network_params = network_def.init(init_rng,
-                                          value=(ex_observations, ex_actions, ex_skills, ex_future),
-                                          target_value=(ex_observations, ex_actions, ex_skills, ex_future),
+                                          q=(ex_observations, ex_actions, ex_skills, ex_future),
+                                          v=(ex_observations, ex_skills, ex_future),
+                                          target_q=(ex_observations, ex_actions, ex_skills, ex_future),
+                                          target_v=(ex_observations, ex_skills, ex_future),
                                           policy=(ex_observations, ex_skills))['params']
-        # Initialize target network with same params as main network
-        network_params['modules_target_value'] = network_params['modules_value']
+        # Initialize target networks with same params as main networks
+        network_params['modules_target_q'] = network_params['modules_q']
+        network_params['modules_target_v'] = network_params['modules_v']
         network = TrainState.create(network_def, network_params,
                                     tx=optax.adam(config.get('lr', 3e-4)))
 
@@ -564,7 +644,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 def get_config():
     return ml_collections.ConfigDict(dict(
         # Agent
-        agent_name='empowerment',
+        agent_name='empowerment_separate',
         lr=3e-4,
         batch_size=1024,
         hidden_dims=(512, 512, 512),        # default for value network (overridable)
