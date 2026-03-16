@@ -13,6 +13,18 @@ from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import GCActor, GCDiscreteActor, MLP, TransformedWithMode, default_init
 
 
+from jax.scipy.special import logsumexp
+
+
+def log1mexp(x):
+    """Stable computation of log(1 - exp(x)) for x <= 0."""
+    log2 = -0.6931471805599453
+    return jnp.where(
+        x < log2,
+        jnp.log1p(-jnp.exp(x)),
+        jnp.log(-jnp.expm1(x))
+    )
+
 # ── Network modules ──────────────────────────────────────────────────────────
 
 
@@ -257,7 +269,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                     self.config['value_latent_dim']
                 )  # [K, batch]
 
-                log_denom = jnp.log(jnp.exp(log_v_all).mean(axis=0) + 1e-8)
+                log_denom = logsumexp(log_v_all, axis=0) - jnp.log(K)
 
                 return log_v - log_denom
 
@@ -314,9 +326,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
       
         # Numerically stable: log(1 - exp(x)) = log1p(-exp(x)) for x < 0
         # Add epsilon to ensure 1 - exp(log_q) > 0
-        exp_q = jnp.exp(log_q)
-        one_minus_exp_q = 1.0 - exp_q
-        log_one_minus_exp_q = jnp.log(one_minus_exp_q)
+        log_one_minus_exp_q = log1mexp(log_q)
         
         loss = -(jax.lax.stop_gradient(v) * log_q + jax.lax.stop_gradient(1 - v) * log_one_minus_exp_q).mean()
         return loss, {'q_loss': loss, 'q_log_mean': log_q.mean(), 'v_mean': v.mean(), 'v_max': v.max(), 'v_min': v.min()}
@@ -338,7 +348,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # Compute loss_1 per sample (for when future != current, i.e., masks == 1.0)
         # Numerically stable computation
         discount_exp_q = self.config['discount'] * jnp.exp(log_q_next)
-        loss_per_sample = - (jax.lax.stop_gradient(discount_exp_q) * log_v + jax.lax.stop_gradient(1 - discount_exp_q) * jnp.log(1.0 - jnp.exp(log_v)))
+        loss_per_sample = - (jax.lax.stop_gradient(discount_exp_q) * log_v + jax.lax.stop_gradient(1 - discount_exp_q) * log1mexp(log_v))
         
         loss = loss_per_sample.mean()
         return loss, {'v_loss': loss, 'v_log_mean': log_v.mean(), 'v_max': v.max(), 'v_min': v.min()}
