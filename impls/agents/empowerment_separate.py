@@ -482,15 +482,27 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         info = {}
 
         q_loss, q_info = self.q_loss(batch, grad_params, skills_onehot)
+        jax.lax.cond(jnp.isnan(q_loss),
+                     lambda: jax.debug.print("⚠️ NaN detected in q_loss: {x}", x=q_loss, ordered=True),
+                     lambda: None)
         info.update({f'q/{k}': v for k, v in q_info.items()})
 
         v_loss, v_info = self.v_loss(batch, grad_params, skills_onehot)
+        jax.lax.cond(jnp.isnan(v_loss),
+                     lambda: jax.debug.print("⚠️ NaN detected in v_loss: {x}", x=v_loss, ordered=True),
+                     lambda: None)
         info.update({f'v/{k}': v for k, v in v_info.items()})
 
         pi_loss, pi_info = self.policy_loss(batch, grad_params, skills, skills_onehot)
+        jax.lax.cond(jnp.isnan(pi_loss),
+                     lambda: jax.debug.print("⚠️ NaN detected in pi_loss: {x}", x=pi_loss, ordered=True),
+                     lambda: None)
         info.update({f'policy/{k}': v for k, v in pi_info.items()})
 
         bc_loss, bc_info = self.bc_loss(batch, grad_params, skills_onehot)
+        jax.lax.cond(jnp.isnan(bc_loss),
+                     lambda: jax.debug.print("⚠️ NaN detected in bc_loss: {x}", x=bc_loss, ordered=True),
+                     lambda: None)
         info.update({f'bc/{k}': v for k, v in bc_info.items()})
 
         # Compute empowerment for the batch (with stop_gradient to avoid affecting gradients)
@@ -501,6 +513,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         alpha = self.config.get('bc_alpha', 0.0)
         total = q_loss + v_loss + pi_loss + alpha * bc_loss
+        jax.lax.cond(jnp.isnan(total),
+                     lambda: jax.debug.print("⚠️ NaN detected in total_loss: {x}", x=total, ordered=True),
+                     lambda: None)
         return total, info
 
     @jax.jit
