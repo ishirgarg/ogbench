@@ -376,7 +376,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         log_m_bar = jnp.log(m_bar)
 
         # importance weight
-        inv_v_z = 1.0 / v_z
+        inv_v_z = 1.0 / jax.lax.stop_gradient(v_z)
 
         # Q term
         q_term = (q * inv_v_z) * (log_q - log_m_bar)
