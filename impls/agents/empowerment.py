@@ -53,19 +53,13 @@ class EmpowermentValueNetwork(nn.Module):
 
         saz_inputs = jnp.concatenate([obs, acts, skills], axis=-1)
 
-        embedding = self.phi_net(saz_inputs)
-        # L2 normalize the embedding
-        norm = jnp.linalg.norm(embedding, axis=-1, keepdims=True) + 1e-8
-        return embedding / norm
+        return self.phi_net(saz_inputs)
 
     def psi(self, future_states):
 
         future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
 
-        embedding = self.psi_net(future)
-        # L2 normalize the embedding
-        norm = jnp.linalg.norm(embedding, axis=-1, keepdims=True) + 1e-8
-        return embedding / norm
+        return self.psi_net(future)
 
     def __call__(self, observations, actions, skills, future_states):
 
@@ -167,14 +161,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         Returns:
             log_q: [...,] log Q value with proper Gaussian normalization
         """
-        # Normalize embeddings to unit length
-        phi_norm = jnp.linalg.norm(phi_embedding, axis=-1, keepdims=True)
-        phi_normalized = phi_embedding / (phi_norm + 1e-8)
-        
-        psi_norm = jnp.linalg.norm(psi_embedding, axis=-1, keepdims=True)
-        psi_normalized = psi_embedding / (psi_norm + 1e-8)
-        
-        diff = phi_normalized - psi_normalized
+        diff = phi_embedding - psi_embedding
         l2_squared = jnp.sum(diff ** 2, axis=-1)
         # Normalization constant for N(phi, (d/2) * I): -0.5 * d * log(π * d)
         normalization = -0.5 * latent_dim * jnp.log(jnp.pi * latent_dim)
