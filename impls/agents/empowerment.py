@@ -59,10 +59,13 @@ class EmpowermentValueNetwork(nn.Module):
         phi_embedding = self.phi(observations, actions, skills)
         psi_embedding = self.psi(future_states)
 
+        # Compute log Q with proper Gaussian normalization
+        # For psi ~ N(phi, (d/2) * I): log p(psi | phi) = -0.5 * d * log(π * d) - ||phi - psi||^2 / d
         diff = phi_embedding - psi_embedding
         l2_squared = jnp.sum(diff ** 2, axis=-1)
-
-        return -l2_squared / self.latent_dim
+        # Normalization constant for N(phi, (d/2) * I): -0.5 * d * log(π * d)
+        normalization = -0.5 * self.latent_dim * jnp.log(jnp.pi * self.latent_dim)
+        return normalization - l2_squared / self.latent_dim
 
 
 class SkillConditionedActor(GCActor):
@@ -137,6 +140,26 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             return dist.probs.argmax(axis=-1)
         return dist.mode()
 
+    def compute_q_logits_from_embedding(self, phi_embedding, psi_embedding, latent_dim):
+        """Compute log Q^z(s^+ | s, a) from phi and psi embeddings.
+        
+        For psi ~ N(phi, (d/2) * I), the log probability density is:
+        log p(psi | phi) = -0.5 * d * log(π * d) - ||phi - psi||^2 / d
+        
+        Args:
+            phi_embedding: [..., d] phi embedding (s, a, z)
+            psi_embedding: [..., d] psi embedding (s^+)
+            latent_dim: int, latent dimension d
+            
+        Returns:
+            log_q: [...,] log Q value with proper Gaussian normalization
+        """
+        diff = phi_embedding - psi_embedding
+        l2_squared = jnp.sum(diff ** 2, axis=-1)
+        # Normalization constant for N(phi, (d/2) * I): -0.5 * d * log(π * d)
+        normalization = -0.5 * latent_dim * jnp.log(jnp.pi * latent_dim)
+        return normalization - l2_squared / latent_dim
+
     # ── Core value computations ────────────────────────────────────────────
 
     def empowerment(self, observations, rng):
@@ -164,13 +187,17 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             psi_samples = phi_z[None] + noise * jnp.sqrt(self.config['value_latent_dim'] / 2.0)
 
             def contribution(psi_splus):
-                diff = phi_z - psi_splus
-                log_v = -jnp.sum(diff**2, axis=-1) / self.config['value_latent_dim']
+                log_v = self.compute_q_logits_from_embedding(
+                    phi_z, psi_splus, self.config['value_latent_dim']
+                )
                 v = jnp.exp(log_v)
 
                 # Compute log_v_all for all skills, matching value network normalization
-                diff_all = phi_all - psi_splus
-                log_v_all = -jnp.sum(diff_all**2, axis=-1) / self.config['value_latent_dim']
+                # phi_all: [K, batch, d], psi_splus: [batch, d]
+                # Broadcasting will make psi_splus [1, batch, d] -> [K, batch, d]
+                log_v_all = self.compute_q_logits_from_embedding(
+                    phi_all, psi_splus, self.config['value_latent_dim']
+                )  # [K, batch]
                 v_all = jnp.exp(log_v_all)
                 # Add epsilon to prevent division by zero and ensure positive denominator
                 denom = v_all.mean(axis=0) + 1e-8
@@ -307,12 +334,20 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         psi = phi_z[None] + jax.random.normal(sample_rng, (N, *phi_z.shape)) * jnp.sqrt(d / 2.0)
 
         # log Q^z: [N, batch]
-        log_q = -jnp.sum((psi - phi_z[None]) ** 2, axis=-1) / d
+        # psi: [N, batch, d], phi_z: [batch, d]
+        log_q = self.compute_q_logits_from_embedding(
+            phi_z[None], psi, d
+        )  # [N, batch]
 
         # log V^{z'} for all skills: [N, K, batch]
         # psi[:, None]:    [N, 1, batch, d]
         # phi_all[None]:   [1, K, batch, d]
-        log_v_all = -jnp.sum((psi[:, None] - phi_all[None]) ** 2, axis=-1) / d
+        # We need to compute for each (n, k, b): -||psi[n, b] - phi_all[k, b]||^2 / d
+        # Reshape for broadcasting: psi[:, None, :, :] is [N, 1, batch, d]
+        # phi_all[None, :, :, :] is [1, K, batch, d]
+        log_v_all = self.compute_q_logits_from_embedding(
+            phi_all[None], psi[:, None], d
+        )  # [N, K, batch]
 
         q       = jnp.exp(log_q)            # [N, batch]
         v_all   = jnp.exp(log_v_all)        # [N, K, batch]
@@ -324,7 +359,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # M̄ = (Q^z + Σ_{z'≠z} V^{z'}) / K   [N, batch]
         v_all_sum = v_all.sum(axis=1)        # [N, batch]
         m_bar     = (q + jax.lax.stop_gradient(v_all_sum - v_z)) / K
-        log_m_bar = jnp.log(m_bar + 1e-8)   # [N, batch]
+        log_m_bar = jnp.log(m_bar)   # [N, batch]
 
         # Q^z · log(Q^z / M̄)   [N, batch]
         q_term = q * (log_q - log_m_bar)
