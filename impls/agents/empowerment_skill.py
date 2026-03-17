@@ -57,6 +57,18 @@ def log_diff_exp(log_total, log_part):
     """
     return log_total + log1mexp(log_part - log_total)
 
+def clipped_linexp_loss(target, pred, gamma, t=-6):
+    '''Clipped linexp loss;  note that target and pred and t should be in log space, this regresses e^pred to gamma * e^target'''
+    target, t = jax.lax.stop_gradient(target), jax.lax.stop_gradient(t)
+    # Use jnp.where for element-wise conditional (works with arrays)
+    loss = jnp.where(
+        pred > t,
+        jnp.exp(jnp.log(gamma) + target - pred) + pred,
+        pred + jnp.exp(jnp.log(gamma) + target - t) * (1 - pred + t),
+    )
+    return loss.mean()
+
+
 
 # ── Network modules ───────────────────────────────────────────────────────────
 
@@ -244,8 +256,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         """
         diff = phi_emb - psi_emb
         l2_sq = jnp.sum(diff ** 2, axis=-1)
-        norm = -0.5 * latent_dim * jnp.log(jnp.pi * latent_dim)
-        return norm - l2_sq / latent_dim
+        return -l2_sq / latent_dim
 
     def _v_phi(self, observations, skills_onehot, *, use_target: bool,
                 policy_params=None):
@@ -441,24 +452,26 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             skills_onehot, future, params=grad_params
         )
 
-        v = jnp.exp(log_v)
-        one_minus_v = -jnp.expm1(log_v)   # 1 − exp(log_v), precise near 0
-
-        loss = -(
-            jax.lax.stop_gradient(v) * log_q
-            + jax.lax.stop_gradient(one_minus_v) * log1mexp(log_q)
-        ).mean()
+        # Use clipped_linexp_loss: regress e^log_q to e^log_v (gamma=1.0)
+        # target=log_v (frozen), pred=log_q (gradient flows)
+        loss = clipped_linexp_loss(
+            target=log_v,
+            pred=log_q,
+            gamma=1.0
+        )
 
         return loss, {
             'q_loss': loss,
             'q_log_mean': log_q.mean(),
-            'v_mean': v.mean(),
-            'v_max': v.max(),
-            'v_min': v.min(),
+            'v_log_mean': log_v.mean(),
+            'v_mean': jnp.exp(log_v).mean(),
+            'v_max': jnp.exp(log_v).max(),
+            'v_min': jnp.exp(log_v).min(),
         }
 
     def v_loss(self, batch, grad_params, skills_onehot):
         """L_V — Bellman backup for the occupancy V (eqs. 16-17).
+
 
         In combined mode `grad_params` differentiates through the Q network
         (since V≡Q(π)); the policy is frozen (policy_params=None).
@@ -480,23 +493,19 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             batch['observations'], skills_onehot, future,
             params=grad_params, policy_params=None
         )
-        v = jnp.exp(log_v)
-
-        log_discount = jnp.log(self.config['discount'])
-        discount_exp_q = jnp.exp(log_discount + log_q_next)
-        # Use expm1 for numerical precision when γQ is very small.
-        one_minus_discount_exp_q = -jnp.expm1(log_discount + log_q_next)
-
-        loss = -(
-            jax.lax.stop_gradient(discount_exp_q) * log_v
-            + jax.lax.stop_gradient(one_minus_discount_exp_q) * log1mexp(log_v)
-        ).mean()
+        # Use clipped_linexp_loss: regress e^log_v to discount * e^log_q_next
+        # target=log_q_next (frozen), pred=log_v (gradient flows), gamma=discount
+        loss = clipped_linexp_loss(
+            target=log_q_next,
+            pred=log_v,
+            gamma=self.config['discount']
+        )
 
         return loss, {
             'v_loss': loss,
             'v_log_mean': log_v.mean(),
-            'v_max': v.max(),
-            'v_min': v.min(),
+            'v_max': jnp.exp(log_v).max(),
+            'v_min': jnp.exp(log_v).min(),
         }
 
     def bc_loss(self, batch, grad_params, skills_onehot):
