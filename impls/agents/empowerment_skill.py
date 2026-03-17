@@ -112,8 +112,7 @@ class EmpowermentQNetwork(nn.Module):
         diff = phi_emb - psi_emb
         l2_sq = jnp.sum(diff ** 2, axis=-1)
         # log p(ψ | φ) for ψ ~ N(φ, (d/2)·I):  −½d·log(πd) − ‖φ−ψ‖²/d
-        norm = -0.5 * self.latent_dim * jnp.log(jnp.pi * self.latent_dim)
-        return norm - l2_sq / self.latent_dim
+        return -l2_sq / self.latent_dim
 
 
 class EmpowermentVNetwork(nn.Module):
@@ -156,8 +155,7 @@ class EmpowermentVNetwork(nn.Module):
         psi_emb = self.psi(future_states)
         diff = phi_emb - psi_emb
         l2_sq = jnp.sum(diff ** 2, axis=-1)
-        norm = -0.5 * self.latent_dim * jnp.log(jnp.pi * self.latent_dim)
-        return norm - l2_sq / self.latent_dim
+        return -l2_sq / self.latent_dim
 
 
 class SkillConditionedActor(GCActor):
