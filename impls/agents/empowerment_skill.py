@@ -57,10 +57,10 @@ def log_diff_exp(log_total, log_part):
     """
     return log_total + log1mexp(log_part - log_total)
 
-def clipped_linexp_loss(target, pred, gamma, t=-6):
+def clipped_linexp_loss(target, pred, gamma, t=-6, min_q_value=-8):
     '''Clipped linexp loss;  note that target and pred and t should be in log space, this regresses e^pred to gamma * e^target'''
     target, t = jax.lax.stop_gradient(target), jax.lax.stop_gradient(t)
-    target, pred = jnp.clip(target, -self.config['min_q_value'], 0), jnp.clip(pred, -self.config['min_q_value'], 0)
+    target, pred = jnp.clip(target, min_q_value, 0), jnp.clip(pred, min_q_value, 0)
     # Use jnp.where for element-wise conditional (works with arrays)
     loss = jnp.where(
         pred > t,
@@ -458,7 +458,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         loss = clipped_linexp_loss(
             target=log_v,
             pred=log_q,
-            gamma=1.0
+            gamma=1.0,
+            min_q_value=self.config['min_q_value']
         )
 
         return loss, {
@@ -499,7 +500,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         loss = clipped_linexp_loss(
             target=log_q_next,
             pred=log_v,
-            gamma=self.config['discount']
+            gamma=self.config['discount'],
+            min_q_value=self.config['min_q_value']
         )
 
         return loss, {
