@@ -60,6 +60,7 @@ def log_diff_exp(log_total, log_part):
 def clipped_linexp_loss(target, pred, gamma, t=-6):
     '''Clipped linexp loss;  note that target and pred and t should be in log space, this regresses e^pred to gamma * e^target'''
     target, t = jax.lax.stop_gradient(target), jax.lax.stop_gradient(t)
+    target, pred = jnp.clip(target, -self.config['min_q_value'], 0), jnp.clip(pred, -self.config['min_q_value'], 0)
     # Use jnp.where for element-wise conditional (works with arrays)
     loss = jnp.where(
         pred > t,
@@ -869,6 +870,7 @@ def get_config():
         # False (default): V derived from Q via the policy (single network).
         # True:            independent Q and V networks with separate targets.
         separate_qv=False,
+        min_q_value=-8,
         # ───────────────────────────────────────────────────────────────────
         discrete=False,
         const_std=True,
