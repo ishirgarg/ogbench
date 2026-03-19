@@ -495,16 +495,34 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         )
         # Use clipped_linexp_loss: regress e^log_v to discount * e^log_q_next
         # target=log_q_next (frozen), pred=log_v (gradient flows), gamma=discount
-        loss = clipped_linexp_loss(
+        loss_future = clipped_linexp_loss(
             target=log_q_next,
             pred=log_v,
             gamma=self.config['discount'],
             min_q_value=self.config['min_q_value']
         )
 
+        # Second loss: regress V(s | s, z) onto 1 - discount
+        # When future state equals current state, V should be 1 - discount
+        log_v_current = self.compute_v_logits(
+            batch['observations'], skills_onehot, batch['observations'],
+            params=grad_params, policy_params=None
+        )
+        loss_current = clipped_linexp_loss(
+            target=jnp.log(1.0 - self.config['discount']),
+            pred=log_v_current,
+            gamma=1.0,
+            min_q_value=self.config['min_q_value']
+        )
+
+        loss = loss_future + loss_current
+
         return loss, {
             'v_loss': loss,
+            'v_loss_future': loss_future,
+            'v_loss_current': loss_current,
             'v_log_mean': log_v.mean(),
+            'v_log_current_mean': log_v_current.mean(),
             'v_max': jnp.exp(log_v).max(),
             'v_min': jnp.exp(log_v).min(),
         }
