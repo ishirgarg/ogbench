@@ -502,30 +502,34 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             min_q_value=self.config['min_q_value']
         )
 
-        # Second loss: regress V(s | s, z) onto 1 - discount
-        # When future state equals current state, V should be 1 - discount
-        log_v_current = self.compute_v_logits(
-            batch['observations'], skills_onehot, batch['observations'],
-            params=grad_params, policy_params=None
-        )
-        loss_current = clipped_linexp_loss(
-            target=jnp.log(1.0 - self.config['discount']),
-            pred=log_v_current,
-            gamma=1.0,
-            min_q_value=self.config['min_q_value']
-        )
-
-        loss = loss_future + loss_current
-
-        return loss, {
+        loss = loss_future
+        metrics = {
             'v_loss': loss,
             'v_loss_future': loss_future,
-            'v_loss_current': loss_current,
             'v_log_mean': log_v.mean(),
-            'v_log_current_mean': log_v_current.mean(),
             'v_max': jnp.exp(log_v).max(),
             'v_min': jnp.exp(log_v).min(),
         }
+
+        # Second loss: regress V(s | s, z) onto 1 - discount
+        # When future state equals current state, V should be 1 - discount
+        if self.config.get('use_self_v_loss', True):
+            log_v_current = self.compute_v_logits(
+                batch['observations'], skills_onehot, batch['observations'],
+                params=grad_params, policy_params=None
+            )
+            loss_current = clipped_linexp_loss(
+                target=jnp.log(1.0 - self.config['discount']),
+                pred=log_v_current,
+                gamma=1.0,
+                min_q_value=self.config['min_q_value']
+            )
+            loss = loss_future + loss_current
+            metrics['v_loss'] = loss
+            metrics['v_loss_current'] = loss_current
+            metrics['v_log_current_mean'] = log_v_current.mean()
+
+        return loss, metrics
 
     def bc_loss(self, batch, grad_params, skills_onehot):
         """Behavioral cloning loss: −log π(a_expert | s, z)."""
@@ -889,6 +893,7 @@ def get_config():
         # True:            independent Q and V networks with separate targets.
         separate_qv=False,
         min_q_value=-8,
+        use_self_v_loss=True,  # Whether to add loss regressing V(s | s, z) onto 1 - discount
         # ───────────────────────────────────────────────────────────────────
         discrete=False,
         const_std=True,
