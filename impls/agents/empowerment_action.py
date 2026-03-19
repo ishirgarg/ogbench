@@ -475,7 +475,7 @@ class EmpowermentActionAgent(flax.struct.PyTreeNode):
             )["params"]
 
         tx = optax.adam(learning_rate=config.get("lr", 3e-4))
-        network = TrainState.create(apply_fn=network_def.apply, params=params, tx=tx, model_def=network_def)
+        network = TrainState.create(model_def=network_def, params=params, tx=tx)
         return cls(rng=rng, network=network, config=config)
 
 
