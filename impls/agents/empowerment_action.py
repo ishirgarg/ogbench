@@ -129,7 +129,7 @@ class EmpowermentVNetwork(nn.Module):
 class EmpowermentActor(GCActor):
     """Continuous actor π(a|s) (no goals, no skills)."""
 
-    def __call__(self, observations, goal_encoded=False, temperature=1.0):
+    def __call__(self, observations, goals=None, goal_encoded=False, temperature=1.0):
         if self.gc_encoder is not None:
             inputs = self.gc_encoder(observations, None)
         else:
@@ -148,7 +148,7 @@ class EmpowermentActor(GCActor):
 class EmpowermentDiscreteActor(GCDiscreteActor):
     """Discrete actor π(a|s) (no goals, no skills)."""
 
-    def __call__(self, observations, goal_encoded=False, temperature=1.0):
+    def __call__(self, observations, goals=None, goal_encoded=False, temperature=1.0):
         if self.gc_encoder is not None:
             inputs = self.gc_encoder(observations, None)
         else:
@@ -400,7 +400,7 @@ class EmpowermentActionAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
-    def sample_actions(self, observations, temperature=1.0):
+    def sample_actions(self, observations, goals=None, temperature=1.0):
         dist = self.network.select("policy")(observations, params=None, temperature=temperature)
         return dist.sample(seed=self.rng)
 
