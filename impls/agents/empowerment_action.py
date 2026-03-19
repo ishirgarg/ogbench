@@ -400,13 +400,20 @@ class EmpowermentActionAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
-    def sample_actions(self, observations, goals=None, temperature=1.0):
-        dist = self.network.select("policy")(observations, params=None, temperature=temperature)
-        return dist.sample(seed=self.rng)
+    def sample_actions(self, observations, goals=None, seed=None, temperature=1.0):
+        """Sample actions. Accepts goals for API compatibility; goals are ignored."""
+        if seed is None:
+            seed = self.rng
 
-    @jax.jit
-    def eval_actions(self, observations):
-        return self._policy_actions(observations, params=None)
+        single_obs = observations.ndim == 1
+        if single_obs:
+            observations = observations[None, :]
+        if goals is not None and goals.ndim == 1:
+            goals = goals[None, :]
+
+        dist = self.network.select("policy")(observations, params=None, temperature=temperature)
+        actions = dist.sample(seed=seed)
+        return actions[0] if single_obs else actions
 
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
