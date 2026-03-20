@@ -57,16 +57,22 @@ def log_diff_exp(log_total, log_part):
     """
     return log_total + log1mexp(log_part - log_total)
 
-def clipped_linexp_loss(target, pred, gamma, t=-6, min_q_value=-8):
-    '''Clipped linexp loss;  note that target and pred and t should be in log space, this regresses e^pred to gamma * e^target'''
+def clipped_linexp_loss(target, pred, gamma, t=5.0):
     target, t = jax.lax.stop_gradient(target), jax.lax.stop_gradient(t)
-    target, pred = jnp.clip(target, min_q_value, 0), jnp.clip(pred, min_q_value, 0)
-    # Use jnp.where for element-wise conditional (works with arrays)
+
+    p0 = target + t
+    value_p0 = gamma * jnp.exp(t) - (target + t)
+    slope_p0 = gamma * jnp.exp(t) - 1.0
+
+    true_loss = gamma * jnp.exp(pred - target) - pred
+    linear_loss = value_p0 + slope_p0 * (pred - p0)
+
     loss = jnp.where(
-        pred > t,
-        jnp.exp(jnp.log(gamma) + target - pred) + pred,
-        pred + jnp.exp(jnp.log(gamma) + target - t) * (1 - pred + t),
+        pred - target < t,
+        true_loss,
+        linear_loss,
     )
+
     return loss.mean()
 
 
@@ -84,6 +90,7 @@ class EmpowermentQNetwork(nn.Module):
     layer_norm: bool = True
     discrete: bool = False
     gc_encoder: Optional[nn.Module] = None
+    shared_psi: Optional[nn.Module] = None
 
     def setup(self):
         self.phi_net = MLP(
@@ -91,11 +98,12 @@ class EmpowermentQNetwork(nn.Module):
             activate_final=False,
             layer_norm=self.layer_norm,
         )
-        self.psi_net = MLP(
-            (*self.hidden_dims, self.latent_dim),
-            activate_final=False,
-            layer_norm=self.layer_norm,
-        )
+        if self.shared_psi is None:
+            self.psi_net = MLP(
+                (*self.hidden_dims, self.latent_dim),
+                activate_final=False,
+                layer_norm=self.layer_norm,
+            )
 
     def phi(self, observations, actions, skills):
         obs = self.gc_encoder(observations, None) if self.gc_encoder else observations
@@ -103,6 +111,8 @@ class EmpowermentQNetwork(nn.Module):
         return self.phi_net(jnp.concatenate([obs, acts, skills], axis=-1))
 
     def psi(self, future_states):
+        if self.shared_psi is not None:
+            return self.shared_psi(future_states)
         future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
         return self.psi_net(future)
 
@@ -129,6 +139,7 @@ class EmpowermentVNetwork(nn.Module):
     layer_norm: bool = True
     discrete: bool = False   # unused; kept for symmetric construction
     gc_encoder: Optional[nn.Module] = None
+    shared_psi: Optional[nn.Module] = None
 
     def setup(self):
         self.phi_net = MLP(
@@ -136,17 +147,20 @@ class EmpowermentVNetwork(nn.Module):
             activate_final=False,
             layer_norm=self.layer_norm,
         )
-        self.psi_net = MLP(
-            (*self.hidden_dims, self.latent_dim),
-            activate_final=False,
-            layer_norm=self.layer_norm,
-        )
+        if self.shared_psi is None:
+            self.psi_net = MLP(
+                (*self.hidden_dims, self.latent_dim),
+                activate_final=False,
+                layer_norm=self.layer_norm,
+            )
 
     def phi(self, observations, skills):
         obs = self.gc_encoder(observations, None) if self.gc_encoder else observations
         return self.phi_net(jnp.concatenate([obs, skills], axis=-1))
 
     def psi(self, future_states):
+        if self.shared_psi is not None:
+            return self.shared_psi(future_states)
         future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
         return self.psi_net(future)
 
@@ -156,6 +170,26 @@ class EmpowermentVNetwork(nn.Module):
         diff = phi_emb - psi_emb
         l2_sq = jnp.sum(diff ** 2, axis=-1)
         return -l2_sq / self.latent_dim
+
+
+class SharedPsiEncoder(nn.Module):
+    """Shared ψ(s⁺): optional GC encoder on s⁺ + one ψ MLP."""
+
+    hidden_dims: Sequence[int]
+    latent_dim: int = 128
+    layer_norm: bool = True
+    gc_encoder: Optional[nn.Module] = None
+
+    def setup(self):
+        self.psi_net = MLP(
+            (*self.hidden_dims, self.latent_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+        )
+
+    def __call__(self, future_states):
+        future = self.gc_encoder(future_states, None) if self.gc_encoder else future_states
+        return self.psi_net(future)
 
 
 class SkillConditionedActor(GCActor):
@@ -438,35 +472,83 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     # dispatching is handled by the V modulation interface above.
 
     def q_loss(self, batch, grad_params, skills_onehot):
-        """L_Q = −V^z(s⁺|s) ▷ log Q^z(s⁺|s,a)  (eq. 15)."""
-        future = batch['value_goals']
+        """Q loss.
 
-        # Target V from next_observations for the Bellman target (frozen).
-        log_v = self.compute_v_logits_target(
-            batch['next_observations'], skills_onehot, future
-        )
-        # Online Q being optimised.
+        separate_qv=True:
+            Regress Q(s⁺ | s, a, z) onto V(s⁺ | s', z).
+        separate_qv=False (shared Q/V):
+            Apply two Bellman-style Q losses:
+              1) Q(s⁺ | s, a, z) = γ Q(s⁺ | s', π(s',z), z)
+              2) Q(s' | s, a, z) = (1-γ) + γ Q(s' | s', π(s',z), z)
+        """
+        future = batch['value_goals']
         log_q = self.compute_q_logits(
             batch['observations'], batch['actions'],
             skills_onehot, future, params=grad_params
         )
 
-        # Use clipped_linexp_loss: regress e^log_q to e^log_v (gamma=1.0)
-        # target=log_v (frozen), pred=log_q (gradient flows)
-        loss = clipped_linexp_loss(
-            target=log_v,
-            pred=log_q,
-            gamma=1.0,
-            min_q_value=self.config['min_q_value']
+        if self.config['separate_qv']:
+            # Target V from next_observations for the Bellman target (frozen).
+            log_v = self.compute_v_logits_target(
+                batch['next_observations'], skills_onehot, future
+            )
+            loss = clipped_linexp_loss(
+                target=-log_v,
+                pred=-log_q,
+                gamma=1.0,
+            )
+            return loss, {
+                'q_loss': loss,
+                'q_loss_future': loss,
+                'q_log_mean': log_q.mean(),
+                'v_log_mean': log_v.mean(),
+                'v_mean': jnp.exp(log_v).mean(),
+                'v_max': jnp.exp(log_v).max(),
+                'v_min': jnp.exp(log_v).min(),
+            }
+
+        # Shared Q/V mode: no V loss; Q carries both Bellman terms.
+        actions_next = self._policy_actions(
+            batch['next_observations'], skills_onehot, params=None
+        )
+        # 1) Q(s+ | s,a) = gamma * Q(s+ | s', pi(s',z), z)
+        log_q_next_future = self.compute_q_logits_target(
+            batch['next_observations'], actions_next, skills_onehot, future
+        )
+        loss_future = clipped_linexp_loss(
+            target=-log_q_next_future,
+            pred=-log_q,
+            gamma=self.config['discount'],
         )
 
+        # 2) Q(s' | s,a) = (1-gamma) + gamma * Q(s' | s', pi(s',z), z)
+        log_q_current = self.compute_q_logits(
+            batch['observations'], batch['actions'],
+            skills_onehot, batch['next_observations'], params=grad_params
+        )
+        log_q_next_current = self.compute_q_logits_target(
+            batch['next_observations'], actions_next,
+            skills_onehot, batch['next_observations']
+        )
+        log_current_target = jnp.logaddexp(
+            jnp.log(1.0 - self.config['discount']),
+            jnp.log(self.config['discount']) + log_q_next_current,
+        )
+        loss_current = clipped_linexp_loss(
+            target=-log_current_target,
+            pred=-log_q_current,
+            gamma=1.0,
+        )
+
+        loss = loss_future + loss_current
         return loss, {
             'q_loss': loss,
+            'q_loss_future': loss_future,
+            'q_loss_current': loss_current,
             'q_log_mean': log_q.mean(),
-            'v_log_mean': log_v.mean(),
-            'v_mean': jnp.exp(log_v).mean(),
-            'v_max': jnp.exp(log_v).max(),
-            'v_min': jnp.exp(log_v).min(),
+            'q_log_current_mean': log_q_current.mean(),
+            'q_log_next_future_mean': log_q_next_future.mean(),
+            'q_log_next_current_mean': log_q_next_current.mean(),
         }
 
     def v_loss(self, batch, grad_params, skills_onehot):
@@ -477,6 +559,15 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         (since V≡Q(π)); the policy is frozen (policy_params=None).
         In separate mode `grad_params` differentiates through the V network.
         """
+        if not self.config['separate_qv']:
+            # In shared Q/V mode, Q loss already includes both Bellman terms.
+            zero = jnp.array(0.0, dtype=batch['observations'].dtype)
+            return zero, {
+                'v_loss': zero,
+                'v_loss_future': zero,
+                'v_loss_current': zero,
+            }
+
         future = batch['value_goals']
 
         # Policy is frozen in the Bellman backup (policy_params=None).
@@ -496,10 +587,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # Use clipped_linexp_loss: regress e^log_v to discount * e^log_q_next
         # target=log_q_next (frozen), pred=log_v (gradient flows), gamma=discount
         loss_future = clipped_linexp_loss(
-            target=log_q_next,
-            pred=log_v,
+            target=-log_q_next,
+            pred=-log_v,
             gamma=self.config['discount'],
-            min_q_value=self.config['min_q_value']
         )
 
         loss = loss_future
@@ -511,23 +601,36 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             'v_min': jnp.exp(log_v).min(),
         }
 
-        # Second loss: regress V(s | s, z) onto 1 - discount
-        # When future state equals current state, V should be 1 - discount
+        # Second loss: regress V(s | s, z) onto
+        # (1 - discount) + discount * Q(s | s, pi(s,z), z)
+        # When future state equals current state, use:
+        #   V(s | s, z) -> (1 - discount) + discount * Q(s | s, pi(s,z), z)
         if self.config.get('use_self_v_loss', True):
+            # Reuse frozen policy action for the current state.
+            log_q_current = self.compute_q_logits_target(
+                batch['observations'],
+                actions_next,
+                skills_onehot,
+                batch['observations'],
+            )
+            log_current_target = jnp.logaddexp(
+                jnp.log(1.0 - self.config['discount']),
+                jnp.log(self.config['discount']) + log_q_current,
+            )
             log_v_current = self.compute_v_logits(
                 batch['observations'], skills_onehot, batch['observations'],
                 params=grad_params, policy_params=None
             )
             loss_current = clipped_linexp_loss(
-                target=jnp.log(1.0 - self.config['discount']),
-                pred=log_v_current,
+                target=-log_current_target,
+                pred=-log_v_current,
                 gamma=1.0,
-                min_q_value=self.config['min_q_value']
             )
             loss = loss_future + loss_current
             metrics['v_loss'] = loss
             metrics['v_loss_current'] = loss_current
             metrics['v_log_current_mean'] = log_v_current.mean()
+            metrics['q_log_current_mean'] = log_q_current.mean()
 
         return loss, metrics
 
@@ -803,9 +906,6 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             discrete=config['discrete'],
         )
 
-        q_def        = EmpowermentQNetwork(**value_kwargs, gc_encoder=encoders.get('q'))
-        target_q_def = copy.deepcopy(q_def)
-
         actor_cls    = (SkillConditionedDiscreteActor if config['discrete']
                         else SkillConditionedActor)
         actor_kwargs = dict(
@@ -830,9 +930,47 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         )
 
         if separate_qv:
-            # Independent Q and V networks, each with their own target copy.
-            v_def        = EmpowermentVNetwork(**value_kwargs, gc_encoder=encoders.get('v'))
-            target_v_def = copy.deepcopy(v_def)
+            # Independent Q and V networks with shared ψ(s+) encoder.
+            psi_encoder = None
+            target_psi_encoder = None
+            if config.get('encoder') is not None:
+                enc = encoder_modules[config['encoder']]
+                psi_encoder = GCEncoder(concat_encoder=enc())
+                target_psi_encoder = GCEncoder(concat_encoder=enc())
+
+            shared_psi_def = SharedPsiEncoder(
+                hidden_dims=value_kwargs['hidden_dims'],
+                latent_dim=value_kwargs['latent_dim'],
+                layer_norm=value_kwargs['layer_norm'],
+                gc_encoder=psi_encoder,
+            )
+            target_shared_psi_def = SharedPsiEncoder(
+                hidden_dims=value_kwargs['hidden_dims'],
+                latent_dim=value_kwargs['latent_dim'],
+                layer_norm=value_kwargs['layer_norm'],
+                gc_encoder=target_psi_encoder,
+            )
+
+            q_def = EmpowermentQNetwork(
+                **value_kwargs,
+                gc_encoder=encoders.get('q'),
+                shared_psi=shared_psi_def,
+            )
+            v_def = EmpowermentVNetwork(
+                **value_kwargs,
+                gc_encoder=encoders.get('v'),
+                shared_psi=shared_psi_def,
+            )
+            target_q_def = EmpowermentQNetwork(
+                **value_kwargs,
+                gc_encoder=encoders.get('q'),
+                shared_psi=target_shared_psi_def,
+            )
+            target_v_def = EmpowermentVNetwork(
+                **value_kwargs,
+                gc_encoder=encoders.get('v'),
+                shared_psi=target_shared_psi_def,
+            )
 
             network_def = ModuleDict(dict(
                 q=q_def, v=v_def,
@@ -851,6 +989,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             network_params['modules_target_v'] = network_params['modules_v']
         else:
             # Single Q network; V is derived at runtime via the policy.
+            q_def = EmpowermentQNetwork(**value_kwargs, gc_encoder=encoders.get('q'))
+            target_q_def = copy.deepcopy(q_def)
             network_def = ModuleDict(dict(
                 q=q_def, target_q=target_q_def, policy=policy_def,
             ))
@@ -885,7 +1025,7 @@ def get_config():
         discount=0.99,
         tau=0.005,
         num_skills=5,
-        num_splus_samples=8,
+        num_splus_samples=64,
         obs_indices=ml_collections.config_dict.placeholder(tuple),
         bc_alpha=0.0,
         # ── Architecture flag ───────────────────────────────────────────────
