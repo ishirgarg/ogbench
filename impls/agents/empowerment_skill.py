@@ -803,7 +803,15 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         info['empowerment/min']  = empowerment_vals.min()
         info['empowerment/max']  = empowerment_vals.max()
 
-        alpha = self.config.get('bc_alpha', 0.0)
+        base_alpha = self.config.get('bc_alpha', 0.0)
+        if self.config.get('anneal_alpha', False):
+            # Exponential decay with half-life 100k optimizer steps.
+            step = jnp.asarray(self.network.step, dtype=jnp.float32)
+            alpha = base_alpha * jnp.power(0.5, step / 100000.0)
+        else:
+            alpha = jnp.asarray(base_alpha, dtype=jnp.float32)
+        info['bc/alpha'] = alpha
+        
         total = q_loss + v_loss + pi_loss + alpha * bc_loss
         jax.lax.cond(
             jnp.isnan(total),
@@ -1028,6 +1036,7 @@ def get_config():
         num_splus_samples=64,
         obs_indices=ml_collections.config_dict.placeholder(tuple),
         bc_alpha=0.0,
+        anneal_alpha=False,
         # ── Architecture flag ───────────────────────────────────────────────
         # False (default): V derived from Q via the policy (single network).
         # True:            independent Q and V networks with separate targets.
