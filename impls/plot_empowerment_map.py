@@ -55,7 +55,7 @@ def main():
         "--ball_xy",
         type=str,
         default=None,
-        help="Fixed ball x,y as 'x,y'. If omitted, uses ball position from reset observation.",
+        help="Fixed ball x,y as 'x,y'. If omitted, uses 9 random positions and plots a 3x3 grid.",
     )
     parser.add_argument("--output", type=str, default=None, help="Output image path (.png). Defaults to run dir.")
     parser.add_argument(
@@ -64,10 +64,18 @@ def main():
         default=192,
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
-    parser.add_argument("--x_min", type=float, default=-22.0, help="Grid min x for ant position.")
-    parser.add_argument("--x_max", type=float, default=22.0, help="Grid max x for ant position.")
-    parser.add_argument("--y_min", type=float, default=-22.0, help="Grid min y for ant position.")
-    parser.add_argument("--y_max", type=float, default=22.0, help="Grid max y for ant position.")
+    parser.add_argument("--x_min", type=float, default=-12.0, help="Grid min x for ant position.")
+    parser.add_argument("--x_max", type=float, default=12.0, help="Grid max x for ant position.")
+    parser.add_argument("--y_min", type=float, default=-12.0, help="Grid min y for ant position.")
+    parser.add_argument("--y_max", type=float, default=12.0, help="Grid max y for ant position.")
+    parser.add_argument(
+        "--goal_xy",
+        type=str,
+        default=None,
+        help="Optional goal x,y as 'x,y'. If provided and env supports set_goal, sets goal once before sweep.",
+    )
+    parser.add_argument("--fix_ball", action="store_true", help="Fix ball position; sample 9 random goals.")
+    parser.add_argument("--fix_goal", action="store_true", help="Fix goal position; sample 9 random balls.")
     args = parser.parse_args()
 
     run_dir = args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)
@@ -105,20 +113,6 @@ def main():
     obs0 = np.asarray(obs0, dtype=np.float32)
 
     base_env = env.unwrapped
-    # Decide ball positions:
-    # - If provided, use that single fixed position.
-    # - If omitted, create 4 random positions within [x_min,x_max]×[y_min,y_max] and
-    #   plot a 2×2 grid of empowerment maps.
-    if args.ball_xy is not None:
-        bx, by = _parse_indices(args.ball_xy)
-        ball_positions = [(float(bx), float(by))]
-    else:
-        # Unseeded randomness: rely on numpy global RNG state.
-        ball_positions = []
-        for _ in range(4):
-            rx = float(np.random.uniform(low=float(args.x_min), high=float(args.x_max)))
-            ry = float(np.random.uniform(low=float(args.y_min), high=float(args.y_max)))
-            ball_positions.append((rx, ry))
 
     x_low, x_high = args.x_min, args.x_max
     y_low, y_high = args.y_min, args.y_max
@@ -127,13 +121,22 @@ def main():
     ys = np.linspace(y_low, y_high, args.grid_res, dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
 
-    def compute_empowerment_map(fixed_ball_xy: tuple[float, float]) -> np.ndarray:
+    def compute_empowerment_map(fixed_ball_xy: tuple[float, float], goal_xy_override: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         # Build observations using the env's own state->observation path when available.
         # This guarantees the state vector matches exactly what the environment produces.
         flat_x = xx.reshape(-1)
         flat_y = yy.reshape(-1)
         obs_list = []
         if hasattr(base_env, "set_agent_ball_xy") and (hasattr(base_env, "get_ob") or hasattr(base_env, "_get_obs")):
+            # Set a goal for this map: override if provided, else random within bounds.
+            if goal_xy_override is not None:
+                goal_xy = goal_xy_override.astype(np.float64)
+            else:
+                goal_xy = np.array(
+                    [np.random.uniform(x_low, x_high), np.random.uniform(y_low, y_high)],
+                    dtype=np.float64,
+                )
+            base_env.set_goal(goal_xy=goal_xy)
             for x, y in zip(flat_x, flat_y):
                 base_env.set_agent_ball_xy(np.array([x, y], dtype=np.float64), np.array(fixed_ball_xy, dtype=np.float64))
                 if hasattr(base_env, "get_ob"):
@@ -154,16 +157,74 @@ def main():
             obs_batch[:, ant_y_idx] = flat_y
             obs_batch[:, ball_x_idx] = fixed_ball_xy[0]
             obs_batch[:, ball_y_idx] = fixed_ball_xy[1]
-        emp = np.asarray(agent.empowerment(jnp.asarray(obs_batch), rng=jax.random.PRNGKey(0)))
-        return emp.reshape(args.grid_res, args.grid_res)
+        # Use a different PRNG key for every point to avoid correlated estimates.
+        obs_batch_jnp = jnp.asarray(obs_batch)
+        num_points = obs_batch_jnp.shape[0]
+        root_seed = int(np.random.randint(0, 2**31 - 1))
+        root_key = jax.random.PRNGKey(root_seed)
+        point_keys = jax.random.split(root_key, num_points)
+        emp = np.asarray(
+            jax.vmap(
+                lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
+                in_axes=(0, 0),
+            )(obs_batch_jnp, point_keys)
+        )
+        # Return the empowerment map and the goal used (if any; otherwise NaNs to force explicitness).
+        goal_used = goal_xy.astype(np.float32) if 'goal_xy' in locals() else np.array([np.nan, np.nan], dtype=np.float32)
+        return emp.reshape(args.grid_res, args.grid_res), goal_used
 
-    maps = [compute_empowerment_map(bp) for bp in ball_positions]
+    # Determine plotting scenario based on flags
+    if args.fix_ball and args.fix_goal:
+        raise ValueError("Both --fix_ball and --fix_goal provided; please set only one.")
+
+    rng = np.random.default_rng()
+    force_grid = False
+    goal_overrides: list[np.ndarray | None]
+
+    if args.fix_ball:
+        # Fix ball position (from args if provided, else sample once), sample 9 random goals.
+        if args.ball_xy is not None:
+            bx, by = _parse_indices(args.ball_xy)
+            fixed_ball = (float(bx), float(by))
+        else:
+            fixed_ball = (float(rng.uniform(x_low, x_high)), float(rng.uniform(y_low, y_high)))
+        ball_positions = [fixed_ball for _ in range(9)]
+        goal_overrides = [
+            np.array([rng.uniform(x_low, x_high), rng.uniform(y_low, y_high)], dtype=np.float64) for _ in range(9)
+        ]
+        force_grid = True
+    elif args.fix_goal:
+        # Fix goal position (from args if provided, else sample once), sample 9 random balls.
+        if args.goal_xy is not None:
+            gx, gy = _parse_indices(args.goal_xy)
+            fixed_goal = np.array([float(gx), float(gy)], dtype=np.float64)
+        else:
+            fixed_goal = np.array([rng.uniform(x_low, x_high), rng.uniform(y_low, y_high)], dtype=np.float64)
+        ball_positions = [(float(rng.uniform(x_low, x_high)), float(rng.uniform(y_low, y_high))) for _ in range(9)]
+        goal_overrides = [fixed_goal for _ in range(9)]
+        force_grid = True
+    else:
+        # Default behavior: single plot if ball fixed, else 3x3 random balls and random goals.
+        if args.ball_xy is not None:
+            bx, by = _parse_indices(args.ball_xy)
+            ball_positions = [(float(bx), float(by))]
+            goal_overrides = [None]
+            force_grid = False
+        else:
+            ball_positions = [(float(rng.uniform(x_low, x_high)), float(rng.uniform(y_low, y_high))) for _ in range(9)]
+            goal_overrides = [None for _ in range(9)]
+            force_grid = True
+
+    results = [compute_empowerment_map(bp, goal_xy_override=go) for bp, go in zip(ball_positions, goal_overrides)]
+    maps = [m for (m, _) in results]
+    goals = [g for (_, g) in results]
 
     out_img = args.output if args.output is not None else os.path.join(run_dir, f"empowerment_map_e{epoch}.png")
     out_npy = os.path.splitext(out_img)[0] + ".npy"
 
-    if len(ball_positions) == 1:
+    if not force_grid and len(ball_positions) == 1:
         fixed_ball = ball_positions[0]
+        goal_used = goals[0]
         plt.figure(figsize=(7, 6))
         im = plt.imshow(
             maps[0],
@@ -182,6 +243,17 @@ def main():
             linewidths=1.0,
             label="Ball",
         )
+        # Plot goal used for this map.
+        plt.scatter(
+            [goal_used[0]],
+            [goal_used[1]],
+            c="yellow",
+            s=70,
+            marker="*",
+            edgecolors="black",
+            linewidths=0.8,
+            label="Goal",
+        )
         plt.legend(loc="upper right")
         plt.colorbar(im, label="Empowerment")
         plt.xlabel(f"Ant x (obs[{ant_x_idx}])")
@@ -196,9 +268,9 @@ def main():
         print(f"Saved image: {out_img}")
         print(f"Saved array: {out_npy}")
     else:
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig, axes = plt.subplots(3, 3, figsize=(15, 13))
         axes = axes.flatten()
-        for i, (ax, emp_map, bp) in enumerate(zip(axes, maps, ball_positions)):
+        for i, (ax, emp_map, bp, goal_used) in enumerate(zip(axes, maps, ball_positions, goals)):
             im = ax.imshow(
                 emp_map,
                 origin="lower",
@@ -216,6 +288,16 @@ def main():
                 linewidths=0.8,
                 label="Ball",
             )
+            ax.scatter(
+                [goal_used[0]],
+                [goal_used[1]],
+                c="yellow",
+                s=60,
+                marker="*",
+                edgecolors="black",
+                linewidths=0.6,
+                label="Goal",
+            )
             ax.set_title(f"Ball=({bp[0]:.2f}, {bp[1]:.2f})")
             ax.set_xlabel(f"Ant x (obs[{ant_x_idx}])")
             ax.set_ylabel(f"Ant y (obs[{ant_y_idx}])")
@@ -224,7 +306,7 @@ def main():
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(out_img, dpi=180)
         np.save(out_npy, np.stack(maps, axis=0))
-        print(f"Saved 2x2 image: {out_img}")
+        print(f"Saved 3x3 image: {out_img}")
         print(f"Saved array stack: {out_npy}")
 
 

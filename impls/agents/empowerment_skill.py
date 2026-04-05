@@ -58,6 +58,7 @@ def log_diff_exp(log_total, log_part):
     return log_total + log1mexp(log_part - log_total)
 
 def clipped_linexp_loss(target, pred, gamma, t=5.0):
+    """Clipped linexp loss in log space; regresses e^-pred to gamma * e^-target."""
     target, t = jax.lax.stop_gradient(target), jax.lax.stop_gradient(t)
 
     p0 = target + t
@@ -431,7 +432,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             )
 
     def empowerment(self, observations, rng):
-        """Monte-Carlo estimate of I(A; S⁺ | s) for each observation."""
+        """Monte-Carlo estimate of I(Z; S⁺ | s) for each observation."""
         batch_size = observations.shape[0]
         K = self.config['num_skills']
         num_samples = self.config['num_splus_samples']
@@ -475,11 +476,15 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         """Q loss.
 
         separate_qv=True:
-            Regress Q(s⁺ | s, a, z) onto V(s⁺ | s', z).
+            Two terms:
+              1) Q(s⁺ | s, a, z) = γ · V(s⁺ | s', z)
+              2) (optional; enabled when use_self_q_loss)
+                 Q(s | s, a, z) = (1-γ) + γ · V(s | s', z)
         separate_qv=False (shared Q/V):
             Apply two Bellman-style Q losses:
-              1) Q(s⁺ | s, a, z) = γ Q(s⁺ | s', π(s',z), z)
-              2) Q(s' | s, a, z) = (1-γ) + γ Q(s' | s', π(s',z), z)
+              1) Q(s⁺ | s, a, z) = γ · Q(s⁺ | s', π(s',z), z)
+              2) (optional; enabled when use_self_q_loss)
+                 Q(s' | s, a, z) = (1-γ) + γ · Q(s' | s', π(s',z), z)
         """
         future = batch['value_goals']
         log_q = self.compute_q_logits(
@@ -488,24 +493,51 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         )
 
         if self.config['separate_qv']:
-            # Target V from next_observations for the Bellman target (frozen).
-            log_v = self.compute_v_logits_target(
+            # 1) Future-state loss: Q(s+ | s,a,z) = discount * V(s+ | s', z)
+            log_v_next_future = self.compute_v_logits_target(
                 batch['next_observations'], skills_onehot, future
             )
-            loss = clipped_linexp_loss(
-                target=-log_v,
+            loss_future = clipped_linexp_loss(
+                target=-log_v_next_future,
                 pred=-log_q,
-                gamma=1.0,
+                gamma=self.config['discount'],
             )
-            return loss, {
+
+            loss = loss_future
+            metrics = {
                 'q_loss': loss,
-                'q_loss_future': loss,
+                'q_loss_future': loss_future,
                 'q_log_mean': log_q.mean(),
-                'v_log_mean': log_v.mean(),
-                'v_mean': jnp.exp(log_v).mean(),
-                'v_max': jnp.exp(log_v).max(),
-                'v_min': jnp.exp(log_v).min(),
+                'v_next_future_log_mean': log_v_next_future.mean(),
             }
+
+            # 2) Optional self loss: Q(s | s,a,z) = (1-γ) + γ · V(s | s', z)
+            if self.config.get('use_self_q_loss', True):
+                log_q_current = self.compute_q_logits(
+                    batch['observations'], batch['actions'],
+                    skills_onehot, batch['observations'], params=grad_params
+                )
+                log_v_next_current = self.compute_v_logits_target(
+                    batch['next_observations'], skills_onehot, batch['observations']
+                )
+                log_current_target = jnp.logaddexp(
+                    jnp.log(1.0 - self.config['discount']),
+                    jnp.log(self.config['discount']) + log_v_next_current,
+                )
+                loss_current = clipped_linexp_loss(
+                    target=-log_current_target,
+                    pred=-log_q_current,
+                    gamma=1.0,
+                )
+                loss = loss + loss_current
+                metrics.update({
+                    'q_loss': loss,
+                    'q_loss_current': loss_current,
+                    'q_log_current_mean': log_q_current.mean(),
+                    'v_next_current_log_mean': log_v_next_current.mean(),
+                })
+
+            return loss, metrics
 
         # Shared Q/V mode: no V loss; Q carries both Bellman terms.
         actions_next = self._policy_actions(
@@ -521,35 +553,42 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             gamma=self.config['discount'],
         )
 
-        # 2) Q(s' | s,a) = (1-gamma) + gamma * Q(s' | s', pi(s',z), z)
-        log_q_current = self.compute_q_logits(
-            batch['observations'], batch['actions'],
-            skills_onehot, batch['next_observations'], params=grad_params
-        )
-        log_q_next_current = self.compute_q_logits_target(
-            batch['next_observations'], actions_next,
-            skills_onehot, batch['next_observations']
-        )
-        log_current_target = jnp.logaddexp(
-            jnp.log(1.0 - self.config['discount']),
-            jnp.log(self.config['discount']) + log_q_next_current,
-        )
-        loss_current = clipped_linexp_loss(
-            target=-log_current_target,
-            pred=-log_q_current,
-            gamma=1.0,
-        )
-
-        loss = loss_future + loss_current
-        return loss, {
+        loss = loss_future
+        metrics = {
             'q_loss': loss,
             'q_loss_future': loss_future,
-            'q_loss_current': loss_current,
             'q_log_mean': log_q.mean(),
-            'q_log_current_mean': log_q_current.mean(),
             'q_log_next_future_mean': log_q_next_future.mean(),
-            'q_log_next_current_mean': log_q_next_current.mean(),
         }
+
+        # 2) Optional self loss: Q(s' | s,a) = (1-γ) + γ · Q(s' | s', π(s',z), z)
+        if self.config.get('use_self_q_loss', True):
+            log_q_current = self.compute_q_logits(
+                batch['observations'], batch['actions'],
+                skills_onehot, batch['next_observations'], params=grad_params
+            )
+            log_q_next_current = self.compute_q_logits_target(
+                batch['next_observations'], actions_next,
+                skills_onehot, batch['next_observations']
+            )
+            log_current_target = jnp.logaddexp(
+                jnp.log(1.0 - self.config['discount']),
+                jnp.log(self.config['discount']) + log_q_next_current,
+            )
+            loss_current = clipped_linexp_loss(
+                target=-log_current_target,
+                pred=-log_q_current,
+                gamma=1.0,
+            )
+            loss = loss + loss_current
+            metrics.update({
+                'q_loss': loss,
+                'q_loss_current': loss_current,
+                'q_log_current_mean': log_q_current.mean(),
+                'q_log_next_current_mean': log_q_next_current.mean(),
+            })
+
+        return loss, metrics
 
     def v_loss(self, batch, grad_params, skills_onehot):
         """L_V — Bellman backup for the occupancy V (eqs. 16-17).
@@ -570,26 +609,21 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         future = batch['value_goals']
 
-        # Policy is frozen in the Bellman backup (policy_params=None).
-        actions_next = self._policy_actions(
+        # Regress V(s+ | s, z) onto Q(s+ | s, π(s,z), z) (no discount, no self V loss).
+        actions_pi = self._policy_actions(
             batch['observations'], skills_onehot, params=None
         )
-
-        # Target Q for the backup — frozen.
-        log_q_next = self.compute_q_logits_target(
-            batch['observations'], actions_next, skills_onehot, future
+        log_q_pi = self.compute_q_logits_target(
+            batch['observations'], actions_pi, skills_onehot, future
         )
-        # Online V being optimised; policy frozen.
         log_v = self.compute_v_logits(
             batch['observations'], skills_onehot, future,
             params=grad_params, policy_params=None
         )
-        # Use clipped_linexp_loss: regress e^log_v to discount * e^log_q_next
-        # target=log_q_next (frozen), pred=log_v (gradient flows), gamma=discount
         loss_future = clipped_linexp_loss(
-            target=-log_q_next,
+            target=-log_q_pi,
             pred=-log_v,
-            gamma=self.config['discount'],
+            gamma=1.0,
         )
 
         loss = loss_future
@@ -597,40 +631,10 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             'v_loss': loss,
             'v_loss_future': loss_future,
             'v_log_mean': log_v.mean(),
+            'q_pi_log_mean': log_q_pi.mean(),
             'v_max': jnp.exp(log_v).max(),
             'v_min': jnp.exp(log_v).min(),
         }
-
-        # Second loss: regress V(s | s, z) onto
-        # (1 - discount) + discount * Q(s | s, pi(s,z), z)
-        # When future state equals current state, use:
-        #   V(s | s, z) -> (1 - discount) + discount * Q(s | s, pi(s,z), z)
-        if self.config.get('use_self_v_loss', True):
-            # Reuse frozen policy action for the current state.
-            log_q_current = self.compute_q_logits_target(
-                batch['observations'],
-                actions_next,
-                skills_onehot,
-                batch['observations'],
-            )
-            log_current_target = jnp.logaddexp(
-                jnp.log(1.0 - self.config['discount']),
-                jnp.log(self.config['discount']) + log_q_current,
-            )
-            log_v_current = self.compute_v_logits(
-                batch['observations'], skills_onehot, batch['observations'],
-                params=grad_params, policy_params=None
-            )
-            loss_current = clipped_linexp_loss(
-                target=-log_current_target,
-                pred=-log_v_current,
-                gamma=1.0,
-            )
-            loss = loss_future + loss_current
-            metrics['v_loss'] = loss
-            metrics['v_loss_current'] = loss_current
-            metrics['v_log_current_mean'] = log_v_current.mean()
-            metrics['q_log_current_mean'] = log_q_current.mean()
 
         return loss, metrics
 
@@ -1042,7 +1046,9 @@ def get_config():
         # True:            independent Q and V networks with separate targets.
         separate_qv=False,
         min_q_value=-8,
-        use_self_v_loss=True,  # Whether to add loss regressing V(s | s, z) onto 1 - discount
+        # Self-loss flags
+        use_self_v_loss=True,  # Whether to add loss regressing V(s | s, z) onto 1 - discount; this is used ONLY  in the Q representing NEXT state occupancy formulation
+        use_self_q_loss=True,  # Whether to add the "self" Q loss terms; this is used ONLY  in the Q representing CURRENT state occupancy formulation
         # ───────────────────────────────────────────────────────────────────
         discrete=False,
         const_std=True,
