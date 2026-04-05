@@ -49,8 +49,7 @@ def main():
     parser.add_argument("--run_dir", type=str, default=None, help="Explicit run dir (overrides latest in ckpt_root).")
     parser.add_argument("--epoch", type=int, default=None, help="Explicit epoch (overrides latest params_*.pkl).")
     parser.add_argument("--grid_res", type=int, default=40, help="Grid resolution for ant XY map.")
-    parser.add_argument("--ant_xy_indices", type=str, default="0,1", help="Observation indices for ant x,y.")
-    parser.add_argument("--ball_xy_indices", type=str, default="2,3", help="Observation indices for ball x,y.")
+    # Ant Soccer only; indices are not needed.
     parser.add_argument(
         "--ball_xy",
         type=str,
@@ -76,6 +75,17 @@ def main():
     )
     parser.add_argument("--fix_ball", action="store_true", help="Fix ball position; sample 9 random goals.")
     parser.add_argument("--fix_goal", action="store_true", help="Fix goal position; sample 9 random balls.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed to make ball/goal sampling deterministic across runs.",
+    )
+    parser.add_argument(
+        "--use_rel4_fallback",
+        action="store_true",
+        help="Use fallback that overwrites only the last 4 obs entries (ball-agent, goal-ball).",
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)
@@ -106,9 +116,6 @@ def main():
     )
     agent = restore_agent(agent, run_dir, epoch)
 
-    ant_x_idx, ant_y_idx = _parse_indices(args.ant_xy_indices)
-    ball_x_idx, ball_y_idx = _parse_indices(args.ball_xy_indices)
-
     obs0, _ = env.reset()
     obs0 = np.asarray(obs0, dtype=np.float32)
 
@@ -122,41 +129,40 @@ def main():
     xx, yy = np.meshgrid(xs, ys)
 
     def compute_empowerment_map(fixed_ball_xy: tuple[float, float], goal_xy_override: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        # Build observations using the env's own state->observation path when available.
-        # This guarantees the state vector matches exactly what the environment produces.
+        # Build observations for Ant Soccer directly via env state, or explicit rel4 fallback.
         flat_x = xx.reshape(-1)
         flat_y = yy.reshape(-1)
         obs_list = []
-        if hasattr(base_env, "set_agent_ball_xy") and (hasattr(base_env, "get_ob") or hasattr(base_env, "_get_obs")):
-            # Set a goal for this map: override if provided, else random within bounds.
-            if goal_xy_override is not None:
-                goal_xy = goal_xy_override.astype(np.float64)
-            else:
-                goal_xy = np.array(
-                    [np.random.uniform(x_low, x_high), np.random.uniform(y_low, y_high)],
-                    dtype=np.float64,
-                )
+        # Set a goal for this map: override if provided, else random within bounds.
+        if goal_xy_override is not None:
+            goal_xy = goal_xy_override.astype(np.float64)
+        else:
+            goal_xy = np.array(
+                [rng.uniform(x_low, x_high), rng.uniform(y_low, y_high)],
+                dtype=np.float64,
+            )
+        if not args.use_rel4_fallback:
             base_env.set_goal(goal_xy=goal_xy)
             for x, y in zip(flat_x, flat_y):
                 base_env.set_agent_ball_xy(np.array([x, y], dtype=np.float64), np.array(fixed_ball_xy, dtype=np.float64))
-                if hasattr(base_env, "get_ob"):
-                    obs_single = np.asarray(base_env.get_ob(), dtype=np.float32)
-                else:
-                    obs_single = np.asarray(base_env._get_obs(), dtype=np.float32)
-                # If frame stacking is enabled, mimic wrapper output by repeating the base observation.
-                if obs_single.shape[0] != obs0.shape[0]:
-                    stack = obs0.shape[0] // obs_single.shape[0]
-                    if stack > 1 and stack * obs_single.shape[0] == obs0.shape[0]:
-                        obs_single = np.concatenate([obs_single] * stack, axis=-1)
+                obs_single = np.asarray(base_env.get_ob(), dtype=np.float32)
                 obs_list.append(obs_single)
             obs_batch = np.stack(obs_list, axis=0)
         else:
-            # Fallback: direct index overwrite (less exact, but keeps script generic).
+            # Fallback: directly overwrite Ant and Ball XY in qpos portion of obs = [qpos, qvel].
+            # qpos layout: [ant x, ant y, ..., ball x, ball y, ball z, ball quat_w, quat_x, quat_y, quat_z]
+            # So ball XY are qpos[-7:-5].
             obs_batch = np.repeat(obs0[None, :], args.grid_res * args.grid_res, axis=0)
-            obs_batch[:, ant_x_idx] = flat_x
-            obs_batch[:, ant_y_idx] = flat_y
-            obs_batch[:, ball_x_idx] = fixed_ball_xy[0]
-            obs_batch[:, ball_y_idx] = fixed_ball_xy[1]
+            nq = int(base_env.data.qpos.size)
+            # Overwrite ant XY (qpos[:2]) per grid point
+            obs_batch[:, 0] = flat_x
+            obs_batch[:, 1] = flat_y
+            # Overwrite ball XY (qpos[-7:-5]) with fixed_ball_xy for the entire map
+            obs_batch[:, nq - 7] = float(fixed_ball_xy[0])
+            obs_batch[:, nq - 6] = float(fixed_ball_xy[1])
+
+        print(obs_batch[:3])
+
         # Use a different PRNG key for every point to avoid correlated estimates.
         obs_batch_jnp = jnp.asarray(obs_batch)
         num_points = obs_batch_jnp.shape[0]
@@ -177,7 +183,7 @@ def main():
     if args.fix_ball and args.fix_goal:
         raise ValueError("Both --fix_ball and --fix_goal provided; please set only one.")
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(args.seed)
     force_grid = False
     goal_overrides: list[np.ndarray | None]
 
@@ -256,8 +262,8 @@ def main():
         )
         plt.legend(loc="upper right")
         plt.colorbar(im, label="Empowerment")
-        plt.xlabel(f"Ant x (obs[{ant_x_idx}])")
-        plt.ylabel(f"Ant y (obs[{ant_y_idx}])")
+        plt.xlabel(f"Ant x")
+        plt.ylabel(f"Ant y")
         plt.title(
             f"Empowerment map | run={os.path.basename(run_dir)} | epoch={epoch}\n"
             f"fixed ball=({fixed_ball[0]:.3f}, {fixed_ball[1]:.3f})"
@@ -299,8 +305,8 @@ def main():
                 label="Goal",
             )
             ax.set_title(f"Ball=({bp[0]:.2f}, {bp[1]:.2f})")
-            ax.set_xlabel(f"Ant x (obs[{ant_x_idx}])")
-            ax.set_ylabel(f"Ant y (obs[{ant_y_idx}])")
+            ax.set_xlabel(f"Ant x")
+            ax.set_ylabel(f"Ant y")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         fig.suptitle(f"Empowerment maps | run={os.path.basename(run_dir)} | epoch={epoch}")
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])

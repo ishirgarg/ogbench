@@ -682,7 +682,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
       
         phi_z_v = self._v_phi(
             batch['observations'], skills_onehot,
-            use_target=True, policy_params=grad_params
+            use_target=True, policy_params=None
         )  # [batch, d]
 
         # ── Sample ψ ~ N(φ_z_v, d/2 · I) ─────────────────────────────────
