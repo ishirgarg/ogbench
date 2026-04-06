@@ -29,7 +29,7 @@ flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
+flags.DEFINE_integer('save_interval', 100000, 'Saving interval.')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')

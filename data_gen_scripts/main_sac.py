@@ -32,7 +32,7 @@ flags.DEFINE_integer('train_interval', 1, 'Train interval.')
 flags.DEFINE_integer('num_epochs', 1, 'Number of updates per train interval.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
+flags.DEFINE_integer('save_interval', 100000, 'Saving interval.')
 flags.DEFINE_integer('reset_interval', 0, 'Full parameter reset interval.')
 flags.DEFINE_integer('terminate_at_end', 0, 'Whether to set terminated=True when truncated=True.')
 
