@@ -63,10 +63,10 @@ def main():
         default=192,
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
-    parser.add_argument("--x_min", type=float, default=-12.0, help="Grid min x for ant position.")
-    parser.add_argument("--x_max", type=float, default=12.0, help="Grid max x for ant position.")
-    parser.add_argument("--y_min", type=float, default=-12.0, help="Grid min y for ant position.")
-    parser.add_argument("--y_max", type=float, default=12.0, help="Grid max y for ant position.")
+    parser.add_argument("--x_min", type=float, default=0, help="Grid min x for ant position.")
+    parser.add_argument("--x_max", type=float, default=20, help="Grid max x for ant position.")
+    parser.add_argument("--y_min", type=float, default=0, help="Grid min y for ant position.")
+    parser.add_argument("--y_max", type=float, default=20, help="Grid max y for ant position.")
     parser.add_argument(
         "--goal_xy",
         type=str,
