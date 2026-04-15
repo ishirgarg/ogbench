@@ -46,29 +46,40 @@ config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
 
 def main(_):
-    # Auto-resume: find the latest run dir for this run_group+seed that has a checkpoint.
+    # Auto-resume: scan every run folder under save_dir, match on the `agent` config dict,
+    # and pick the most-recently-modified folder with a checkpoint.
     resume_dir = None
     resume_epoch = None
     resume_run_id = None
     if FLAGS.resume:
-        group_dir = os.path.join(FLAGS.save_dir, 'OGBench', FLAGS.run_group)
-        candidates = sorted(glob.glob(os.path.join(group_dir, f'sd{FLAGS.seed:03d}_*')))
-        for cand in reversed(candidates):
+        current_agent = FLAGS.agent.to_dict() if hasattr(FLAGS.agent, 'to_dict') else dict(FLAGS.agent)
+        matches = []
+        for flags_path in glob.glob(os.path.join(FLAGS.save_dir, '**', 'flags.json'), recursive=True):
+            cand = os.path.dirname(flags_path)
             ckpts = glob.glob(os.path.join(cand, 'params_*.pkl'))
             if not ckpts:
                 continue
+            try:
+                with open(flags_path) as f:
+                    saved = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if saved.get('agent') != current_agent:
+                continue
             epochs = [int(re.search(r'params_(\d+)\.pkl', p).group(1)) for p in ckpts]
-            resume_epoch = max(epochs)
-            resume_dir = cand
-            id_path = os.path.join(cand, 'wandb_run_id.txt')
+            matches.append((os.path.getmtime(cand), cand, max(epochs)))
+        if matches:
+            matches.sort(reverse=True)
+            _, resume_dir, resume_epoch = matches[0]
+            id_path = os.path.join(resume_dir, 'wandb_run_id.txt')
             if os.path.exists(id_path):
                 with open(id_path) as f:
                     resume_run_id = f.read().strip()
-            break
-        if resume_dir is None:
-            print(f'[resume] No checkpoint found under {group_dir}; starting fresh.')
-        else:
             print(f'[resume] Resuming {resume_dir} from epoch {resume_epoch} (wandb id={resume_run_id}).')
+            if len(matches) > 1:
+                print(f'[resume] {len(matches)} candidates matched; picked most recent.')
+        else:
+            print(f'[resume] No matching checkpoint under {FLAGS.save_dir}; starting fresh.')
 
     # Set up logger.
     if resume_dir is not None:
