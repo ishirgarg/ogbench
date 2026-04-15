@@ -1,6 +1,8 @@
+import glob
 import json
 import os
 import random
+import re
 import time
 from collections import defaultdict
 
@@ -25,6 +27,7 @@ flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (datas
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
+flags.DEFINE_bool('resume', False, 'Auto-resume the latest crashed run for this run_group+seed.')
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -43,12 +46,54 @@ config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
 
 def main(_):
-    # Set up logger.
-    exp_name = get_exp_name(FLAGS.seed)
-    setup_wandb(project='OGBench', group=FLAGS.run_group, name=exp_name)
+    # Auto-resume: find the latest run dir for this run_group+seed that has a checkpoint.
+    resume_dir = None
+    resume_epoch = None
+    resume_run_id = None
+    if FLAGS.resume:
+        group_dir = os.path.join(FLAGS.save_dir, 'OGBench', FLAGS.run_group)
+        candidates = sorted(glob.glob(os.path.join(group_dir, f'sd{FLAGS.seed:03d}_*')))
+        for cand in reversed(candidates):
+            ckpts = glob.glob(os.path.join(cand, 'params_*.pkl'))
+            if not ckpts:
+                continue
+            epochs = [int(re.search(r'params_(\d+)\.pkl', p).group(1)) for p in ckpts]
+            resume_epoch = max(epochs)
+            resume_dir = cand
+            id_path = os.path.join(cand, 'wandb_run_id.txt')
+            if os.path.exists(id_path):
+                with open(id_path) as f:
+                    resume_run_id = f.read().strip()
+            break
+        if resume_dir is None:
+            print(f'[resume] No checkpoint found under {group_dir}; starting fresh.')
+        else:
+            print(f'[resume] Resuming {resume_dir} from epoch {resume_epoch} (wandb id={resume_run_id}).')
 
-    FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
-    os.makedirs(FLAGS.save_dir, exist_ok=True)
+    # Set up logger.
+    if resume_dir is not None:
+        exp_name = os.path.basename(resume_dir)
+        FLAGS.save_dir = resume_dir
+    else:
+        exp_name = get_exp_name(FLAGS.seed)
+    setup_wandb(
+        project='OGBench',
+        group=FLAGS.run_group,
+        name=exp_name,
+        run_id=resume_run_id,
+        resume='allow' if resume_run_id is not None else None,
+    )
+
+    if resume_dir is None:
+        FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
+        os.makedirs(FLAGS.save_dir, exist_ok=True)
+
+    # Persist wandb run id so future --resume launches re-attach to this run.
+    id_path = os.path.join(FLAGS.save_dir, 'wandb_run_id.txt')
+    if not os.path.exists(id_path):
+        with open(id_path, 'w') as f:
+            f.write(wandb.run.id)
+
     flag_dict = get_flag_dict()
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f)
@@ -83,7 +128,9 @@ def main(_):
     )
 
     # Restore agent.
-    if FLAGS.restore_path is not None:
+    if resume_dir is not None:
+        agent = restore_agent(agent, resume_dir, resume_epoch)
+    elif FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
     # Train agent.
@@ -91,7 +138,8 @@ def main(_):
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
     first_time = time.time()
     last_time = time.time()
-    for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
+    start_step = (resume_epoch + 1) if resume_epoch is not None else 1
+    for i in tqdm.tqdm(range(start_step, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
         agent, update_info = agent.update(batch)

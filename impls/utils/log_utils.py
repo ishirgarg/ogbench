@@ -17,6 +17,13 @@ class CsvLogger:
         self.header = None
         self.file = None
         self.disallowed_types = (wandb.Image, wandb.Video, wandb.Histogram)
+        # If a CSV already exists (resumed run), append and reuse its header.
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path) as f:
+                first = f.readline().strip()
+            if first:
+                self.header = first.split(',')
+            self.file = open(path, 'a')
 
     def log(self, row, step):
         row['step'] = step
@@ -65,6 +72,8 @@ def setup_wandb(
     group=None,
     name=None,
     mode='online',
+    run_id=None,
+    resume=None,
 ):
     """Set up Weights & Biases for logging."""
     wandb_output_dir = tempfile.mkdtemp()
@@ -84,6 +93,8 @@ def setup_wandb(
         ),
         mode=mode,
         save_code=True,
+        id=run_id,
+        resume=resume,
     )
 
     run = wandb.init(**init_kwargs)
