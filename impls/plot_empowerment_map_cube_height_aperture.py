@@ -70,7 +70,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Cube empowerment map: gripper hovers over one cube, sweeps height vs openness."
     )
-    parser.add_argument("--ckpt_root", type=str, default="ckpts")
+    parser.add_argument("--ckpt_root", type=str, default="ckpts/cube1")
     parser.add_argument("--run_dir", type=str, default=None)
     parser.add_argument("--epoch", type=int, default=None)
     parser.add_argument("--grid_res", type=int, default=30)
@@ -79,10 +79,10 @@ def main():
     parser.add_argument("--z_max", type=float, default=0.25, help="Gripper z max.")
     parser.add_argument("--open_min", type=float, default=0.0)
     parser.add_argument("--open_max", type=float, default=1.0)
-    parser.add_argument("--cube_x_min", type=float, default=0.35)
-    parser.add_argument("--cube_x_max", type=float, default=0.50)
-    parser.add_argument("--cube_y_min", type=float, default=-0.20)
-    parser.add_argument("--cube_y_max", type=float, default=0.20)
+    parser.add_argument("--cube_x_min", type=float, default=0.30)
+    parser.add_argument("--cube_x_max", type=float, default=0.55)
+    parser.add_argument("--cube_y_min", type=float, default=-0.30)
+    parser.add_argument("--cube_y_max", type=float, default=0.30)
     parser.add_argument(
         "--cube_xy",
         type=str,

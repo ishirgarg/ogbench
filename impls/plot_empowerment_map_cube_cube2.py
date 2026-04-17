@@ -70,19 +70,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="Cube-double empowerment map: fix gripper near center (jittered) and cube1, sweep cube2 XY."
     )
-    parser.add_argument("--ckpt_root", type=str, default="ckpts")
+    parser.add_argument("--ckpt_root", type=str, default="ckpts/cube2")
     parser.add_argument("--run_dir", type=str, default=None)
     parser.add_argument("--epoch", type=int, default=None)
     parser.add_argument("--grid_res", type=int, default=30)
     parser.add_argument("--num_splus_samples", type=int, default=192)
     parser.add_argument("--x_min", type=float, default=0.30, help="Cube2 sweep min x.")
     parser.add_argument("--x_max", type=float, default=0.55, help="Cube2 sweep max x.")
-    parser.add_argument("--y_min", type=float, default=-0.25, help="Cube2 sweep min y.")
-    parser.add_argument("--y_max", type=float, default=0.25, help="Cube2 sweep max y.")
-    parser.add_argument("--cube_x_min", type=float, default=0.35, help="Cube1 random-sampling min x.")
-    parser.add_argument("--cube_x_max", type=float, default=0.50)
-    parser.add_argument("--cube_y_min", type=float, default=-0.20)
-    parser.add_argument("--cube_y_max", type=float, default=0.20)
+    parser.add_argument("--y_min", type=float, default=-0.30, help="Cube2 sweep min y.")
+    parser.add_argument("--y_max", type=float, default=0.30, help="Cube2 sweep max y.")
+    parser.add_argument("--cube_x_min", type=float, default=0.30, help="Cube1 random-sampling min x.")
+    parser.add_argument("--cube_x_max", type=float, default=0.55)
+    parser.add_argument("--cube_y_min", type=float, default=-0.30)
+    parser.add_argument("--cube_y_max", type=float, default=0.30)
     parser.add_argument(
         "--gripper_center",
         type=str,
