@@ -91,6 +91,70 @@ def rollout_trajectory(agent, env, config, max_steps=None, eval_temperature=0):
     return frames, observations, actions_list
 
 
+def _render_observation_on_env(env, obs):
+    """Set the base env's state to match `obs` and render a frame.
+
+    Supports OGBench manipspace cube envs by decoding the observation layout
+    back to arm qpos, gripper joint, and per-cube object joints.
+    """
+    import mujoco
+
+    base = env.unwrapped
+    if not (hasattr(base, '_arm_joint_ids') and hasattr(base, '_data') and hasattr(base, '_model')):
+        return env.render().copy()
+
+    n_arm = len(base._arm_joint_ids)
+    xyz_center = np.array([0.425, 0.0, 0.0])
+    xyz_scaler = 10.0
+    gripper_scaler = 3.0
+
+    obs = np.asarray(obs)
+    base._data.qpos[base._arm_joint_ids] = obs[:n_arm]
+    base._data.qvel[base._arm_joint_ids] = obs[n_arm:2 * n_arm]
+
+    gripper_opening = float(obs[2 * n_arm + 5]) / gripper_scaler
+    base._data.qpos[base._gripper_opening_joint_id] = gripper_opening * 0.8
+
+    n_cubes = getattr(base, '_num_cubes', 0)
+    cube_start = 2 * n_arm + 7
+    for i in range(n_cubes):
+        off = cube_start + i * 9
+        pos = obs[off:off + 3] / xyz_scaler + xyz_center
+        quat = obs[off + 3:off + 7]
+        joint = base._data.joint(f'object_joint_{i}')
+        joint.qpos[:3] = pos
+        joint.qpos[3:] = quat
+
+    mujoco.mj_forward(base._model, base._data)
+    return env.render().copy()
+
+
+def sample_offline_trajectory(env, dataset, max_steps=None):
+    """Pick a random complete trajectory from the offline dataset and render it."""
+    terminals = np.asarray(dataset['terminals'])
+    (terminal_locs,) = np.nonzero(terminals > 0)
+    if len(terminal_locs) == 0:
+        raise RuntimeError("Offline dataset has no terminals; cannot slice into trajectories.")
+    initial_locs = np.concatenate([[0], terminal_locs[:-1] + 1])
+
+    traj_idx = np.random.randint(len(terminal_locs))
+    start = int(initial_locs[traj_idx])
+    end = int(terminal_locs[traj_idx])  # inclusive
+    if max_steps is not None:
+        end = min(end, start + max_steps)
+
+    observations_arr = np.asarray(dataset['observations'][start:end + 1])
+    actions_arr = np.asarray(dataset['actions'][start:end])
+
+    env.reset()
+    frames = [_render_observation_on_env(env, observations_arr[t]) for t in range(len(observations_arr))]
+    observations = [observations_arr[t] for t in range(len(observations_arr))]
+    actions_list = [actions_arr[t] for t in range(len(actions_arr))]
+
+    print(f"  Offline trajectory: idx={traj_idx}, start={start}, end={end}, len={len(observations)}")
+    return frames, observations, actions_list
+
+
 def compute_empowerment_timeseries(agent, observations, batch_size=64):
     """Compute empowerment for each observation in a trajectory."""
     obs_array = np.stack(observations, axis=0).astype(np.float32)
@@ -215,6 +279,9 @@ def main():
                         help="Batch size for empowerment computation.")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto in run_dir).")
+    parser.add_argument("--use_empowerment_policy", action="store_true", default=False,
+                        help="If set, roll out the learned empowerment policy in the env. "
+                             "If not set (default), sample a random offline trajectory from the dataset.")
     args = parser.parse_args()
 
     # Resolve checkpoint
@@ -249,13 +316,19 @@ def main():
     for ep_idx in range(args.num_episodes):
         print(f"\n--- Episode {ep_idx + 1}/{args.num_episodes} ---")
 
-        # Roll out trajectory
-        print("Rolling out trajectory...")
-        frames, observations, actions = rollout_trajectory(
-            agent, env, agent_cfg,
-            max_steps=args.max_steps,
-            eval_temperature=args.eval_temperature,
-        )
+        # Get trajectory — either from on-policy rollout or offline dataset sample.
+        if args.use_empowerment_policy:
+            print("Rolling out empowerment policy in env...")
+            frames, observations, actions = rollout_trajectory(
+                agent, env, agent_cfg,
+                max_steps=args.max_steps,
+                eval_temperature=args.eval_temperature,
+            )
+        else:
+            print("Sampling random offline trajectory...")
+            frames, observations, actions = sample_offline_trajectory(
+                env, train_dataset, max_steps=args.max_steps,
+            )
         print(f"  {len(frames)} frames, {len(observations)} observations")
 
         # Apply frame skip
@@ -285,7 +358,8 @@ def main():
                 base, ext = os.path.splitext(args.output)
                 out_path = f"{base}_ep{ep_idx}{ext}"
         else:
-            out_path = os.path.join(run_dir, f"trajectory_empowerment_ep{ep_idx}_e{epoch}.mp4")
+            src_tag = "policy" if args.use_empowerment_policy else "offline"
+            out_path = os.path.join(run_dir, f"trajectory_empowerment_{src_tag}_ep{ep_idx}_e{epoch}.mp4")
 
         print(f"Saving video to {out_path}...")
         save_mp4(composed, out_path, fps=args.fps)
