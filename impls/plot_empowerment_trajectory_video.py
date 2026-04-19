@@ -91,7 +91,19 @@ def rollout_trajectory(agent, env, config, max_steps=None, eval_temperature=0):
     return frames, observations, actions_list
 
 
-def _render_observation_on_env(env, obs):
+def _get_base_env(env):
+    """Walk wrappers to find the OGBench manipspace base env."""
+    cur = env
+    # Unwrap gym wrappers.
+    while hasattr(cur, 'env') and not (hasattr(cur, '_arm_joint_ids') and hasattr(cur, '_model')):
+        cur = cur.env
+    if hasattr(cur, '_arm_joint_ids') and hasattr(cur, '_model'):
+        return cur
+    # Fall back to gym's unwrapped.
+    return getattr(env, 'unwrapped', env)
+
+
+def _render_observation_on_env(env, obs, verbose=False):
     """Set the base env's state to match `obs` and render a frame.
 
     Supports OGBench manipspace cube envs by decoding the observation layout
@@ -99,8 +111,10 @@ def _render_observation_on_env(env, obs):
     """
     import mujoco
 
-    base = env.unwrapped
+    base = _get_base_env(env)
     if not (hasattr(base, '_arm_joint_ids') and hasattr(base, '_data') and hasattr(base, '_model')):
+        if verbose:
+            print(f"  [warn] base env {type(base).__name__} missing cube attrs; rendering reset state.")
         return env.render().copy()
 
     n_arm = len(base._arm_joint_ids)
@@ -108,7 +122,7 @@ def _render_observation_on_env(env, obs):
     xyz_scaler = 10.0
     gripper_scaler = 3.0
 
-    obs = np.asarray(obs)
+    obs = np.asarray(obs).astype(np.float64)
     base._data.qpos[base._arm_joint_ids] = obs[:n_arm]
     base._data.qvel[base._arm_joint_ids] = obs[n_arm:2 * n_arm]
 
@@ -130,16 +144,26 @@ def _render_observation_on_env(env, obs):
 
 
 def sample_offline_trajectory(env, dataset, max_steps=None):
-    """Pick a random complete trajectory from the offline dataset and render it."""
-    terminals = np.asarray(dataset['terminals'])
-    (terminal_locs,) = np.nonzero(terminals > 0)
-    if len(terminal_locs) == 0:
-        raise RuntimeError("Offline dataset has no terminals; cannot slice into trajectories.")
-    initial_locs = np.concatenate([[0], terminal_locs[:-1] + 1])
+    """Pick a random complete trajectory from the offline dataset and render it.
 
-    traj_idx = np.random.randint(len(terminal_locs))
-    start = int(initial_locs[traj_idx])
-    end = int(terminal_locs[traj_idx])  # inclusive
+    Compact-dataset terminals come in consecutive pairs ([...,1,1,...]) at each
+    episode boundary, so we collapse runs of adjacent terminal indices and use
+    the last index of each run as the true episode end.
+    """
+    terminals = np.asarray(dataset['terminals'])
+    term_idx = np.nonzero(terminals > 0)[0]
+    if len(term_idx) == 0:
+        raise RuntimeError("Offline dataset has no terminals; cannot slice into trajectories.")
+
+    # Collapse runs of adjacent terminal indices into one end-of-episode index.
+    split_points = np.where(np.diff(term_idx) > 1)[0] + 1
+    term_groups = np.split(term_idx, split_points)
+    end_locs = np.array([int(g[-1]) for g in term_groups])
+    start_locs = np.concatenate([[0], end_locs[:-1] + 1])
+
+    traj_idx = np.random.randint(len(end_locs))
+    start = int(start_locs[traj_idx])
+    end = int(end_locs[traj_idx])  # inclusive
     if max_steps is not None:
         end = min(end, start + max_steps)
 
@@ -147,9 +171,29 @@ def sample_offline_trajectory(env, dataset, max_steps=None):
     actions_arr = np.asarray(dataset['actions'][start:end])
 
     env.reset()
-    frames = [_render_observation_on_env(env, observations_arr[t]) for t in range(len(observations_arr))]
+
+    # Diagnose base env once up front.
+    base = _get_base_env(env)
+    has_cube_attrs = hasattr(base, '_arm_joint_ids') and hasattr(base, '_model')
+    print(f"  Base env: {type(base).__name__}; cube render path: {has_cube_attrs}")
+    if has_cube_attrs:
+        n_arm = len(base._arm_joint_ids)
+        n_cubes = getattr(base, '_num_cubes', 0)
+        expected_obs_dim = 2 * n_arm + 7 + 9 * n_cubes
+        actual_obs_dim = observations_arr.shape[-1]
+        print(f"  n_arm={n_arm}, n_cubes={n_cubes}, expected obs dim={expected_obs_dim}, actual={actual_obs_dim}")
+        if expected_obs_dim != actual_obs_dim:
+            print(f"  [warn] observation dim mismatch — obs layout may differ from cube_env.compute_observation.")
+
+    frames = [_render_observation_on_env(env, observations_arr[t], verbose=(t == 0))
+              for t in range(len(observations_arr))]
     observations = [observations_arr[t] for t in range(len(observations_arr))]
     actions_list = [actions_arr[t] for t in range(len(actions_arr))]
+
+    # Sanity check: do frames actually differ?
+    if len(frames) >= 2:
+        diff = np.abs(frames[-1].astype(np.int32) - frames[0].astype(np.int32)).mean()
+        print(f"  Mean |frame[-1] - frame[0]| = {diff:.3f} (near 0 means static render)")
 
     print(f"  Offline trajectory: idx={traj_idx}, start={start}, end={end}, len={len(observations)}")
     return frames, observations, actions_list
