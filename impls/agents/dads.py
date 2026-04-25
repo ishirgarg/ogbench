@@ -561,7 +561,9 @@ class DADSAgent(flax.struct.PyTreeNode):
             info[k] = v
         info['dads/active'] = in_dads_f
 
-        total = wm_active * wm_loss + in_dads_f * dads_loss + bc_alpha * bc_loss_val
+        # Policy + critic + skill-dynamics + BC are all gated by `in_dads_f`,
+        # so during warmup ONLY the world model receives gradient.
+        total = wm_active * wm_loss + in_dads_f * (dads_loss + bc_alpha * bc_loss_val)
         return total, info
 
     @jax.jit
