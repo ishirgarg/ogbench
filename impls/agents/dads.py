@@ -12,9 +12,8 @@ intrinsic reward r = log q(s'|s,z) - log[(1/K) Σ_{z'} q(s'|s,z')].
 Here we cannot interact with the env.  We instead:
   1. Train a *world model*  p_w(s' | s, a)  on the offline OGBench dataset
      by maximum likelihood (Gaussian over Δs = s' − s with learned diagonal
-     covariance).
-  2. After a warm-up phase that gives the world model time to fit, run online
-     DADS *inside the world model*:
+     covariance) for `model_warmup_steps` optimizer steps, then FREEZE it.
+  2. With the world model frozen, run online DADS *inside the world model*:
        - sample a batch of initial states from the offline data,
        - sample one skill per state (one-hot),
        - roll out H steps using a_t = π(s_t, z),  s_{t+1} ~ p_w(s_t, a_t),
@@ -522,11 +521,13 @@ class DADSAgent(flax.struct.PyTreeNode):
         wm_loss, wm_info = self.world_model_loss(batch, grad_params)
         info = {f'world_model/{k}': v for k, v in wm_info.items()}
 
-        # DADS branch is gated on having trained the world model for at least
-        # `model_warmup_steps` optimizer steps.  Outside warmup we still keep
-        # training the world model (it doesn't hurt) AND train all DADS pieces.
+        # Two-phase schedule:
+        #   step <  model_warmup_steps:  only world-model + BC losses train.
+        #   step >= model_warmup_steps:  world model is FROZEN; DADS losses
+        #                                (skill dynamics, SAC, BC) train.
         in_dads = self.network.step >= self.config['model_warmup_steps']
         in_dads_f = in_dads.astype(jnp.float32)
+        wm_active = 1.0 - in_dads_f
 
         dads_loss, dads_info = self._dads_branch(batch, grad_params, dads_rng)
 
@@ -560,12 +561,20 @@ class DADSAgent(flax.struct.PyTreeNode):
             info[k] = v
         info['dads/active'] = in_dads_f
 
-        total = wm_loss + in_dads_f * dads_loss + bc_alpha * bc_loss_val
+        total = wm_active * wm_loss + in_dads_f * dads_loss + bc_alpha * bc_loss_val
         return total, info
 
     @jax.jit
     def update(self, batch):
         new_rng, rng = jax.random.split(self.rng)
+
+        # Snapshot world-model params BEFORE the update.  Once past warmup we
+        # restore them, which freezes the world model robustly even though
+        # Adam's momentum on those params from warmup would otherwise keep
+        # nudging them after their gradient becomes zero.
+        old_wm = self.network.params['modules_world_model']
+        in_dads = self.network.step >= self.config['model_warmup_steps']
+
         new_network, info = self.network.apply_loss_fn(
             loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
         )
@@ -576,7 +585,19 @@ class DADSAgent(flax.struct.PyTreeNode):
             new_network.params['modules_critic'],
             new_network.params['modules_target_critic'],
         )
-        new_params = {**new_network.params, 'modules_target_critic': new_target}
+
+        # Freeze world model after warmup by reverting its params.
+        frozen_wm = jax.tree_util.tree_map(
+            lambda old, new: jnp.where(in_dads, old, new),
+            old_wm,
+            new_network.params['modules_world_model'],
+        )
+
+        new_params = {
+            **new_network.params,
+            'modules_target_critic': new_target,
+            'modules_world_model': frozen_wm,
+        }
         new_network = new_network.replace(params=new_params)
         return self.replace(network=new_network, rng=new_rng), info
 
@@ -708,8 +729,8 @@ def get_config():
         num_skills=8,
         num_splus_samples=64,             # MC samples for empowerment estimate
         reward_scale=1.0,
-        rollout_length=10,                # H, model-rollout horizon
-        model_warmup_steps=50_000,        # train world model only for this many steps
+        rollout_length=50,                # H, model-rollout horizon
+        model_warmup_steps=500_000,       # train world model only for this many steps; frozen after
         # Goal-subspace projection: which obs dims define skills (e.g. (0, 1) for
         # x-y in ant maze).  None = use full state for skill dynamics output.
         obs_indices=ml_collections.config_dict.placeholder(tuple),
