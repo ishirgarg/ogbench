@@ -123,10 +123,16 @@ def _render_observation_on_env(env, obs, verbose=False):
     gripper_scaler = 3.0
 
     obs = np.asarray(obs).astype(np.float64)
+    if not np.all(np.isfinite(obs)):
+        if verbose:
+            print("  [warn] observation has non-finite values; skipping state update.")
+        return env.render().copy()
+
     base._data.qpos[base._arm_joint_ids] = obs[:n_arm]
     base._data.qvel[base._arm_joint_ids] = obs[n_arm:2 * n_arm]
 
     gripper_opening = float(obs[2 * n_arm + 5]) / gripper_scaler
+    gripper_opening = float(np.clip(gripper_opening, 0.0, 1.0))
     base._data.qpos[base._gripper_opening_joint_id] = gripper_opening * 0.8
 
     n_cubes = getattr(base, '_num_cubes', 0)
@@ -134,10 +140,17 @@ def _render_observation_on_env(env, obs, verbose=False):
     for i in range(n_cubes):
         off = cube_start + i * 9
         pos = obs[off:off + 3] / xyz_scaler + xyz_center
-        quat = obs[off + 3:off + 7]
+        quat = np.asarray(obs[off + 3:off + 7], dtype=np.float64)
+        norm = np.linalg.norm(quat)
+        if not np.isfinite(norm) or norm < 1e-6:
+            quat = np.array([1.0, 0.0, 0.0, 0.0])  # identity
+        else:
+            quat = quat / norm
         joint = base._data.joint(f'object_joint_{i}')
         joint.qpos[:3] = pos
-        joint.qpos[3:] = quat
+        joint.qpos[3:7] = quat
+        # Zero cube velocities for a static visualization frame.
+        joint.qvel[:] = 0.0
 
     mujoco.mj_forward(base._model, base._data)
     return env.render().copy()
@@ -237,8 +250,8 @@ def compose_video_frames(env_frames, emp_values, fps):
     env_h, env_w = env_frames[0].shape[:2]
 
     # Fixed y-axis: 1 to 2
-    y_lo = 1.3
-    y_hi = 1.5
+    y_lo = 0.9
+    y_hi = 1.8
 
     # Figure size: match env height, reasonable width for a tall plot
     fig_h_inches = env_h / 100.0
@@ -319,7 +332,7 @@ def main():
                         help="Only keep every N-th frame (1 = keep all).")
     parser.add_argument("--num_splus_samples", type=int, default=192,
                         help="Monte-Carlo samples for empowerment estimation.")
-    parser.add_argument("--emp_batch_size", type=int, default=64,
+    parser.add_argument("--emp_batch_size", type=int, default=256,
                         help="Batch size for empowerment computation.")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path (default: auto in run_dir).")
