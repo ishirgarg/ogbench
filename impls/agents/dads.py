@@ -746,7 +746,7 @@ def get_config():
         init_alpha=1.0,
         target_entropy=ml_collections.config_dict.placeholder(float),
         target_entropy_multiplier=0.5,
-        tanh_squash=True,
+        tanh_squash=False,
         state_dependent_std=True,
         actor_fc_scale=0.01,
         # ── Compatibility with OGBench main.py / GCDataset ───────────────────
