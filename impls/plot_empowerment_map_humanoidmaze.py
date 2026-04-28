@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--ckpt_root", type=str, default="ckpts", help="Root checkpoint directory.")
     parser.add_argument("--run_dir", type=str, default=None, help="Explicit run dir (overrides latest in ckpt_root).")
     parser.add_argument("--epoch", type=int, default=None, help="Explicit epoch (overrides latest params_*.pkl).")
-    parser.add_argument("--grid_res", type=int, default=40, help="Grid resolution for humanoid XY map.")
+    parser.add_argument("--grid_res", type=int, default=160, help="Grid resolution for humanoid XY map.")
     parser.add_argument("--x_min", type=float, default=0.0, help="Grid min x for humanoid position.")
     parser.add_argument("--x_max", type=float, default=52.0, help="Grid max x for humanoid position.")
     parser.add_argument("--y_min", type=float, default=0.0, help="Grid min y for humanoid position.")
@@ -56,10 +56,16 @@ def main():
     parser.add_argument(
         "--num_splus_samples",
         type=int,
-        default=192,
+        default=256,
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for per-point RNG.")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=128,
+        help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
+    )
     parser.add_argument("--output", type=str, default=None, help="Output image path (.png). Defaults to run dir.")
     args = parser.parse_args()
 
@@ -120,13 +126,22 @@ def main():
     point_root_key = jax.random.PRNGKey(point_root_seed)
     num_points = obs_batch_jnp.shape[0]
     point_keys = jax.random.split(point_root_key, num_points)
-    # Compute empowerment exactly like Ant Soccer: agent.empowerment averaged over skills internally
-    emp_vals = np.asarray(
-        jax.vmap(
+    # Compute empowerment exactly like Ant Soccer: agent.empowerment averaged over skills internally.
+    # Batch over grid points to avoid OOM on large grids / large num_splus_samples.
+    @jax.jit
+    def _emp_batch(obs_b, keys_b):
+        return jax.vmap(
             lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
             in_axes=(0, 0),
-        )(obs_batch_jnp, point_keys)
-    )
+        )(obs_b, keys_b)
+
+    batch_size = max(1, int(args.batch_size))
+    emp_chunks = []
+    for start in range(0, num_points, batch_size):
+        end = min(start + batch_size, num_points)
+        emp_chunks.append(np.asarray(_emp_batch(obs_batch_jnp[start:end], point_keys[start:end])))
+        print(f"  empowerment batch {start}:{end} / {num_points}")
+    emp_vals = np.concatenate(emp_chunks, axis=0)
     emp_map = emp_vals.reshape(args.grid_res, args.grid_res)
 
     # Overlay helper: draw maze walls as solid black squares
@@ -166,7 +181,7 @@ def main():
         origin="lower",
         extent=[x_low_plot, x_high_plot, y_low_plot, y_high_plot],
         aspect="auto",
-        cmap="viridis",
+        cmap="magma",
     )
     overlay_maze(ax)
     ax.set_xlabel("Humanoid x")

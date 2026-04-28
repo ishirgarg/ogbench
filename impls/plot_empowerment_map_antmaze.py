@@ -60,6 +60,12 @@ def main():
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for per-point RNG.")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1024,
+        help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
+    )
     parser.add_argument("--output", type=str, default=None, help="Output image path (.png). Defaults to run dir.")
     args = parser.parse_args()
 
@@ -120,13 +126,22 @@ def main():
     point_root_key = jax.random.PRNGKey(point_root_seed)
     num_points = obs_batch_jnp.shape[0]
     point_keys = jax.random.split(point_root_key, num_points)
-    # Compute empowerment exactly like Ant Soccer: agent.empowerment averaged over skills internally
-    emp_vals = np.asarray(
-        jax.vmap(
+    # Compute empowerment exactly like Ant Soccer: agent.empowerment averaged over skills internally.
+    # Batch over grid points to avoid OOM on large grids / large num_splus_samples.
+    @jax.jit
+    def _emp_batch(obs_b, keys_b):
+        return jax.vmap(
             lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
             in_axes=(0, 0),
-        )(obs_batch_jnp, point_keys)
-    )
+        )(obs_b, keys_b)
+
+    batch_size = max(1, int(args.batch_size))
+    emp_chunks = []
+    for start in range(0, num_points, batch_size):
+        end = min(start + batch_size, num_points)
+        emp_chunks.append(np.asarray(_emp_batch(obs_batch_jnp[start:end], point_keys[start:end])))
+        print(f"  empowerment batch {start}:{end} / {num_points}")
+    emp_vals = np.concatenate(emp_chunks, axis=0)
     emp_map = emp_vals.reshape(args.grid_res, args.grid_res)
 
     # Overlay helper: draw maze walls as semi-transparent rectangles

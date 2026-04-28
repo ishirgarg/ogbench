@@ -102,6 +102,12 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1024,
+        help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)
@@ -146,6 +152,13 @@ def main():
     flat_y = yy.reshape(-1)
     num_points = flat_x.shape[0]
 
+    @jax.jit
+    def _emp_batch(obs_b, keys_b):
+        return jax.vmap(
+            lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
+            in_axes=(0, 0),
+        )(obs_b, keys_b)
+
     def compute_empowerment_map(cube_xys):
         obs_list = []
         for gx, gy in zip(flat_x, flat_y):
@@ -160,12 +173,14 @@ def main():
         obs_batch_jnp = jnp.asarray(obs_batch)
         root_key = jax.random.PRNGKey(int(rng.integers(0, 2**31 - 1)))
         point_keys = jax.random.split(root_key, num_points)
-        emp = np.asarray(
-            jax.vmap(
-                lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
-                in_axes=(0, 0),
-            )(obs_batch_jnp, point_keys)
-        )
+        # Batch over grid points to avoid OOM on large grids / large num_splus_samples.
+        batch_size = max(1, int(args.batch_size))
+        emp_chunks = []
+        for start in range(0, num_points, batch_size):
+            end = min(start + batch_size, num_points)
+            emp_chunks.append(np.asarray(_emp_batch(obs_batch_jnp[start:end], point_keys[start:end])))
+            print(f"  empowerment batch {start}:{end} / {num_points}")
+        emp = np.concatenate(emp_chunks, axis=0)
         return emp.reshape(args.grid_res, args.grid_res)
 
     if args.cube_xys is not None:
