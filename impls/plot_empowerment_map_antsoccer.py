@@ -162,6 +162,24 @@ def main():
                     )
                     ax.add_patch(rect)
 
+    def is_valid_xy(x: float, y: float) -> bool:
+        if maze_map is None:
+            return True
+        j = int(round((x + offx) / unit))
+        i = int(round((y + offy) / unit))
+        rows, cols = maze_map.shape
+        if i < 0 or i >= rows or j < 0 or j >= cols:
+            return False
+        return int(maze_map[i, j]) != 1
+
+    def sample_valid_ball_xy(rng_) -> tuple[float, float]:
+        for _ in range(10000):
+            x = float(rng_.uniform(x_low, x_high))
+            y = float(rng_.uniform(y_low, y_high))
+            if is_valid_xy(x, y):
+                return x, y
+        raise RuntimeError("Could not sample a valid (non-wall) ball position within bounds.")
+
     xs = np.linspace(x_low, x_high, args.grid_res, dtype=np.float32)
     ys = np.linspace(y_low, y_high, args.grid_res, dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
@@ -240,7 +258,7 @@ def main():
             bx, by = _parse_indices(args.ball_xy)
             fixed_ball = (float(bx), float(by))
         else:
-            fixed_ball = (float(rng.uniform(x_low, x_high)), float(rng.uniform(y_low, y_high)))
+            fixed_ball = sample_valid_ball_xy(rng)
         ball_positions = [fixed_ball for _ in range(9)]
         goal_overrides = [
             np.array([rng.uniform(x_low, x_high), rng.uniform(y_low, y_high)], dtype=np.float64) for _ in range(9)
@@ -253,7 +271,7 @@ def main():
             fixed_goal = np.array([float(gx), float(gy)], dtype=np.float64)
         else:
             fixed_goal = np.array([rng.uniform(x_low, x_high), rng.uniform(y_low, y_high)], dtype=np.float64)
-        ball_positions = [(float(rng.uniform(x_low, x_high)), float(rng.uniform(y_low, y_high))) for _ in range(9)]
+        ball_positions = [sample_valid_ball_xy(rng) for _ in range(9)]
         goal_overrides = [fixed_goal for _ in range(9)]
         force_grid = True
     else:
@@ -264,7 +282,7 @@ def main():
             goal_overrides = [None]
             force_grid = False
         else:
-            ball_positions = [(float(rng.uniform(x_low, x_high)), float(rng.uniform(y_low, y_high))) for _ in range(9)]
+            ball_positions = [sample_valid_ball_xy(rng) for _ in range(9)]
             goal_overrides = [None for _ in range(9)]
             force_grid = True
 
