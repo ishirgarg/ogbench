@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Rectangle
 
 from agents import agents as agent_registry
 from utils.env_utils import make_env_and_datasets
@@ -130,6 +131,37 @@ def main():
     x_low, x_high = args.x_min, args.x_max
     y_low, y_high = args.y_min, args.y_max
 
+    # Maze geometry for wall overlay (auto-detected from env: arena, medium, etc.)
+    unit = getattr(base_env, "_maze_unit", 4.0)
+    half = float(unit) / 2.0
+    offx = getattr(base_env, "_offset_x", 4.0)
+    offy = getattr(base_env, "_offset_y", 4.0)
+    maze_map = getattr(base_env, "maze_map", None)
+    x_low_plot, x_high_plot = x_low - half, x_high + half
+    y_low_plot, y_high_plot = y_low - half, y_high + half
+
+    def overlay_maze(ax):
+        if maze_map is None:
+            return
+        rows, cols = maze_map.shape
+        for i in range(rows):
+            for j in range(cols):
+                if maze_map[i, j] == 1:
+                    cx = j * unit - offx
+                    cy = i * unit - offy
+                    llx = cx - unit / 2.0
+                    lly = cy - unit / 2.0
+                    rect = Rectangle(
+                        (llx, lly),
+                        unit,
+                        unit,
+                        facecolor="black",
+                        edgecolor="black",
+                        linewidth=0.3,
+                        alpha=0.6,
+                    )
+                    ax.add_patch(rect)
+
     xs = np.linspace(x_low, x_high, args.grid_res, dtype=np.float32)
     ys = np.linspace(y_low, y_high, args.grid_res, dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
@@ -246,15 +278,16 @@ def main():
     if not force_grid and len(ball_positions) == 1:
         fixed_ball = ball_positions[0]
         goal_used = goals[0]
-        plt.figure(figsize=(7, 6))
-        im = plt.imshow(
+        fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+        im = ax.imshow(
             maps[0],
             origin="lower",
-            extent=[x_low, x_high, y_low, y_high],
+            extent=[x_low_plot, x_high_plot, y_low_plot, y_high_plot],
             aspect="auto",
             cmap="viridis",
         )
-        plt.scatter(
+        overlay_maze(ax)
+        ax.scatter(
             [fixed_ball[0]],
             [fixed_ball[1]],
             c="red",
@@ -265,7 +298,7 @@ def main():
             label="Ball",
         )
         # Plot goal used for this map.
-        plt.scatter(
+        ax.scatter(
             [goal_used[0]],
             [goal_used[1]],
             c="yellow",
@@ -275,11 +308,11 @@ def main():
             linewidths=0.8,
             label="Goal",
         )
-        plt.legend(loc="upper right")
-        plt.colorbar(im, label="Empowerment")
-        plt.xlabel(f"Ant x")
-        plt.ylabel(f"Ant y")
-        plt.title(
+        ax.legend(loc="upper right")
+        fig.colorbar(im, ax=ax, label="Empowerment")
+        ax.set_xlabel(f"Ant x")
+        ax.set_ylabel(f"Ant y")
+        ax.set_title(
             f"Empowerment map | run={os.path.basename(run_dir)} | epoch={epoch}\n"
             f"fixed ball=({fixed_ball[0]:.3f}, {fixed_ball[1]:.3f})"
         )
@@ -295,10 +328,11 @@ def main():
             im = ax.imshow(
                 emp_map,
                 origin="lower",
-                extent=[x_low, x_high, y_low, y_high],
+                extent=[x_low_plot, x_high_plot, y_low_plot, y_high_plot],
                 aspect="auto",
                 cmap="viridis",
             )
+            overlay_maze(ax)
             ax.scatter(
                 [bp[0]],
                 [bp[1]],

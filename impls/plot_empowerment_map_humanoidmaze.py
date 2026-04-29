@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--ckpt_root", type=str, default="ckpts", help="Root checkpoint directory.")
     parser.add_argument("--run_dir", type=str, default=None, help="Explicit run dir (overrides latest in ckpt_root).")
     parser.add_argument("--epoch", type=int, default=None, help="Explicit epoch (overrides latest params_*.pkl).")
-    parser.add_argument("--grid_res", type=int, default=160, help="Grid resolution for humanoid XY map.")
+    parser.add_argument("--grid_res", type=int, default=320, help="Grid resolution for humanoid XY map.")
     parser.add_argument("--x_min", type=float, default=0.0, help="Grid min x for humanoid position.")
     parser.add_argument("--x_max", type=float, default=52.0, help="Grid max x for humanoid position.")
     parser.add_argument("--y_min", type=float, default=0.0, help="Grid min y for humanoid position.")
@@ -56,7 +56,7 @@ def main():
     parser.add_argument(
         "--num_splus_samples",
         type=int,
-        default=256,
+        default=512,
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for per-point RNG.")
