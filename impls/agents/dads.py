@@ -723,15 +723,15 @@ def get_config():
         lr=3e-4,
         batch_size=512,
         # ── Architecture ─────────────────────────────────────────────────────
-        hidden_dims=(512, 512, 512),
+        hidden_dims=(512, 512, 512, 512),
         value_hidden_dims=ml_collections.config_dict.placeholder(tuple),
         actor_hidden_dims=ml_collections.config_dict.placeholder(tuple),
         layer_norm=True,
         # ── DADS ─────────────────────────────────────────────────────────────
-        num_skills=8,
-        num_splus_samples=64,             # MC samples for empowerment estimate
+        num_skills=5,
+        num_splus_samples=32,             # MC samples for empowerment estimate
         reward_scale=1.0,
-        rollout_length=50,                # H, model-rollout horizon
+        rollout_length=80,                # H, model-rollout horizon
         model_warmup_steps=500_000,       # train world model only for this many steps; frozen after
         # Goal-subspace projection: which obs dims define skills (e.g. (0, 1) for
         # x-y in ant maze).  None = use full state for skill dynamics output.

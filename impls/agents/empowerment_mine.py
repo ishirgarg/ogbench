@@ -519,7 +519,7 @@ def get_config():
         lr=3e-4,
         batch_size=1024,
         # ── Architecture ─────────────────────────────────────────────────────
-        hidden_dims=(512, 512, 512),
+        hidden_dims=(512, 512, 512, 512),
         world_model_hidden_dims=ml_collections.config_dict.placeholder(tuple),
         t_hidden_dims=ml_collections.config_dict.placeholder(tuple),
         actor_hidden_dims=ml_collections.config_dict.placeholder(tuple),
@@ -541,7 +541,7 @@ def get_config():
         # ── BC constraint ────────────────────────────────────────────────────
         bc_alpha=0.1,
         # ── Empowerment metric (MC) ─────────────────────────────────────────
-        num_a_samples=4,
+        num_a_samples=32,
         # ── Compatibility with main.py / GCDataset (fields unused by the
         #    agent itself, but consumed by GCDataset wiring). ────────────────
         discrete=False,
