@@ -49,7 +49,7 @@ def main():
     parser.add_argument("--ckpt_root", type=str, default="ckpts", help="Root checkpoint directory.")
     parser.add_argument("--run_dir", type=str, default=None, help="Explicit run dir (overrides latest in ckpt_root).")
     parser.add_argument("--epoch", type=int, default=None, help="Explicit epoch (overrides latest params_*.pkl).")
-    parser.add_argument("--grid_res", type=int, default=40, help="Grid resolution for ant XY map.")
+    parser.add_argument("--grid_res", type=int, default=200, help="Grid resolution for ant XY map.")
     # Ant Soccer only; indices are not needed.
     parser.add_argument(
         "--ball_xy",
@@ -61,7 +61,7 @@ def main():
     parser.add_argument(
         "--num_splus_samples",
         type=int,
-        default=192,
+        default=384,
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
     parser.add_argument("--x_min", type=float, default=0, help="Grid min x for ant position.")
@@ -90,7 +90,7 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1024,
+        default=128,
         help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
     )
     args = parser.parse_args()

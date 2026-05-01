@@ -3,6 +3,7 @@ from agents.crl import CRLAgent
 from agents.dads import DADSAgent
 from agents.ddpgbc import DDPGBCAgent
 from agents.empowerment_action import EmpowermentActionAgent
+from agents.empowerment_mine import EmpowermentMineAgent
 from agents.empowerment_skill import EmpowermentAgent as EmpowermentSkillAgent
 from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
@@ -17,6 +18,7 @@ agents = dict(
     dads=DADSAgent,
     ddpgbc=DDPGBCAgent,
     empowerment_action=EmpowermentActionAgent,
+    empowerment_mine=EmpowermentMineAgent,
     empowerment_skill=EmpowermentSkillAgent,
     gcbc=GCBCAgent,
     gciql=GCIQLAgent,

@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--ckpt_root", type=str, default="ckpts", help="Root checkpoint directory.")
     parser.add_argument("--run_dir", type=str, default=None, help="Explicit run dir (overrides latest in ckpt_root).")
     parser.add_argument("--epoch", type=int, default=None, help="Explicit epoch (overrides latest params_*.pkl).")
-    parser.add_argument("--grid_res", type=int, default=40, help="Grid resolution for ant XY map.")
+    parser.add_argument("--grid_res", type=int, default=200, help="Grid resolution for ant XY map.")
     parser.add_argument("--x_min", type=float, default=0.0, help="Grid min x for ant position.")
     parser.add_argument("--x_max", type=float, default=20.0, help="Grid max x for ant position.")
     parser.add_argument("--y_min", type=float, default=0.0, help="Grid min y for ant position.")
@@ -56,14 +56,14 @@ def main():
     parser.add_argument(
         "--num_splus_samples",
         type=int,
-        default=192,
+        default=384,
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for per-point RNG.")
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1024,
+        default=16,
         help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
     )
     parser.add_argument("--output", type=str, default=None, help="Output image path (.png). Defaults to run dir.")
