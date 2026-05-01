@@ -531,6 +531,8 @@ def get_config():
         obs_indices=ml_collections.config_dict.placeholder(tuple),
         # ── Target networks (Polyak averaging) ───────────────────────────────
         tau=0.005,
+        # ── Goal-relabelling geometric sampling (used by GCDataset) ──────────
+        discount=0.99,
         # ── SAC entropy temperature ──────────────────────────────────────────
         init_alpha=1.0,
         target_entropy=ml_collections.config_dict.placeholder(float),
