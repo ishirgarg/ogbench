@@ -24,8 +24,15 @@ offline setting:
 scoring with T (e.g. xy in antmaze). The world model still predicts the
 full state — only the input to T is projected — so empowerment is
 I(proj(S'); A | s) under the policy.
+
+Polyak target networks (`target_t`, `target_world_model`) provide stable
+inputs to non-stationarity-sensitive callers: the actor sees a slow-moving
+score and the MINE T loss sees a stationary marginal distribution. Targets
+are soft-updated with rate `tau` after every gradient step, matching the
+empowerment_action / DADS conventions.
 """
 
+import copy
 from typing import Any, Optional, Sequence
 
 import distrax
@@ -144,16 +151,18 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
             return states[..., jnp.array(obs_indices)]
         return states
 
-    def _world_model_sample(self, observations, actions, eps_rng, params=None):
+    def _world_model_sample(self, observations, actions, eps_rng,
+                             *, wm_module='world_model', params=None):
         """Reparameterised sample s' = s + μ_w + σ_w · ε."""
-        mean, log_std = self.network.select('world_model')(
+        mean, log_std = self.network.select(wm_module)(
             observations, actions, params=params
         )
         eps = jax.random.normal(eps_rng, mean.shape)
         return observations + mean + jnp.exp(log_std) * eps
 
-    def _marginal_t_samples(self, observations, rng, *, t_params=None,
-                             world_model_params=None, policy_params=None):
+    def _marginal_t_samples(self, observations, rng, *,
+                             t_module='t', wm_module='world_model',
+                             t_params=None, wm_params=None, policy_params=None):
         """Score (s, a*, proj(s'_marg)) with T, where (a*, s'_marg) is a sample
         from the marginal π(a|s) p(s'|s).
 
@@ -161,6 +170,9 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
         marginal, a** for the world-model input so s'_marg = s + Δ_w(s, a**).
         Independence is required for the marginal to factorise as
         π(a|s) p(s'|s) (matching JaxGCRL, online_mine_empowerment.py:182-195).
+
+        `t_module` / `wm_module` select which T (current vs target) and which
+        world model (current vs target) is used.
         """
         a_star_key, a_dyn_key, eps_key = jax.random.split(rng, 3)
         dist_star = self.network.select('policy')(observations, params=policy_params)
@@ -168,9 +180,9 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
         dist_dyn = self.network.select('policy')(observations, params=policy_params)
         a_dyn = dist_dyn.sample(seed=a_dyn_key)
         s_marg = self._world_model_sample(
-            observations, a_dyn, eps_key, params=world_model_params
+            observations, a_dyn, eps_key, wm_module=wm_module, params=wm_params,
         )
-        t_marg = self.network.select('t')(
+        t_marg = self.network.select(t_module)(
             observations, a_star, self._proj(s_marg), params=t_params,
         )
         return t_marg
@@ -206,8 +218,14 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
         t_joint = self.network.select('t')(
             obs, actions, self._proj(next_obs), params=grad_params,
         )
-        # Marginal: actor + world-model frozen (no params= on either).
-        t_marg = self._marginal_t_samples(obs, rng, t_params=grad_params)
+        # Marginal: gradient flows through T only. Use the **target** world
+        # model so the marginal distribution T sees stays stationary across
+        # consecutive updates (the analogue of SAC's target-bootstrap).
+        t_marg = self._marginal_t_samples(
+            obs, rng,
+            t_module='t', wm_module='target_world_model',
+            t_params=grad_params,
+        )
 
         n = jnp.asarray(t_marg.shape[0], dtype=t_marg.dtype)
         log_partition = logsumexp(t_marg) - jnp.log(n)
@@ -238,17 +256,28 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
         actions = dist.sample(seed=a_key)
         log_probs = dist.log_prob(actions)
 
-        # Reparameterised next-state sample (world model frozen).
-        s_next = self._world_model_sample(obs, actions, dyn_key)
+        # Reparameterised next-state sample from the **target** world model
+        # (frozen via no params=, and target rather than current so the
+        # actor's reparam grad sees a slow-moving dynamics).
+        s_next = self._world_model_sample(
+            obs, actions, dyn_key, wm_module='target_world_model',
+        )
 
-        # T score with the network frozen (gradient flows to policy through
-        # actions and s_next).
-        t_score = self.network.select('t')(obs, actions, self._proj(s_next))
+        # T score from the **target** T network — stable improvement signal,
+        # SAC-style. Gradient still flows to the policy through the
+        # reparameterised actions and s_next.
+        t_score = self.network.select('target_t')(obs, actions, self._proj(s_next))
 
-        # log_partition over a fresh marginal batch (frozen π and p_w);
-        # stop_gradient defensively so no gradient leaks here.
+        # log_partition over a fresh marginal batch using the target
+        # networks (frozen for grad and slow-moving for stability).
         log_partition = jax.lax.stop_gradient(
-            logsumexp(self._marginal_t_samples(obs, marg_key)) - jnp.log(obs.shape[0])
+            logsumexp(
+                self._marginal_t_samples(
+                    obs, marg_key,
+                    t_module='target_t', wm_module='target_world_model',
+                )
+            )
+            - jnp.log(obs.shape[0])
         )
         score = t_score - log_partition
 
@@ -302,13 +331,20 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
         def score_for_sample(a_seed, d_seed):
             dist = self.network.select('policy')(observations)
             a = dist.sample(seed=a_seed)
-            s_next = self._world_model_sample(observations, a, d_seed)
-            return self.network.select('t')(observations, a, self._proj(s_next))
+            s_next = self._world_model_sample(
+                observations, a, d_seed, wm_module='target_world_model',
+            )
+            return self.network.select('target_t')(observations, a, self._proj(s_next))
 
         t_per_sample = jax.vmap(score_for_sample)(action_seeds, dyn_seeds)  # [M, B]
 
         log_partition = (
-            logsumexp(self._marginal_t_samples(observations, marg_rng))
+            logsumexp(
+                self._marginal_t_samples(
+                    observations, marg_rng,
+                    t_module='target_t', wm_module='target_world_model',
+                )
+            )
             - jnp.log(observations.shape[0])
         )
         return t_per_sample.mean(axis=0) - log_partition  # [B]
@@ -350,6 +386,25 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(
             loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
         )
+
+        # Polyak soft-update of target networks.
+        tau = self.config['tau']
+        new_target_t = jax.tree_util.tree_map(
+            lambda p, tp: p * tau + tp * (1 - tau),
+            new_network.params['modules_t'],
+            new_network.params['modules_target_t'],
+        )
+        new_target_wm = jax.tree_util.tree_map(
+            lambda p, tp: p * tau + tp * (1 - tau),
+            new_network.params['modules_world_model'],
+            new_network.params['modules_target_world_model'],
+        )
+        new_params = {
+            **new_network.params,
+            'modules_target_t': new_target_t,
+            'modules_target_world_model': new_target_wm,
+        }
+        new_network = new_network.replace(params=new_params)
         return self.replace(network=new_network, rng=new_rng), info
 
     # ── Evaluation ───────────────────────────────────────────────────────────
@@ -412,10 +467,12 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
             log_std_min=config['world_model_log_std_min'],
             log_std_max=config['world_model_log_std_max'],
         )
+        target_world_model_def = copy.deepcopy(world_model_def)
         t_def = StatisticsT(
             hidden_dims=t_hidden_dims,
             layer_norm=layer_norm,
         )
+        target_t_def = copy.deepcopy(t_def)
         policy_def = EmpowermentMineActor(
             hidden_dims=actor_hidden_dims,
             action_dim=action_dim,
@@ -431,7 +488,9 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
 
         network_info = dict(
             world_model=(world_model_def, (ex_observations, ex_actions)),
+            target_world_model=(target_world_model_def, (ex_observations, ex_actions)),
             t=(t_def, (ex_observations, ex_actions, ex_next_proj)),
+            target_t=(target_t_def, (ex_observations, ex_actions, ex_next_proj)),
             policy=(policy_def, (ex_observations,)),
             alpha=(alpha_def, ()),
         )
@@ -441,6 +500,10 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
         network_def = ModuleDict(networks)
         network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
+        # Initialise targets as exact copies of their online counterparts so
+        # the very first update sees identical predictions.
+        network_params['modules_target_world_model'] = network_params['modules_world_model']
+        network_params['modules_target_t'] = network_params['modules_t']
 
         network = TrainState.create(network_def, network_params, tx=network_tx)
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
@@ -466,6 +529,8 @@ def get_config():
         world_model_log_std_max=2.0,
         # ── Subspace projection (e.g. (0, 1) for xy in antmaze) ──────────────
         obs_indices=ml_collections.config_dict.placeholder(tuple),
+        # ── Target networks (Polyak averaging) ───────────────────────────────
+        tau=0.005,
         # ── SAC entropy temperature ──────────────────────────────────────────
         init_alpha=1.0,
         target_entropy=ml_collections.config_dict.placeholder(float),
