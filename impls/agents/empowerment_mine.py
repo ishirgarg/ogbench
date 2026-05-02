@@ -315,7 +315,11 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
     def bc_loss(self, batch, grad_params):
         """−log π(a_data | s)."""
         dist = self.network.select('policy')(batch['observations'], params=grad_params)
-        log_prob = dist.log_prob(batch['actions'])
+        # With tanh_squash, log_prob inverts via atanh, which diverges at ±1.
+        # OGBench data contains actions clipped to the boundary, so pull them
+        # just inside the open interval to keep atanh and its Jacobian finite.
+        actions = jnp.clip(batch['actions'], -1.0 + 1e-6, 1.0 - 1e-6)
+        log_prob = dist.log_prob(actions)
         loss = -log_prob.mean()
         return loss, {
             'bc_loss': loss,
@@ -551,7 +555,7 @@ def get_config():
         target_entropy=ml_collections.config_dict.placeholder(float),
         target_entropy_multiplier=0.5,
         # ── Actor head ───────────────────────────────────────────────────────
-        tanh_squash=False,
+        tanh_squash=True,
         actor_fc_scale=0.01,
         # ── BC constraint ────────────────────────────────────────────────────
         bc_alpha=0.1,
