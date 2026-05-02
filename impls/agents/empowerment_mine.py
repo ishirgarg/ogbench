@@ -10,11 +10,13 @@ offline setting:
   - World model p_w(s' | s, a) = N(s + μ_w, diag σ²_w)  (DADS-style; trained
     by Gaussian NLL on Δs over the **full** state).
   - Statistics network T_φ(s, a, proj(s')) → R, trained by maximising
-        E_{(s,a,s')~data}[T] − log E_{(s,a*,s'_marg) ~ π × p_w}[exp T] .
-    Joint samples are real offline transitions; marginal samples come from
-    two independent draws of the actor (one for the action coordinate a*,
-    one for the dynamics input a**, which is then pushed through the world
-    model to produce s'_marg).
+        E_{(s,a,s') ~ π × p_w}[T] − log E_{(s,a*,s'_marg) ~ π × p_w}[exp T] .
+    Joint samples: a ~ π(·|s), s' ~ p_w(·|s, a) (the policy's own dynamics).
+    Marginal samples: two independent actor draws (a* for the action
+    coordinate, a** for the dynamics input pushed through the world model
+    to produce s'_marg). Both use the *current* policy as the A-marginal,
+    so the bound estimates I(A; S'|s) under π × p_w. The offline data is
+    used for the world-model NLL and the BC regulariser only.
   - Stochastic actor π_θ(a | s), trained to maximise the MINE per-sample
     score with SAC-style entropy regularisation (auto-tuned α via
     LogParam, target entropy −0.5 · action_dim by default), plus a BC
@@ -208,21 +210,32 @@ class EmpowermentMineAgent(flax.struct.PyTreeNode):
     def mine_t_loss(self, batch, grad_params, rng):
         """Negated Donsker–Varadhan bound. Gradient flows through T only.
 
-        Joint samples come from the offline batch (s, a, proj(s')); marginal
-        samples come from π × p_w with the actor and world model frozen.
+        Joint and marginal both use π_θ as the A-marginal so the bound is a
+        valid estimator of I(A; S'|s) under π × p_w:
+          - joint  : a ~ π(·|s),  s' ~ p_w(·|s, a)
+          - marginal: a*, a** ~ π(·|s) independently, s'_marg ~ p_w(·|s, a**)
+        Policy and world model are frozen for this loss (gradient through T
+        only); the **target** world model is used so the distribution T sees
+        is stationary across consecutive updates (SAC-style bootstrap).
         """
         obs = batch['observations']
-        actions = batch['actions']
-        next_obs = batch['next_observations']
+        joint_rng, marg_rng = jax.random.split(rng)
 
-        t_joint = self.network.select('t')(
-            obs, actions, self._proj(next_obs), params=grad_params,
+        # Joint sample (a, s') ~ π × p_w. policy_params=None freezes π and
+        # wm_module='target_world_model' freezes the dynamics for this loss.
+        a_key, dyn_key = jax.random.split(joint_rng)
+        dist = self.network.select('policy')(obs)
+        a_joint = dist.sample(seed=a_key)
+        s_joint = self._world_model_sample(
+            obs, a_joint, dyn_key, wm_module='target_world_model',
         )
-        # Marginal: gradient flows through T only. Use the **target** world
-        # model so the marginal distribution T sees stays stationary across
-        # consecutive updates (the analogue of SAC's target-bootstrap).
+        t_joint = self.network.select('t')(
+            obs, a_joint, self._proj(s_joint), params=grad_params,
+        )
+
+        # Marginal: independent (a, s') under π × p_w.
         t_marg = self._marginal_t_samples(
-            obs, rng,
+            obs, marg_rng,
             t_module='t', wm_module='target_world_model',
             t_params=grad_params,
         )
