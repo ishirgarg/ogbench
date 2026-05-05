@@ -679,10 +679,13 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         rng, sample_rng = jax.random.split(self.rng)
 
-      
+        # use_target=False routes the policy loss through the online Q/V
+        # networks (no target bootstrap on the policy gradient).
+        use_target = not self.config['no_target_q_for_policy']
+
         phi_z_v = self._v_phi(
             batch['observations'], skills_onehot,
-            use_target=True, policy_params=None
+            use_target=use_target, policy_params=None
         )  # [batch, d]
 
         # ── Sample ψ ~ N(φ_z_v, d/2 · I) ─────────────────────────────────
@@ -695,15 +698,19 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             batch['observations'], skills_onehot, params=grad_params
         )
         phi_z_q = self._q_phi(
-            batch['observations'], policy_actions, skills_onehot, use_target=True
+            batch['observations'], policy_actions, skills_onehot, use_target=use_target
         )  # [batch, d]
 
         # log Q^z(ψ | s, π(s,z)):  [N, batch]
         log_q = self._logits_from_embeddings(phi_z_q[None], psi, d)
 
-     
+        # When sample_z=True, log_v_all enters only stop_grad'd paths
+        # (log_c_sg, log_v_z), so the policy gradient through phi_all is dead.
+        sample_z = self.config['sample_z']
+        phi_all_policy_params = None if sample_z else grad_params
         phi_all = self._v_phi_all_skills(
-            batch['observations'], use_target=True, policy_params=grad_params
+            batch['observations'], use_target=use_target,
+            policy_params=phi_all_policy_params,
         )  # [K, batch, d]
 
         # log V^{z'}(ψ | s) for all z':  [N, K, batch]
@@ -712,7 +719,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # log V^z for the assigned skill:  [N, batch]
         log_v_z = log_v_all[:, skills, jnp.arange(batch_size)]
 
-     
+
         log_v_all_lse = logsumexp(log_v_all, axis=1)   # [N, batch]
         log_c_sg = jax.lax.stop_gradient(
             log_diff_exp(log_v_all_lse, log_v_z)
@@ -727,28 +734,34 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         log_q_over_v_z = log_q - jax.lax.stop_gradient(log_v_z)   # [N, batch]
         q_term = jnp.exp(log_q_over_v_z) * (log_q - log_m_bar)    # [N, batch]
 
-        # ── v_others_term (all stop_grad'd — V networks are frozen) ───────
-        log_v_ratio = log_v_all - jax.lax.stop_gradient(log_v_z[:, None, :])
-        v_ratio = jnp.exp(log_v_ratio)   # [N, K, batch]
+        if sample_z:
+            # MC over z via random skill draw per batch element. Inner
+            # sum over Z is preserved inside log_m_bar.
+            e_delta = q_term.sum(axis=0)                          # [batch]
+        else:
+            # ── v_others_term (all stop_grad'd — V networks are frozen) ───
+            log_v_ratio = log_v_all - jax.lax.stop_gradient(log_v_z[:, None, :])
+            v_ratio = jnp.exp(log_v_ratio)   # [N, K, batch]
 
-        # Σ_{z'} (v_{z'}/v_z) · log v_{z'}
-        v_log_v_sum = jax.lax.stop_gradient(
-            (v_ratio * log_v_all).sum(axis=1)
-        )  # [N, batch]
+            # Σ_{z'} (v_{z'}/v_z) · log v_{z'}
+            v_log_v_sum = jax.lax.stop_gradient(
+                (v_ratio * log_v_all).sum(axis=1)
+            )  # [N, batch]
 
-        # (Σ_{z'} v_{z'}/v_z) · log m̄  — note: grad of log_m_bar is alive
-        v_all_sum_weighted = jax.lax.stop_gradient(
-            jnp.exp(log_v_all_lse - log_v_z)
-        )  # [N, batch]
-        v_log_m_sum = v_all_sum_weighted * log_m_bar   # [N, batch]
+            # (Σ_{z'} v_{z'}/v_z) · log m̄  — note: grad of log_m_bar is alive
+            v_all_sum_weighted = jax.lax.stop_gradient(
+                jnp.exp(log_v_all_lse - log_v_z)
+            )  # [N, batch]
+            v_log_m_sum = v_all_sum_weighted * log_m_bar   # [N, batch]
 
-        # v_z/v_z = 1 analytically; last_term = log v_z − log m̄
-        last_term = jax.lax.stop_gradient(log_v_z) - log_m_bar    # [N, batch]
+            # v_z/v_z = 1 analytically; last_term = log v_z − log m̄
+            last_term = jax.lax.stop_gradient(log_v_z) - log_m_bar    # [N, batch]
 
-        v_others_term = (v_log_v_sum - v_log_m_sum) - last_term   # [N, batch]
+            v_others_term = (v_log_v_sum - v_log_m_sum) - last_term   # [N, batch]
 
-        # ── Aggregate over N samples then over batch ───────────────────────
-        e_delta = ((q_term + v_others_term) / K).sum(axis=0)       # [batch]
+            # ── Aggregate over N samples then over batch ───────────────────
+            e_delta = ((q_term + v_others_term) / K).sum(axis=0)       # [batch]
+
         loss = -e_delta.mean()
 
         return loss, {
@@ -769,27 +782,12 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         info = {}
 
         q_loss, q_info = self.q_loss(batch, grad_params, skills_onehot)
-        jax.lax.cond(
-            jnp.isnan(q_loss),
-            lambda: jax.debug.print("⚠️ NaN in q_loss: {x}", x=q_loss, ordered=True),
-            lambda: None,
-        )
         info.update({f'q/{k}': v for k, v in q_info.items()})
 
         v_loss, v_info = self.v_loss(batch, grad_params, skills_onehot)
-        jax.lax.cond(
-            jnp.isnan(v_loss),
-            lambda: jax.debug.print("⚠️ NaN in v_loss: {x}", x=v_loss, ordered=True),
-            lambda: None,
-        )
         info.update({f'v/{k}': v for k, v in v_info.items()})
 
         pi_loss, pi_info = self.policy_loss(batch, grad_params, skills, skills_onehot)
-        jax.lax.cond(
-            jnp.isnan(pi_loss),
-            lambda: jax.debug.print("⚠️ NaN in pi_loss: {x}", x=pi_loss, ordered=True),
-            lambda: None,
-        )
         info.update({f'policy/{k}': v for k, v in pi_info.items()})
 
         bc_loss, bc_info = self.bc_loss(batch, grad_params, skills_onehot)
@@ -800,12 +798,29 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         )
         info.update({f'bc/{k}': v for k, v in bc_info.items()})
 
-        empowerment_vals = jax.lax.stop_gradient(
-            self.empowerment(batch['observations'], rng=empowerment_rng)
+        # empowerment() is only consumed at log steps, so skip the MC estimate
+        # otherwise. step is the iteration count during update (== 0 mod
+        # log_interval at log iterations); validation total_loss runs *after*
+        # update has incremented step, so it sits at == 1 mod log_interval.
+        log_interval = self.config['log_interval']
+        step_mod = self.network.step % log_interval
+        should_compute_emp = (step_mod == 0) | (step_mod == 1)
+        zero = jnp.zeros((), dtype=jnp.float32)
+
+        def _compute_emp_metrics():
+            emp = jax.lax.stop_gradient(
+                self.empowerment(batch['observations'], rng=empowerment_rng)
+            )
+            return emp.mean(), emp.min(), emp.max()
+
+        emp_mean, emp_min, emp_max = jax.lax.cond(
+            should_compute_emp,
+            _compute_emp_metrics,
+            lambda: (zero, zero, zero),
         )
-        info['empowerment/mean'] = empowerment_vals.mean()
-        info['empowerment/min']  = empowerment_vals.min()
-        info['empowerment/max']  = empowerment_vals.max()
+        info['empowerment/mean'] = emp_mean
+        info['empowerment/min']  = emp_min
+        info['empowerment/max']  = emp_max
 
         base_alpha = self.config.get('bc_alpha', 0.0)
         if self.config.get('anneal_alpha', False):
@@ -1049,6 +1064,11 @@ def get_config():
         # Self-loss flags
         use_self_v_loss=True,  # Whether to add loss regressing V(s | s, z) onto 1 - discount; this is used ONLY  in the Q representing NEXT state occupancy formulation
         use_self_q_loss=True,  # Whether to add the "self" Q loss terms; this is used ONLY  in the Q representing CURRENT state occupancy formulation
+        # Policy-loss flags
+        no_target_q_for_policy=True,  # Use main Q/V networks (not target) when computing the policy loss.
+        sample_z=True,                # Sample one z per batch element for the policy loss instead of summing analytically over all Z.
+        # Log gating
+        log_interval=5000,            # Skip empowerment() inside total_loss except on steps that match this interval.
         # ───────────────────────────────────────────────────────────────────
         discrete=False,
         const_std=True,
