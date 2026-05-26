@@ -921,7 +921,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         if config.get('encoder') is not None:
             enc  = encoder_modules[config['encoder']]
             keys = ('q', 'v', 'policy') if separate_qv else ('q', 'policy')
-            encoders = {k: GCEncoder(concat_encoder=enc()) for k in keys}
+            encoders = {k: GCEncoder(state_encoder=enc()) for k in keys}
 
         # Shared kwargs for both Q and V network constructors.
         value_kwargs = dict(
@@ -962,8 +962,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             target_psi_encoder = None
             if config.get('encoder') is not None:
                 enc = encoder_modules[config['encoder']]
-                psi_encoder = GCEncoder(concat_encoder=enc())
-                target_psi_encoder = GCEncoder(concat_encoder=enc())
+                psi_encoder = GCEncoder(state_encoder=enc())
+                target_psi_encoder = GCEncoder(state_encoder=enc())
 
             shared_psi_def = SharedPsiEncoder(
                 hidden_dims=value_kwargs['hidden_dims'],
@@ -1059,7 +1059,7 @@ def get_config():
         # ── Architecture flag ───────────────────────────────────────────────
         # False (default): V derived from Q via the policy (single network).
         # True:            independent Q and V networks with separate targets.
-        separate_qv=False,
+        separate_qv=True,
         min_q_value=-8,
         # Self-loss flags
         use_self_v_loss=True,  # Whether to add loss regressing V(s | s, z) onto 1 - discount; this is used ONLY  in the Q representing NEXT state occupancy formulation
