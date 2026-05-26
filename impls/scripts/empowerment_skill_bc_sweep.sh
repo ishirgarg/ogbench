@@ -40,6 +40,8 @@ fi
 # -----------------------------
 # Run
 # -----------------------------
+export MUJOCO_GL=egl
+
 python main.py \
     --env_name=$ENV \
     --save_dir=$SAVE_DIR \
