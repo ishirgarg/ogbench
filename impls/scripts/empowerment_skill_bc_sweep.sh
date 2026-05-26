@@ -46,4 +46,5 @@ python main.py \
     --agent=agents/empowerment_skill.py \
     --agent.num_skills=15 \
     --agent.bc_alpha=$BC_ALPHA \
+    --train_steps=1500000 \
     $EXTRA_ARGS
