@@ -874,11 +874,14 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         if seed is None:
             seed = self.rng
 
-        single_obs = observations.ndim == 1
+        # A single (unbatched) state-based obs is 1D; a single visual obs is 3D
+        # (HWC). Treat both as the unbatched case and prepend a batch dim.
+        single_obs_ndim = 3 if self.config.get('encoder') is not None else 1
+        single_obs = observations.ndim == single_obs_ndim
         if single_obs:
-            observations = observations[None, :]
-        if goals is not None and goals.ndim == 1:
-            goals = goals[None, :]
+            observations = observations[None, ...]
+            if goals is not None:
+                goals = goals[None, ...]
 
         batch_size = observations.shape[0]
 
@@ -916,12 +919,15 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         hidden_dims  = config.get('hidden_dims', (512, 512))
         separate_qv  = config.get('separate_qv', False)
 
-        # Optional visual encoders.
+        # Note that target and main networks need their own encoder each (even though its the same frozen encoder)
         encoders = {}
+        target_encoders = {}
         if config.get('encoder') is not None:
             enc  = encoder_modules[config['encoder']]
             keys = ('q', 'v', 'policy') if separate_qv else ('q', 'policy')
             encoders = {k: GCEncoder(state_encoder=enc()) for k in keys}
+            if separate_qv:
+                target_encoders = {k: GCEncoder(state_encoder=enc()) for k in ('q', 'v')}
 
         # Shared kwargs for both Q and V network constructors.
         value_kwargs = dict(
@@ -990,12 +996,12 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             )
             target_q_def = EmpowermentQNetwork(
                 **value_kwargs,
-                gc_encoder=encoders.get('q'),
+                gc_encoder=target_encoders.get('q'),
                 shared_psi=target_shared_psi_def,
             )
             target_v_def = EmpowermentVNetwork(
                 **value_kwargs,
-                gc_encoder=encoders.get('v'),
+                gc_encoder=target_encoders.get('v'),
                 shared_psi=target_shared_psi_def,
             )
 
