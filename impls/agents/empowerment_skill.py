@@ -1,17 +1,5 @@
 """
-Offline empowerment agent (Myers 2025).
-
-Set  config['separate_qv'] = True   to use independent Q and V networks.
-Set  config['separate_qv'] = False  (default) to derive V from Q via the
-policy, sharing a single value network (φ(s,a,z) == φ_V(s,z) when a=π(s,z)).
-
-All branching on `separate_qv` is isolated to the V modulation interface:
-    _v_phi              – φ_V(s, z)  for a single skill batch
-    _v_phi_all_skills   – φ_V(s, z') for every skill  [K, batch, d]
-    compute_v_logits        – log V^z(s⁺ | s)   (online network)
-    compute_v_logits_target – log V^z(s⁺ | s)   (target network)
-
-Every loss function calls these helpers without any case analysis.
+Offline empowerment agent
 """
 
 from typing import Any, Optional, Sequence
@@ -653,23 +641,25 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         }
 
     def policy_loss(self, batch, grad_params, skills, skills_onehot):
-        """Policy loss via empowerment gradient — fully in log-space.
+        """Policy loss via empowerment gradient.
 
-        Gradient flow
-        ─────────────
-        Combined (separate_qv=False):
-            φ_z_v == φ_z_q (same Q network/policy).  Grad flows through
-            policy_actions in *both* phi_z_v (psi sampling base) and phi_z_q
-            (log_q), and through phi_all for all skills.
+        Unified IS scheme.  For each sample slot m we have a skill z'_m and
+        a ψ_m ~ V_{z'_m}(·|s); the per-sample reward is
 
-        Separate (separate_qv=True):
-            φ_z_v comes from the frozen V network (no policy actions) — psi
-            sampling has no grad.  φ_z_q comes from the frozen Q network via
-            policy_actions(grad_params) — grad flows only through log_q.
-            phi_all comes from the frozen V network — no grad.
+            r_m = (M_{z'_m}/V_{z'_m}) · log(M_{z'_m}/m̄_m)
 
-        All Q/V network *parameters* are stop_grad'd in both modes; grad
-        enters only via the policy output (`policy_params=grad_params`).
+        with M_{z'} = Q^z(ψ|s,a) if z'=z else V_{z'}(ψ|s), and
+        m̄ = (Q^z + Σ_{z''≠z} V_{z''}) / K.  The IS weight collapses to
+        Q^z/V^z when z'=z and to 1 when z'≠z.
+
+        sample_z=True:   M = N MC samples of (z' ~ Unif(K), ψ).
+        sample_z=False:  M = N·K — each z' ∈ [K] used N times analytically
+                         (one ψ ~ V_{z'} per slot); aggregation divides by K
+                         so both modes scale as N · E_{z'}E_ψ[r].
+
+        Gradient flow:  V's are stop_grad'd (frozen V net + explicit sg on
+        log_v_z_prime and log_c_sg).  Policy grad flows only through log_q,
+        which appears as itself and inside log_m_bar.
         """
         batch_size = batch['observations'].shape[0]
         K = self.config['num_skills']
@@ -683,84 +673,81 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # networks (no target bootstrap on the policy gradient).
         use_target = not self.config['no_target_q_for_policy']
 
-        phi_z_v = self._v_phi(
-            batch['observations'], skills_onehot,
-            use_target=use_target, policy_params=None
-        )  # [batch, d]
-
-        # ── Sample ψ ~ N(φ_z_v, d/2 · I) ─────────────────────────────────
-        psi = (
-            phi_z_v[None]
-            + jax.random.normal(sample_rng, (N, *phi_z_v.shape)) * jnp.sqrt(d / 2.0)
-        )  # [N, batch, d]
-
-        policy_actions = self._policy_actions(
-            batch['observations'], skills_onehot, params=grad_params
-        )
-        phi_z_q = self._q_phi(
-            batch['observations'], policy_actions, skills_onehot, use_target=use_target
-        )  # [batch, d]
-
-        # log Q^z(ψ | s, π(s,z)):  [N, batch]
-        log_q = self._logits_from_embeddings(phi_z_q[None], psi, d)
-
-        # When sample_z=True, log_v_all enters only stop_grad'd paths
-        # (log_c_sg, log_v_z), so the policy gradient through phi_all is dead.
         sample_z = self.config['sample_z']
-        phi_all_policy_params = None if sample_z else grad_params
+
+        # phi_all: V at all K skills.  V is frozen w.r.t. the policy in both
+        # modes — every V reference downstream is stop_grad'd anyway.
         phi_all = self._v_phi_all_skills(
-            batch['observations'], use_target=use_target,
-            policy_params=phi_all_policy_params,
+            batch['observations'], use_target=use_target, policy_params=None,
         )  # [K, batch, d]
 
-        # log V^{z'}(ψ | s) for all z':  [N, K, batch]
-        log_v_all = self._logits_from_embeddings(phi_all[None], psi[:, None], d)
+        # ── Build z' for each of M sample slots ─────────────────────────────
+        if sample_z:
+            rng_zp, sample_rng = jax.random.split(sample_rng)
+            z_prime = jax.random.randint(
+                rng_zp, (N, batch_size), 0, K,
+            )  # [N, batch]
+        else:
+            # Enumerate z' ∈ [K] exactly once per (N, batch).
+            z_prime = jnp.broadcast_to(
+                jnp.arange(K)[None, :, None], (N, K, batch_size),
+            ).reshape(N * K, batch_size)  # [N·K, batch]
 
-        # log V^z for the assigned skill:  [N, batch]
-        log_v_z = log_v_all[:, skills, jnp.arange(batch_size)]
+        M = z_prime.shape[0]
 
+        # ── Sample ψ ~ V_{z'}(·|s) ──────────────────────────────────────────
+        batch_idx = jnp.arange(batch_size)[None, :]
+        phi_z_prime_v = phi_all[z_prime, batch_idx]  # [M, batch, d]
+        psi = (
+            phi_z_prime_v
+            + jax.random.normal(sample_rng, (M, batch_size, d))
+            * jnp.sqrt(d / 2.0)
+        )  # [M, batch, d]
 
-        log_v_all_lse = logsumexp(log_v_all, axis=1)   # [N, batch]
+        # ── log Q^z(ψ | s, π(s,z)) ──────────────────────────────────────────
+        policy_actions = self._policy_actions(
+            batch['observations'], skills_onehot, params=grad_params,
+        )
+        phi_z_q = self._q_phi(
+            batch['observations'], policy_actions, skills_onehot, use_target=use_target,
+        )  # [batch, d]
+        log_q = self._logits_from_embeddings(phi_z_q[None], psi, d)  # [M, batch]
+
+        # ── log V_{z''}(ψ) for all z''; pick out V^z (assigned skill) ───────
+        log_v_all = self._logits_from_embeddings(phi_all[None], psi[:, None], d)  # [M, K, batch]
+        log_v_z = log_v_all[:, skills, jnp.arange(batch_size)]                    # [M, batch]
+        log_v_all_lse = logsumexp(log_v_all, axis=1)                              # [M, batch]
         log_c_sg = jax.lax.stop_gradient(
             log_diff_exp(log_v_all_lse, log_v_z)
-        )  # log(Σ V^{z'} − V^z),  [N, batch]
+        )  # log Σ_{z''≠z} V_{z''}:  [M, batch]
 
-        # Grad of log_m_bar flows through log_q only (log_c_sg is stop_grad).
+        # ── m̄ = (Q^z + Σ_{z''≠z} V_{z''}) / K ──────────────────────────────
         log_m_bar = (
             logsumexp(jnp.stack([log_q, log_c_sg], axis=0), axis=0) - log_K
-        )  # [N, batch]
+        )  # [M, batch]
 
-        # ── q_term ────────────────────────────────────────────────────────
-        log_q_over_v_z = log_q - jax.lax.stop_gradient(log_v_z)   # [N, batch]
-        q_term = jnp.exp(log_q_over_v_z) * (log_q - log_m_bar)    # [N, batch]
+        # ── log V_{z'}(ψ): identical to log_v_all[m, z'_m, b], so just index
+        # into the tensor we already computed.  Frozen V → stop_grad.
+        log_v_z_prime_sg = jax.lax.stop_gradient(
+            log_v_all[jnp.arange(M)[:, None], z_prime, jnp.arange(batch_size)[None, :]]
+        )  # [M, batch]
 
+        # log M_{z'}: log_q if z'=z (grad alive), else sg(log V_{z'}).
+        z_eq_zp = (z_prime == skills[None, :])  # [M, batch]
+        log_m_z_prime = jnp.where(z_eq_zp, log_q, log_v_z_prime_sg)
+
+        # IS weight w = M_{z'}/V_{z'}:  Q^z/V^z when z'=z, else 1.
+        w = jnp.exp(log_m_z_prime - log_v_z_prime_sg)            # [M, batch]
+
+        reward = w * (log_m_z_prime - log_m_bar)                 # [M, batch]
+
+        # ── Aggregate ───────────────────────────────────────────────────────
+        # sample_z=True:   sum over N MC samples           → N · E_{z'}E_ψ[r]
+        # sample_z=False:  sum over N·K, divide by K       → N · E_{z'}E_ψ[r]
         if sample_z:
-            # MC over z via random skill draw per batch element. Inner
-            # sum over Z is preserved inside log_m_bar.
-            e_delta = q_term.sum(axis=0)                          # [batch]
+            e_delta = reward.sum(axis=0)
         else:
-            # ── v_others_term (all stop_grad'd — V networks are frozen) ───
-            log_v_ratio = log_v_all - jax.lax.stop_gradient(log_v_z[:, None, :])
-            v_ratio = jnp.exp(log_v_ratio)   # [N, K, batch]
-
-            # Σ_{z'} (v_{z'}/v_z) · log v_{z'}
-            v_log_v_sum = jax.lax.stop_gradient(
-                (v_ratio * log_v_all).sum(axis=1)
-            )  # [N, batch]
-
-            # (Σ_{z'} v_{z'}/v_z) · log m̄  — note: grad of log_m_bar is alive
-            v_all_sum_weighted = jax.lax.stop_gradient(
-                jnp.exp(log_v_all_lse - log_v_z)
-            )  # [N, batch]
-            v_log_m_sum = v_all_sum_weighted * log_m_bar   # [N, batch]
-
-            # v_z/v_z = 1 analytically; last_term = log v_z − log m̄
-            last_term = jax.lax.stop_gradient(log_v_z) - log_m_bar    # [N, batch]
-
-            v_others_term = (v_log_v_sum - v_log_m_sum) - last_term   # [N, batch]
-
-            # ── Aggregate over N samples then over batch ───────────────────
-            e_delta = ((q_term + v_others_term) / K).sum(axis=0)       # [batch]
+            e_delta = (reward / K).sum(axis=0)
 
         loss = -e_delta.mean()
 
@@ -1058,7 +1045,7 @@ def get_config():
         discount=0.99,
         tau=0.005,
         num_skills=15,
-        num_splus_samples=32,
+        num_splus_samples=1,
         obs_indices=ml_collections.config_dict.placeholder(tuple),
         bc_alpha=0.0,
         anneal_alpha=False,
@@ -1066,7 +1053,6 @@ def get_config():
         # False (default): V derived from Q via the policy (single network).
         # True:            independent Q and V networks with separate targets.
         separate_qv=True,
-        min_q_value=-8,
         # Self-loss flags
         use_self_v_loss=True,  # Whether to add loss regressing V(s | s, z) onto 1 - discount; this is used ONLY  in the Q representing NEXT state occupancy formulation
         use_self_q_loss=True,  # Whether to add the "self" Q loss terms; this is used ONLY  in the Q representing CURRENT state occupancy formulation
