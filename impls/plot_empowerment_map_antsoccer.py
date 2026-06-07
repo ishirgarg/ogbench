@@ -1,7 +1,10 @@
+import os
+# Force EGL (headless GL) before any mujoco import so env.render() works on a server.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import argparse
 import glob
 import json
-import os
 import re
 
 import jax
@@ -9,10 +12,12 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
+from PIL import Image, ImageEnhance
 
 from agents import agents as agent_registry
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import restore_agent
+from utils.log_utils import reshape_video
 
 
 def _latest_run_dir(ckpt_root: str) -> str:
@@ -42,6 +47,161 @@ def _parse_indices(text: str) -> tuple[int, int]:
     if len(parts) != 2:
         raise ValueError(f"Expected two comma-separated indices, got: {text}")
     return int(parts[0]), int(parts[1])
+
+
+def rollout_skill(env, agent, num_skills, skill_id, ant_xy, ball_xy,
+                  n_steps, frame_skip, temperature=0.0, seed=0,
+                  goal_xy=None, collect_frames=True, collect_xy=False):
+    """Roll out the empowerment-maximizing policy for a single fixed skill.
+
+    Resets the env, overrides ant + ball XY (and optionally the goal) so the
+    starting state is identical across skills, then runs deterministic
+    policy(.|s, skill_onehot) for n_steps. Returns (frames, ant_xy_traj),
+    where each is None if not requested. Frames are captured every
+    frame_skip steps to match OGBench's eval video cadence; the xy
+    trajectory captures every step.
+    """
+    K = num_skills
+    skill_onehot = jnp.eye(K, dtype=jnp.float32)[skill_id][None, :]
+
+    @jax.jit
+    def policy_action(obs, key):
+        obs_b = obs[None, ...]
+        dist = agent.network.select('policy')(
+            obs_b, skill_onehot, temperature=temperature
+        )
+        if temperature == 0.0:
+            action = dist.mode()
+        else:
+            action = dist.sample(seed=key)
+        return jnp.clip(action[0], -1.0, 1.0)
+
+    base_env = env.unwrapped
+
+    env.reset()
+    if goal_xy is not None:
+        base_env.set_goal(goal_xy=np.asarray(goal_xy, dtype=np.float64))
+    base_env.set_agent_ball_xy(
+        np.asarray(ant_xy, dtype=np.float64),
+        np.asarray(ball_xy, dtype=np.float64),
+    )
+    obs = np.asarray(base_env.get_ob(), dtype=np.float32)
+
+    frames = [env.render().copy()] if collect_frames else None
+    xy_traj = [np.asarray(base_env.get_agent_ball_xy()[0], dtype=np.float32)] \
+        if collect_xy else None
+    rng = jax.random.PRNGKey(int(seed))
+
+    for step in range(1, n_steps + 1):
+        rng, key = jax.random.split(rng)
+        action = np.asarray(policy_action(jnp.asarray(obs), key))
+        obs, _, terminated, truncated, _ = env.step(action)
+        obs = np.asarray(obs, dtype=np.float32)
+        if collect_frames and (step % frame_skip == 0 or step == n_steps):
+            frames.append(env.render().copy())
+        if collect_xy:
+            xy_traj.append(np.asarray(base_env.get_agent_ball_xy()[0], dtype=np.float32))
+        if terminated or truncated:
+            break
+
+    frames_out = np.asarray(frames, dtype=np.uint8) if collect_frames else None
+    xy_out = np.stack(xy_traj, axis=0) if collect_xy else None
+    return frames_out, xy_out
+
+
+def compose_skill_grid(renders_per_skill, n_cols=None):
+    """Pad + border per-skill rollouts and tile into a near-square grid.
+
+    Mirrors utils.log_utils.get_wandb_video padding/border behavior, then
+    uses utils.log_utils.reshape_video for the actual tiling, so the layout
+    matches what OGBench produces during training.
+    """
+    if n_cols is None:
+        n_cols = int(np.ceil(np.sqrt(len(renders_per_skill))))
+
+    max_length = max(len(r) for r in renders_per_skill)
+    padded = []
+    for render in renders_per_skill:
+        assert render.dtype == np.uint8
+        if len(render) < max_length:
+            final = render[-1]
+            dim = np.array(
+                ImageEnhance.Brightness(Image.fromarray(final)).enhance(0.5)
+            )
+            pad = np.repeat(dim[None, ...], max_length - len(render), axis=0)
+            render = np.concatenate([render, pad], axis=0)
+        render = np.pad(
+            render, ((0, 0), (1, 1), (1, 1), (0, 0)),
+            mode='constant', constant_values=0,
+        )
+        padded.append(render)
+
+    arr = np.array(padded)  # [n, t, h, w, c]
+    tiled = reshape_video(arr, n_cols)  # [t, c, H, W]
+    tiled = np.transpose(tiled, (0, 2, 3, 1))  # [t, H, W, c]
+    return tiled.astype(np.uint8)
+
+
+def plot_skill_paths(xy_per_skill, ball_xy, ant_start_xy, overlay_maze, extent,
+                     output_path, title=None):
+    """One 2D plot: a thin line per skill (ant xy over time), plus the ball.
+
+    Args:
+        xy_per_skill: list of np.ndarray[T_i, 2] giving the ant (x, y) per step.
+        ball_xy: (x, y) of the fixed ball.
+        ant_start_xy: (x, y) of the fixed starting ant position.
+        overlay_maze: callable that draws maze walls onto an Axes.
+        extent: (x_lo, x_hi, y_lo, y_hi) plot bounds.
+        output_path: where to write the PNG.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+    overlay_maze(ax)
+
+    K = len(xy_per_skill)
+    cmap = plt.get_cmap('hsv')
+    for z, xy in enumerate(xy_per_skill):
+        color = cmap(z / max(K, 1))
+        ax.plot(xy[:, 0], xy[:, 1], color=color, linewidth=0.6, alpha=0.9,
+                label=f"skill {z}")
+
+    ax.scatter([ant_start_xy[0]], [ant_start_xy[1]], c='black', s=40,
+               marker='o', edgecolors='white', linewidths=0.8, zorder=5,
+               label='Ant start')
+    ax.scatter([ball_xy[0]], [ball_xy[1]], c='red', s=70, marker='o',
+               edgecolors='white', linewidths=1.0, zorder=6, label='Ball')
+
+    x_lo, x_hi, y_lo, y_hi = extent
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_aspect('equal')
+    ax.set_xlabel('Ant x')
+    ax.set_ylabel('Ant y')
+    if title is not None:
+        ax.set_title(title)
+
+    # Legend only sensible for small K; collapse otherwise.
+    if K <= 15:
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def save_mp4(frames, output_path, fps=15):
+    """Save frames as an mp4 via imageio-ffmpeg (h264 / yuv420p)."""
+    import imageio
+    h, w = frames[0].shape[:2]
+    h -= h % 2
+    w -= w % 2
+    writer = imageio.get_writer(
+        output_path, format='FFMPEG', mode='I',
+        fps=fps, codec='libx264',
+        output_params=['-pix_fmt', 'yuv420p'],
+    )
+    for f in frames:
+        writer.append_data(f[:h, :w])
+    writer.close()
 
 
 def main():
@@ -93,7 +253,50 @@ def main():
         default=128,
         help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
     )
+    # ── Skill-grid video flags ──────────────────────────────────────────────
+    parser.add_argument(
+        "--skill_video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render a near-square grid (one video per skill) of the empowerment-"
+             "maximizing policy rolled out from a fixed ant+ball start. "
+             "On by default; pass --no-skill_video to disable.",
+    )
+    parser.add_argument(
+        "--skill_paths",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render a 2D plot with a thin ant-path line per skill (plus the "
+             "fixed ball). Triggers rollouts; shares them with --skill_video. "
+             "On by default; pass --no-skill_paths to disable.",
+    )
+    parser.add_argument(
+        "--skill_map",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render the empowerment map(s). On by default; pass --no-skill_map "
+             "to skip the (slow) map computation.",
+    )
+    parser.add_argument("--video_steps", type=int, default=500,
+                        help="Env steps to roll out per skill.")
+    parser.add_argument("--video_frame_skip", type=int, default=3,
+                        help="Frame-skip cadence for captured frames (OGBench default = 3).")
+    parser.add_argument("--video_fps", type=int, default=15,
+                        help="Output mp4 fps.")
+    parser.add_argument("--video_ant_xy", type=str, default=None,
+                        help="Fixed ant x,y for the skill grid (e.g. '8,8'). "
+                             "Defaults to the env's reset ant position.")
+    parser.add_argument("--video_ball_xy", type=str, default=None,
+                        help="Fixed ball x,y for the skill grid. "
+                             "Defaults to the env's reset ball position.")
+    parser.add_argument("--video_goal_xy", type=str, default=None,
+                        help="Optional fixed goal x,y for the skill grid.")
     args = parser.parse_args()
+
+    # Force a fresh np.random global seed on every invocation, so the env's
+    # task / start sampling differs run-to-run (env.reset uses np.random
+    # internally). --seed only affects the per-grid-point empowerment RNG.
+    np.random.seed(None)
 
     run_dir = args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)
     epoch = args.epoch if args.epoch is not None else _latest_epoch(run_dir)
@@ -161,6 +364,90 @@ def main():
                         alpha=0.6,
                     )
                     ax.add_patch(rect)
+
+    # ── Skill-rollout branch (video grid + ant-path plot) ──────────────────
+    # Runs once if either output is requested; produces video and/or the
+    # path plot from a shared rollout pass. Does not short-circuit the
+    # empowerment map below.
+    if args.skill_video or args.skill_paths:
+        num_skills = int(agent_cfg.get('num_skills'))
+
+        # Determine the fixed ant+ball+goal from CLI overrides, otherwise
+        # read them off the env's reset state (so the grid uses a natural
+        # task start when nothing is specified).
+        default_ant, default_ball = base_env.get_agent_ball_xy()
+
+        if args.video_ant_xy is not None:
+            ax_, ay_ = _parse_indices(args.video_ant_xy)
+            ant_xy = np.array([float(ax_), float(ay_)], dtype=np.float64)
+        else:
+            ant_xy = np.asarray(default_ant, dtype=np.float64)
+        if args.video_ball_xy is not None:
+            bx_, by_ = _parse_indices(args.video_ball_xy)
+            ball_xy = np.array([float(bx_), float(by_)], dtype=np.float64)
+        else:
+            ball_xy = np.asarray(default_ball, dtype=np.float64)
+        if args.video_goal_xy is not None:
+            gx_, gy_ = _parse_indices(args.video_goal_xy)
+            goal_xy = np.array([float(gx_), float(gy_)], dtype=np.float64)
+        else:
+            goal_xy = None
+
+        print(
+            f"Skill rollouts: K={num_skills}, steps={args.video_steps}, "
+            f"frame_skip={args.video_frame_skip}, ant={ant_xy.tolist()}, "
+            f"ball={ball_xy.tolist()}, goal={None if goal_xy is None else goal_xy.tolist()}, "
+            f"video={args.skill_video}, paths={args.skill_paths}"
+        )
+
+        renders_per_skill = []
+        xy_per_skill = []
+        for z in range(num_skills):
+            print(f"  rolling out skill {z + 1}/{num_skills}...")
+            frames, xy_traj = rollout_skill(
+                env=env,
+                agent=agent,
+                num_skills=num_skills,
+                skill_id=z,
+                ant_xy=ant_xy,
+                ball_xy=ball_xy,
+                n_steps=args.video_steps,
+                frame_skip=args.video_frame_skip,
+                temperature=0.0,
+                seed=z,
+                goal_xy=goal_xy,
+                collect_frames=args.skill_video,
+                collect_xy=args.skill_paths,
+            )
+            if args.skill_video:
+                renders_per_skill.append(frames)
+            if args.skill_paths:
+                xy_per_skill.append(xy_traj)
+
+        if args.skill_video:
+            grid = compose_skill_grid(renders_per_skill)
+            video_out = args.output if args.output is not None else os.path.join(
+                run_dir, f"skill_grid_video_e{epoch}.mp4"
+            )
+            save_mp4(grid, video_out, fps=args.video_fps)
+            print(f"Saved skill-grid video: {video_out}")
+
+        if args.skill_paths:
+            paths_out = os.path.join(run_dir, f"skill_ant_paths_e{epoch}.png")
+            plot_skill_paths(
+                xy_per_skill=xy_per_skill,
+                ball_xy=ball_xy,
+                ant_start_xy=ant_xy,
+                overlay_maze=overlay_maze,
+                extent=(x_low_plot, x_high_plot, y_low_plot, y_high_plot),
+                output_path=paths_out,
+                title=(
+                    f"Ant paths | run={os.path.basename(run_dir)} | epoch={epoch}\n"
+                    f"K={num_skills}, steps={args.video_steps}, "
+                    f"ball=({ball_xy[0]:.2f}, {ball_xy[1]:.2f})"
+                ),
+            )
+            print(f"Saved skill ant-path plot: {paths_out}")
 
     def is_valid_xy(x: float, y: float) -> bool:
         if maze_map is None:
@@ -243,6 +530,9 @@ def main():
         # Return the empowerment map and the goal used (if any; otherwise NaNs to force explicitness).
         goal_used = goal_xy.astype(np.float32) if 'goal_xy' in locals() else np.array([np.nan, np.nan], dtype=np.float32)
         return emp.reshape(args.grid_res, args.grid_res), goal_used
+
+    if not args.skill_map:
+        return
 
     # Determine plotting scenario based on flags
     if args.fix_ball and args.fix_goal:

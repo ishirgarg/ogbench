@@ -58,11 +58,12 @@ def _parse_xy(text: str) -> tuple[float, float]:
 def rollout_skill_ant(env, agent, num_skills, skill_id, ant_xy,
                       n_steps, frame_skip, temperature=0.0, seed=0,
                       collect_frames=True, collect_xy=False):
-    """Roll out the empowerment-maximizing policy for a single skill in AntMaze.
+    """Roll out the empowerment-maximizing policy for a single skill in (visual) AntMaze.
 
     Resets the env, overrides ant XY (via set_xy — no ball in AntMaze), then
-    runs deterministic policy(.|s, skill_onehot) for n_steps. Returns
-    (frames, xy_traj), where each is None if not requested.
+    runs deterministic policy(.|s, skill_onehot) for n_steps. The observation
+    fed to the policy is the env's pixel frame (visual env), exactly as in
+    training. Returns (frames, xy_traj), where each is None if not requested.
     """
     K = num_skills
     skill_onehot = jnp.eye(K, dtype=jnp.float32)[skill_id][None, :]
@@ -192,11 +193,19 @@ def save_mp4(frames, output_path, fps=15):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot AntMaze empowerment map (same computation as Ant Soccer).")
+    parser = argparse.ArgumentParser(
+        description="Plot visual-AntMaze empowerment map (same computation as the "
+                    "state-based AntMaze script, but observations are rendered "
+                    "pixel frames so the map is built by teleport+render per cell)."
+    )
     parser.add_argument("--ckpt_root", type=str, default="ckpts", help="Root checkpoint directory.")
     parser.add_argument("--run_dir", type=str, default=None, help="Explicit run dir (overrides latest in ckpt_root).")
     parser.add_argument("--epoch", type=int, default=None, help="Explicit epoch (overrides latest params_*.pkl).")
-    parser.add_argument("--grid_res", type=int, default=200, help="Grid resolution for ant XY map.")
+    parser.add_argument("--grid_res", type=int, default=50,
+                        help="Grid resolution for ant XY map. Rendering a pixel obs per "
+                             "cell is the bottleneck (~hundreds of ms each), so this "
+                             "defaults lower than the state-based script. Wall cells are "
+                             "skipped.")
     parser.add_argument("--x_min", type=float, default=0.0, help="Grid min x for ant position.")
     parser.add_argument("--x_max", type=float, default=20.0, help="Grid max x for ant position.")
     parser.add_argument("--y_min", type=float, default=0.0, help="Grid min y for ant position.")
@@ -215,7 +224,7 @@ def main():
         help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
     )
     parser.add_argument("--output", type=str, default=None, help="Output image path (.png). Defaults to run dir.")
-    # ── Skill-rollout flags (mirror antsoccer) ──────────────────────────────
+    # ── Skill-rollout flags (mirror antsoccer / antmaze) ─────────────────────
     parser.add_argument(
         "--skill_video",
         action=argparse.BooleanOptionalAction,
@@ -260,7 +269,7 @@ def main():
     agent_cfg["num_splus_samples"] = int(args.num_splus_samples)
     env_name = flags["env_name"]
 
-    # Build AntMaze env/dataset and agent
+    # Build (visual) AntMaze env/dataset and agent
     env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
     example_batch = train_dataset.sample(1)
     if agent_cfg.get("discrete"):
@@ -279,8 +288,7 @@ def main():
     # invocation (env.reset uses np.random internally).
     np.random.seed(None)
 
-    obs0, _ = env.reset()
-    obs0 = np.asarray(obs0, dtype=np.float32)
+    env.reset()
     base_env = env.unwrapped
 
     x_low, x_high = float(args.x_min), float(args.x_max)
@@ -403,18 +411,35 @@ def main():
     xx, yy = np.meshgrid(xs, ys)
     flat_x = xx.reshape(-1)
     flat_y = yy.reshape(-1)
+    num_points = flat_x.shape[0]
 
-    # Pre-assemble observation batch template and just overwrite XY
-    obs_batch = np.repeat(obs0[None, :], args.grid_res * args.grid_res, axis=0)
-    obs_batch[:, 0] = flat_x
-    obs_batch[:, 1] = flat_y
-    obs_batch_jnp = jnp.asarray(obs_batch)
+    # Visual env: the observation is a rendered pixel frame, so — unlike the
+    # state-based AntMaze map, which just overwrites obs[:, 0:2] — we teleport
+    # the ant to each grid cell and render its pixel observation. Wall cells are
+    # skipped (left as NaN) since they're meaningless and rendering is the
+    # dominant cost.
+    valid = np.fromiter(
+        (is_valid_xy(float(flat_x[i]), float(flat_y[i])) for i in range(num_points)),
+        dtype=bool, count=num_points,
+    )
+    valid_idx = np.nonzero(valid)[0]
+    print(f"Rendering {valid_idx.size}/{num_points} non-wall grid cells "
+          f"({args.grid_res}x{args.grid_res} grid)...")
+
+    obs_list = []
+    for count, i in enumerate(valid_idx):
+        base_env.set_xy(np.array([flat_x[i], flat_y[i]], dtype=np.float64))
+        obs_list.append(np.asarray(base_env.get_ob(), dtype=np.float32))
+        if (count + 1) % 250 == 0:
+            print(f"  rendered {count + 1}/{valid_idx.size} cells")
+    obs_arr = np.stack(obs_list, axis=0)  # [Nvalid, H, W, C]
+    obs_arr_jnp = jnp.asarray(obs_arr)
 
     # Per-point RNG root
     point_root_seed = int(np.random.default_rng(args.seed).integers(0, 2**31 - 1))
     point_root_key = jax.random.PRNGKey(point_root_seed)
-    num_points = obs_batch_jnp.shape[0]
-    point_keys = jax.random.split(point_root_key, num_points)
+    point_keys = jax.random.split(point_root_key, valid_idx.size)
+
     @jax.jit
     def _emp_batch(obs_b, keys_b):
         return jax.vmap(
@@ -424,29 +449,34 @@ def main():
 
     batch_size = max(1, int(args.batch_size))
     emp_chunks = []
-    for start in range(0, num_points, batch_size):
-        end = min(start + batch_size, num_points)
-        emp_chunks.append(np.asarray(_emp_batch(obs_batch_jnp[start:end], point_keys[start:end])))
-        print(f"  empowerment batch {start}:{end} / {num_points}")
-    emp_vals = np.concatenate(emp_chunks, axis=0)
-    emp_map = emp_vals.reshape(args.grid_res, args.grid_res)
+    for start in range(0, valid_idx.size, batch_size):
+        end = min(start + batch_size, valid_idx.size)
+        emp_chunks.append(np.asarray(_emp_batch(obs_arr_jnp[start:end], point_keys[start:end])))
+        print(f"  empowerment batch {start}:{end} / {valid_idx.size}")
+    emp_valid = np.concatenate(emp_chunks, axis=0)
 
-    out_img = args.output if args.output is not None else os.path.join(run_dir, f"empowerment_antmaze_e{epoch}.png")
+    emp_flat = np.full(num_points, np.nan, dtype=np.float32)
+    emp_flat[valid_idx] = emp_valid
+    emp_map = emp_flat.reshape(args.grid_res, args.grid_res)
+
+    out_img = args.output if args.output is not None else os.path.join(run_dir, f"empowerment_visual_antmaze_e{epoch}.png")
     out_npy = os.path.splitext(out_img)[0] + ".npy"
 
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad(color="lightgray")
     fig, ax = plt.subplots(1, 1, figsize=(7, 6))
     im = ax.imshow(
-        emp_map,
+        np.ma.masked_invalid(emp_map),
         origin="lower",
         extent=[x_low_plot, x_high_plot, y_low_plot, y_high_plot],
         aspect="auto",
-        cmap="viridis",
+        cmap=cmap,
     )
     overlay_maze(ax)
     ax.set_xlabel("Ant x")
     ax.set_ylabel("Ant y")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle(f"AntMaze empowerment | run={os.path.basename(run_dir)} | epoch={epoch}")
+    fig.suptitle(f"Visual-AntMaze empowerment | run={os.path.basename(run_dir)} | epoch={epoch}")
     plt.tight_layout()
     plt.savefig(out_img, dpi=180)
     np.save(out_npy, emp_map)
@@ -456,4 +486,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
