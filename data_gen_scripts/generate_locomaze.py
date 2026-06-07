@@ -1,15 +1,21 @@
 import glob
 import json
+import os
 import pathlib
+import re
 from collections import defaultdict
 
 import gymnasium
+import jax
+import jax.numpy as jnp
 import numpy as np
 from absl import app, flags
 from agents import SACAgent
+from agents import agents as agent_registry
 from tqdm import trange
 from utils.evaluation import supply_rng
 from utils.flax_utils import restore_agent
+from utils.log_utils import setup_wandb
 
 import ogbench.locomaze  # noqa
 
@@ -24,6 +30,146 @@ flags.DEFINE_string('save_path', None, 'Save path.')
 flags.DEFINE_float('noise', 0.2, 'Gaussian action noise level.')
 flags.DEFINE_integer('num_episodes', 1000, 'Number of episodes.')
 flags.DEFINE_integer('max_episode_steps', 1001, 'Maximum number of steps in an episode.')
+
+# Empowerment-based initial-state sampling.
+flags.DEFINE_string(
+    'empowerment_ckpt', None,
+    'Path to a pretrained empowerment run folder (containing flags.json and params_*.pkl). '
+    'When set, initial cells are sampled proportionally to empowerment instead of uniformly.',
+)
+flags.DEFINE_integer('empowerment_epoch', None, 'Empowerment checkpoint epoch (defaults to latest params_*.pkl).')
+flags.DEFINE_enum(
+    'empowerment_sampling', 'linear', ['linear', 'softmax'],
+    "How to turn empowerment into start-cell probabilities. "
+    "'linear': p ∝ emp (assumed non-negative, no clipping). 'softmax': p ∝ exp(emp / temp).",
+)
+flags.DEFINE_float('empowerment_temp', 1.0, 'Softmax temperature (only used when empowerment_sampling=softmax).')
+flags.DEFINE_integer('empowerment_splus_samples', 384, 'Number of s+ samples for the empowerment Monte Carlo estimate.')
+
+# Weights & Biases logging (start-state KDE heatmap).
+flags.DEFINE_bool('log_wandb', False, 'Whether to log a KDE heatmap of start states to wandb.')
+flags.DEFINE_string('wandb_project', 'ogbench_datagen', 'wandb project name.')
+flags.DEFINE_string('wandb_group', None, 'wandb group name.')
+flags.DEFINE_string('wandb_name', None, 'wandb run name.')
+flags.DEFINE_enum('wandb_mode', 'online', ['online', 'offline', 'disabled'], 'wandb mode.')
+
+
+def _latest_epoch(run_dir):
+    """Return the largest epoch among params_*.pkl checkpoints in run_dir."""
+    ckpts = glob.glob(os.path.join(run_dir, 'params_*.pkl'))
+    if not ckpts:
+        raise FileNotFoundError(f'No params_*.pkl found in {run_dir}')
+    epochs = []
+    for path in ckpts:
+        m = re.search(r'params_(\d+)\.pkl$', os.path.basename(path))
+        if m:
+            epochs.append(int(m.group(1)))
+    if not epochs:
+        raise RuntimeError(f'Could not parse checkpoint epochs in {run_dir}')
+    return max(epochs)
+
+
+def log_start_state_empowerment_scatter(cell_xys, cell_emp, env):
+    """Log a scatter of candidate start cells (x, y) colored by precomputed empowerment to wandb."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import wandb
+    from matplotlib.patches import Rectangle
+
+    cell_xys = np.asarray(cell_xys)
+    cell_emp = np.asarray(cell_emp)
+    n = len(cell_xys)
+
+    base_env = env.unwrapped
+    unit = float(getattr(base_env, '_maze_unit', 4.0))
+    offx = float(getattr(base_env, '_offset_x', 4.0))
+    offy = float(getattr(base_env, '_offset_y', 4.0))
+    maze_map = getattr(base_env, 'maze_map', None)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+    if maze_map is not None:
+        rows, cols = maze_map.shape
+        for i in range(rows):
+            for j in range(cols):
+                if maze_map[i, j] == 1:
+                    cx = j * unit - offx
+                    cy = i * unit - offy
+                    ax.add_patch(Rectangle(
+                        (cx - unit / 2.0, cy - unit / 2.0), unit, unit,
+                        facecolor='black', edgecolor='black', linewidth=0.3, alpha=0.2,
+                    ))
+    sc = ax.scatter(
+        cell_xys[:, 0], cell_xys[:, 1], c=cell_emp, s=120, marker='s',
+        cmap='viridis', edgecolors='white', linewidths=0.5,
+    )
+    ax.set_aspect('equal')
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_title(f'Start-cell empowerment — {n} cells')
+    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label='empowerment')
+    plt.tight_layout()
+    wandb.log({'start_cell_empowerment': wandb.Image(fig)})
+    plt.close(fig)
+
+
+def log_start_state_kde(start_xys, env):
+    """Log a KDE heatmap of all realized start states to wandb (title shows the sample count)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import wandb
+    from matplotlib.patches import Rectangle
+    from scipy.stats import gaussian_kde
+
+    start_xys = np.asarray(start_xys, dtype=np.float64)
+    n = len(start_xys)
+
+    base_env = env.unwrapped
+    unit = float(getattr(base_env, '_maze_unit', 4.0))
+    offx = float(getattr(base_env, '_offset_x', 4.0))
+    offy = float(getattr(base_env, '_offset_y', 4.0))
+    maze_map = getattr(base_env, 'maze_map', None)
+
+    if maze_map is not None:
+        rows, cols = maze_map.shape
+        x_lo = -offx - unit / 2.0
+        x_hi = (cols - 1) * unit - offx + unit / 2.0
+        y_lo = -offy - unit / 2.0
+        y_hi = (rows - 1) * unit - offy + unit / 2.0
+    else:
+        rows = cols = 0
+        x_lo, x_hi = float(start_xys[:, 0].min()), float(start_xys[:, 0].max())
+        y_lo, y_hi = float(start_xys[:, 1].min()), float(start_xys[:, 1].max())
+
+    res = 200
+    xs = np.linspace(x_lo, x_hi, res)
+    ys = np.linspace(y_lo, y_hi, res)
+    xx, yy = np.meshgrid(xs, ys)
+    kde = gaussian_kde(start_xys.T)
+    dens = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(res, res)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+    im = ax.imshow(
+        dens, origin='lower', extent=[x_lo, x_hi, y_lo, y_hi], aspect='auto', cmap='viridis'
+    )
+    if maze_map is not None:
+        for i in range(rows):
+            for j in range(cols):
+                if maze_map[i, j] == 1:
+                    cx = j * unit - offx
+                    cy = i * unit - offy
+                    ax.add_patch(Rectangle(
+                        (cx - unit / 2.0, cy - unit / 2.0), unit, unit,
+                        facecolor='black', edgecolor='black', linewidth=0.3, alpha=0.3,
+                    ))
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_title(f'Start-state density (KDE) — N={n} samples')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    wandb.log({'start_state_kde': wandb.Image(fig)})
+    plt.close(fig)
 
 
 def main(_):
@@ -92,22 +238,105 @@ def main(_):
 
                 vertex_cells.append((i, j))
 
+    # Set up empowerment-based initial-state sampling.
+    use_empowerment = FLAGS.empowerment_ckpt is not None
+    cell_xys = None
+    cell_emp = None  # Precomputed empowerment per candidate start cell.
+    cell_probs = None  # Fixed sampling distribution over start cells.
+    if use_empowerment:
+        run_dir = FLAGS.empowerment_ckpt
+        with open(os.path.join(run_dir, 'flags.json'), 'r') as f:
+            emp_flags = json.load(f)
+        agent_cfg = emp_flags['agent']
+        agent_cfg['num_splus_samples'] = FLAGS.empowerment_splus_samples
+        if agent_cfg.get('frame_stack') is not None:
+            raise ValueError(
+                'Empowerment estimators trained with frame_stack are not supported by this script '
+                '(the data-collection env produces unstacked observations).'
+            )
+        epoch = FLAGS.empowerment_epoch if FLAGS.empowerment_epoch is not None else _latest_epoch(run_dir)
+
+        # Build an example batch from the data-collection env (obs/action dims match the estimator's env).
+        example_obs = np.zeros((1, ob_dim), dtype=np.float32)
+        if agent_cfg.get('discrete'):
+            example_act = np.full((1,), env.action_space.n - 1)
+        else:
+            example_act = np.asarray(env.action_space.sample(), dtype=np.float32)[None]
+
+        agent_class = agent_registry[agent_cfg['agent_name']]
+        emp_agent = agent_class.create(
+            seed=FLAGS.seed,
+            ex_observations=example_obs,
+            ex_actions=example_act,
+            config=agent_cfg,
+        )
+        emp_agent = restore_agent(emp_agent, run_dir, epoch)
+
+        @jax.jit
+        def emp_for_cells(obs_batch, rng):
+            return emp_agent.empowerment(obs_batch, rng)
+
+        # Precompute empowerment once over the finite set of start cells. Only x-y differs between
+        # cells; the proprioceptive part comes from a single default reset observation.
+        template_ob, _ = env.reset()
+        template_ob = np.asarray(template_ob, dtype=np.float32)
+        cell_xys = np.array([env.unwrapped.ij_to_xy(c) for c in all_cells], dtype=np.float32)
+        obs_batch = np.repeat(template_ob[None, :], len(all_cells), axis=0)
+        obs_batch[:, 0] = cell_xys[:, 0]
+        obs_batch[:, 1] = cell_xys[:, 1]
+        cell_emp = np.asarray(emp_for_cells(jnp.asarray(obs_batch), jax.random.PRNGKey(FLAGS.seed)))
+
+        # Convert empowerment into a fixed sampling distribution over cells.
+        if FLAGS.empowerment_sampling == 'softmax':
+            logits = cell_emp / FLAGS.empowerment_temp
+            cell_probs = np.exp(logits - logits.max())
+            cell_probs = cell_probs / cell_probs.sum()
+        else:
+            if (cell_emp < 0).any():
+                raise ValueError(
+                    'Negative empowerment encountered with empowerment_sampling=linear; '
+                    'use --empowerment_sampling=softmax instead.'
+                )
+            cell_probs = cell_emp / cell_emp.sum()
+
+        print(
+            f'Empowerment sampling enabled: ckpt={run_dir}, epoch={epoch}, '
+            f'mode={FLAGS.empowerment_sampling}, temp={FLAGS.empowerment_temp}, '
+            f'num_cells={len(all_cells)}, num_splus_samples={FLAGS.empowerment_splus_samples}, '
+            f'emp[min/mean/max]={cell_emp.min():.4f}/{cell_emp.mean():.4f}/{cell_emp.max():.4f}',
+            flush=True,
+        )
+
+    if FLAGS.log_wandb:
+        setup_wandb(
+            project=FLAGS.wandb_project,
+            group=FLAGS.wandb_group,
+            name=FLAGS.wandb_name,
+            mode=FLAGS.wandb_mode,
+        )
+        # Log the precomputed per-cell empowerment landscape once at the start.
+        if use_empowerment:
+            log_start_state_empowerment_scatter(cell_xys, cell_emp, env)
+
     # Collect data.
     dataset = defaultdict(list)
+    start_xys = []  # Realized start x-y for every episode (for the wandb KDE heatmap).
     total_steps = 0
     total_train_steps = 0
     num_train_episodes = FLAGS.num_episodes
     num_val_episodes = FLAGS.num_episodes // 10
     for ep_idx in trange(num_train_episodes + num_val_episodes):
-        if FLAGS.dataset_type in ['path', 'navigate', 'explore']:
-            # Sample an initial state from all cells.
+        # Sample an initial cell, either uniformly or from the precomputed empowerment distribution.
+        if use_empowerment:
+            init_ij = all_cells[np.random.choice(len(all_cells), p=cell_probs)]
+        else:
             init_ij = all_cells[np.random.randint(len(all_cells))]
+
+        # Sample a goal cell (depends on the dataset type).
+        if FLAGS.dataset_type in ['path', 'navigate', 'explore']:
             # Sample a goal state from vertex cells.
             goal_ij = vertex_cells[np.random.randint(len(vertex_cells))]
         elif FLAGS.dataset_type == 'stitch':
-            # Sample an initial state from all cells.
-            init_ij = all_cells[np.random.randint(len(all_cells))]
-
             # Perform BFS to find adjacent cells.
             adj_cells = []
             adj_steps = 4  # Target distance from the initial cell.
@@ -138,6 +367,7 @@ def main(_):
             raise ValueError(f'Unsupported dataset_type: {FLAGS.dataset_type}')
 
         ob, _ = env.reset(options=dict(task_info=dict(init_ij=init_ij, goal_ij=goal_ij)))
+        start_xys.append(np.asarray(env.unwrapped.get_xy(), dtype=np.float32))
 
         done = False
         step = 0
@@ -188,6 +418,9 @@ def main(_):
             total_train_steps += step
 
     print('Total steps:', total_steps)
+
+    if FLAGS.log_wandb:
+        log_start_state_kde(start_xys, env)
 
     train_path = FLAGS.save_path
     val_path = FLAGS.save_path.replace('.npz', '-val.npz')

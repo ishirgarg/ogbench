@@ -11,6 +11,7 @@ from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
 from agents.qrl import QRLAgent
 from agents.sac import SACAgent
+from agents.skill_match import SkillMatchAgent
 
 agents = dict(
     bc=BCAgent,
@@ -26,4 +27,5 @@ agents = dict(
     hiql=HIQLAgent,
     qrl=QRLAgent,
     sac=SACAgent,
+    skill_match=SkillMatchAgent,
 )

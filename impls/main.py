@@ -24,6 +24,11 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
+flags.DEFINE_string(
+    'dataset_path', None,
+    'Optional path to a custom .npz dataset file. When set, the env is built from env_name but the offline data '
+    'is loaded from this file (and the matching -val.npz) instead of the default download location.',
+)
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
@@ -111,7 +116,9 @@ def main(_):
 
     # Set up environment and dataset.
     config = FLAGS.agent
-    env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+    env, train_dataset, val_dataset = make_env_and_datasets(
+        FLAGS.env_name, frame_stack=config['frame_stack'], dataset_path=FLAGS.dataset_path
+    )
 
     dataset_class = {
         'GCDataset': GCDataset,

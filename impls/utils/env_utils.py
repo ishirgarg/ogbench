@@ -162,7 +162,7 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
-def make_env_and_datasets(dataset_name, frame_stack=None):
+def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None):
     """Make OGBench environment and datasets.
 
     A `-colored-` token in the dataset name (e.g. `antsoccer-arena-stitch-colored-v0`)
@@ -174,6 +174,9 @@ def make_env_and_datasets(dataset_name, frame_stack=None):
     Args:
         dataset_name: Name of the dataset.
         frame_stack: Number of frames to stack.
+        dataset_path: (Optional) Path to a custom `.npz` dataset file. When set, the env is still built from
+            `dataset_name` (so the environment and evaluation tasks are unchanged), but the offline data is loaded
+            from this file (and the matching `-val.npz`) instead of the default download location.
 
     Returns:
         A tuple of the environment, training dataset, and validation dataset.
@@ -183,7 +186,9 @@ def make_env_and_datasets(dataset_name, frame_stack=None):
     underlying_name = '-'.join(t for t in splits if t != 'colored') if is_colored else dataset_name
 
     # Use compact dataset to save memory.
-    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(underlying_name, compact_dataset=True)
+    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(
+        underlying_name, compact_dataset=True, dataset_path=dataset_path
+    )
 
     if is_colored:
         env = ColoredObsWrapper(env)
