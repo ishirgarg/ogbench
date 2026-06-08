@@ -15,7 +15,8 @@ export MUJOCO_GL=egl
 # Machine / sweep configuration
 # -----------------------------
 # GPU ids to use. At most one job runs on a GPU at a time; extra jobs wait in a
-# queue until a GPU frees up (no oversubscription).
+# queue until a GPU frees up (no oversubscription). With a single GPU listed,
+# all jobs run sequentially on it.
 GPUS=(0 1 2 3 4 6 7)
 
 CKPT_PREFIX=/home/ishirgarg/ogbench/impls/ckpts
@@ -78,6 +79,7 @@ for CFG in "${!ENVS[@]}"; do
                 --agent.skill_checkpoint_path=$SKILL_CKPT \
                 --agent.alpha=$ALPHA \
                 --eval_episodes=50 \
+                --video_episodes=0 \
                 --train_steps=1000000 \
                 > "$LOG" 2>&1
         ) &

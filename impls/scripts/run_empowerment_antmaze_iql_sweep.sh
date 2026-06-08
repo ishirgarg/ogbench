@@ -6,11 +6,14 @@
 # For each of two pretrained empowerment estimators we generate an
 # antmaze-medium-navigate dataset whose *initial cell* is sampled proportionally
 # to empowerment (everything else identical to the original dataset's policy and
-# budget), sweeping 4 weighting configs: linear, softmax@0.5/1.0/2.0
-#   -> 2 ckpts x 4 configs = 8 datasets. Plus the original dataset = 9 GCIQL runs.
+# budget), sweeping 2 weighting configs: linear and softmax@1.0
+#   -> 2 ckpts x 2 configs = 4 datasets. On each dataset we then train GCIQL
+# swept over the actor-loss alpha [0.03 0.1 0.3 1]
+#   -> 4 datasets x 4 alphas = 16 GCIQL runs.
 #
-# Each job generates only its own (distinctly named) dataset, so parallel jobs
-# never write the same file.
+# Datasets are generated first (distinctly named, so parallel generation never
+# writes the same file); the 16 alpha training jobs run afterwards and only read
+# the already-generated datasets.
 
 export WANDB_ENTITY="ishirgarg-university-of-california-berkeley"
 export WANDB_API_KEY='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'
@@ -43,13 +46,15 @@ CKPT_PATHS=(
 )
 CKPT_LABELS=(ckptA ckptB)
 
-CFG_TAGS=(linear softmax_t0.5 softmax_t1 softmax_t2)
+# Empowerment-weighting configs: linear and softmax @ temperature 1.0.
+CFG_TAGS=(linear softmax_t1)
 CFG_ARGS=(
     "--empowerment_sampling=linear"
-    "--empowerment_sampling=softmax --empowerment_temp=0.5"
     "--empowerment_sampling=softmax --empowerment_temp=1.0"
-    "--empowerment_sampling=softmax --empowerment_temp=2.0"
 )
+
+# GCIQL actor-loss alpha values to sweep per dataset.
+ALPHAS=(0.03 0.1 0.3 1)
 
 # Original dataset's policy/budget (kept identical for the empowerment variants).
 ENV_GEN=antmaze-medium-v0
@@ -57,11 +62,18 @@ ENV_TRAIN=antmaze-medium-navigate-v0
 NUM_EPISODES=1000
 MAX_EPISODE_STEPS=1001
 
+# Dataset path for a given (ckpt, config) index pair (shared across the alpha sweep).
+ds_path_for() {
+    local CKPT_LABEL=${CKPT_LABELS[$1]}
+    local CFG_TAG=${CFG_TAGS[$2]}
+    echo "${DATA_DIR}/antmaze-medium-navigate-emp-${CKPT_LABEL}-${CFG_TAG}-v0.npz"
+}
+
 # -----------------------------
-# Per-job body: generate (if missing) then train GCIQL.
-# Args: CKPT_IDX CFG_IDX   (CKPT_IDX<0 => original-dataset run)
+# Generate the empowerment-weighted dataset for one (ckpt, config) pair.
+# Args: GPU CKPT_IDX CFG_IDX
 # -----------------------------
-run_emp_variant() {
+generate_dataset() {
     set -euo pipefail
     local GPU=$1 CKPT_IDX=$2 CFG_IDX=$3
     export CUDA_VISIBLE_DEVICES=${GPU}
@@ -69,101 +81,51 @@ run_emp_variant() {
     local CKPT_LABEL=${CKPT_LABELS[${CKPT_IDX}]}
     local CFG_TAG=${CFG_TAGS[${CFG_IDX}]}
     local CFG_ARG=${CFG_ARGS[${CFG_IDX}]}
-
+    local DS_PATH; DS_PATH=$(ds_path_for "${CKPT_IDX}" "${CFG_IDX}")
     local DS_TAG="antmaze-medium-navigate-emp-${CKPT_LABEL}-${CFG_TAG}"
-    local DS_PATH="${DATA_DIR}/${DS_TAG}-v0.npz"
 
     echo "ckpt=${CKPT_LABEL} (${CKPT_PATH}) config=${CFG_TAG} dataset=${DS_PATH}"
 
-    # 1) Generate the empowerment-weighted dataset (skip if it already exists).
-    if [[ -f "${DS_PATH}" ]]; then
-        echo "Dataset already exists, skipping generation: ${DS_PATH}"
-    else
-        cd "${GEN_DIR}"
-        PYTHONPATH="${IMPLS_DIR}:${PYTHONPATH:-}" python generate_locomaze.py \
-            --env_name=${ENV_GEN} \
-            --save_path="${DS_PATH}" \
-            --dataset_type=navigate \
-            --num_episodes=${NUM_EPISODES} \
-            --max_episode_steps=${MAX_EPISODE_STEPS} \
-            --restore_path=${EXPERTS} \
-            --restore_epoch=${EXPERT_EPOCH} \
-            --empowerment_ckpt="${CKPT_PATH}" \
-            ${CFG_ARG} \
-            --log_wandb \
-            --wandb_project=ogbench_datagen \
-            --wandb_name="${DS_TAG}"
-    fi
+    # Always generate from scratch.
+    cd "${GEN_DIR}"
+    PYTHONPATH="${IMPLS_DIR}:${PYTHONPATH:-}" python generate_locomaze.py \
+        --env_name=${ENV_GEN} \
+        --save_path="${DS_PATH}" \
+        --dataset_type=navigate \
+        --num_episodes=${NUM_EPISODES} \
+        --max_episode_steps=${MAX_EPISODE_STEPS} \
+        --restore_path=${EXPERTS} \
+        --restore_epoch=${EXPERT_EPOCH} \
+        --empowerment_ckpt="${CKPT_PATH}" \
+        ${CFG_ARG} \
+        --log_wandb \
+        --wandb_project=ogbench_datagen \
+        --wandb_name="${DS_TAG}"
+}
 
-    # 2) Train GCIQL (IQL with DDPG+BC actor loss) on the generated dataset.
+# -----------------------------
+# Train GCIQL (IQL with DDPG+BC actor loss) on an already-generated dataset.
+# Args: GPU CKPT_IDX CFG_IDX ALPHA
+# -----------------------------
+train_gciql() {
+    set -euo pipefail
+    local GPU=$1 CKPT_IDX=$2 CFG_IDX=$3 ALPHA=$4
+    export CUDA_VISIBLE_DEVICES=${GPU}
+    local CKPT_LABEL=${CKPT_LABELS[${CKPT_IDX}]}
+    local CFG_TAG=${CFG_TAGS[${CFG_IDX}]}
+    local DS_PATH; DS_PATH=$(ds_path_for "${CKPT_IDX}" "${CFG_IDX}")
+
+    echo "Training GCIQL ckpt=${CKPT_LABEL} config=${CFG_TAG} alpha=${ALPHA} on ${DS_PATH}"
+
     cd "${IMPLS_DIR}"
     python main.py \
         --env_name=${ENV_TRAIN} \
         --dataset_path="${DS_PATH}" \
         --eval_episodes=50 \
         --agent=agents/gciql.py \
-        --agent.alpha=0.1 \
+        --agent.alpha=${ALPHA} \
         --save_dir=${SAVE_DIR} \
-        --run_group=emp_antmaze_iql_${CKPT_LABEL}_${CFG_TAG}
-}
-
-run_original() {
-    set -euo pipefail
-    local GPU=$1
-    export CUDA_VISIBLE_DEVICES=${GPU}
-    echo "Training GCIQL on the original ${ENV_TRAIN} (uniform starts)."
-    cd "${IMPLS_DIR}"
-    python main.py \
-        --env_name=${ENV_TRAIN} \
-        --eval_episodes=50 \
-        --agent=agents/gciql.py \
-        --agent.alpha=0.1 \
-        --save_dir=${SAVE_DIR} \
-        --run_group=emp_antmaze_iql_original
-}
-
-# Recollect an OGBench-style dataset from scratch (uniform starts, no empowerment
-# sampling) using the same policy/budget as the empowerment variants, then train
-# GCIQL on it. This is the apples-to-apples baseline: same generation pipeline,
-# only the start-cell distribution differs from the empowerment runs.
-run_recollected() {
-    set -euo pipefail
-    local GPU=$1
-    export CUDA_VISIBLE_DEVICES=${GPU}
-
-    local DS_TAG="antmaze-medium-navigate-recollected"
-    local DS_PATH="${DATA_DIR}/${DS_TAG}-v0.npz"
-
-    echo "Recollecting uniform dataset (no empowerment): ${DS_PATH}"
-
-    # 1) Generate the uniform dataset (skip if it already exists).
-    if [[ -f "${DS_PATH}" ]]; then
-        echo "Dataset already exists, skipping generation: ${DS_PATH}"
-    else
-        cd "${GEN_DIR}"
-        PYTHONPATH="${IMPLS_DIR}:${PYTHONPATH:-}" python generate_locomaze.py \
-            --env_name=${ENV_GEN} \
-            --save_path="${DS_PATH}" \
-            --dataset_type=navigate \
-            --num_episodes=${NUM_EPISODES} \
-            --max_episode_steps=${MAX_EPISODE_STEPS} \
-            --restore_path=${EXPERTS} \
-            --restore_epoch=${EXPERT_EPOCH} \
-            --log_wandb \
-            --wandb_project=ogbench_datagen \
-            --wandb_name="${DS_TAG}"
-    fi
-
-    # 2) Train GCIQL on the recollected dataset.
-    cd "${IMPLS_DIR}"
-    python main.py \
-        --env_name=${ENV_TRAIN} \
-        --dataset_path="${DS_PATH}" \
-        --eval_episodes=50 \
-        --agent=agents/gciql.py \
-        --agent.alpha=0.1 \
-        --save_dir=${SAVE_DIR} \
-        --run_group=emp_antmaze_iql_recollected
+        --run_group=emp_antmaze_iql_${CKPT_LABEL}_${CFG_TAG}_alpha${ALPHA}
 }
 
 # -----------------------------
@@ -181,39 +143,43 @@ exec 9<>"$FIFO"
 rm -f "$FIFO"
 for GPU in "${GPUS[@]}"; do echo "$GPU"; done >&9
 
-# 8 empowerment variants: 2 ckpts x 4 configs.
+# Phase 1: generate the 4 empowerment-weighted datasets (2 ckpts x 2 configs;
+# distinct names, safe in parallel). Wait for all before training so the alpha
+# sweep only reads them.
 for CKPT_IDX in 0 1; do
-    for CFG_IDX in 0 1 2 3; do
+    for CFG_IDX in 0 1; do
         read -u 9 GPU      # block until a GPU is free
-        TAG="emp_${CKPT_LABELS[${CKPT_IDX}]}_${CFG_TAGS[${CFG_IDX}]}"
-        echo "JOB=${JOB} GPU=${GPU} ${TAG}"
+        TAG="gen_${CKPT_LABELS[${CKPT_IDX}]}_${CFG_TAGS[${CFG_IDX}]}"
+        echo "GEN GPU=${GPU} ${TAG}"
         (
             trap 'echo "${GPU}" >&9' EXIT
-            run_emp_variant "${GPU}" "${CKPT_IDX}" "${CFG_IDX}" \
+            generate_dataset "${GPU}" "${CKPT_IDX}" "${CFG_IDX}" \
                 > "${LOG_DIR}/${TAG}.log" 2>&1
         ) &
-        JOB=$((JOB + 1))
         sleep 2   # stagger near-simultaneous mujoco-EGL inits
     done
 done
+echo "Generating datasets; waiting for all before the alpha sweep..."
+wait
+echo "Datasets ready."
 
-# Original dataset (uniform starts).
-read -u 9 GPU
-echo "JOB=${JOB} GPU=${GPU} original"
-(
-    trap 'echo "${GPU}" >&9' EXIT
-    run_original "${GPU}" > "${LOG_DIR}/original.log" 2>&1
-) &
-JOB=$((JOB + 1))
-
-# Recollected OGBench-style dataset (uniform starts, no empowerment sampling).
-read -u 9 GPU
-echo "JOB=${JOB} GPU=${GPU} recollected"
-(
-    trap 'echo "${GPU}" >&9' EXIT
-    run_recollected "${GPU}" > "${LOG_DIR}/recollected.log" 2>&1
-) &
-JOB=$((JOB + 1))
+# Phase 2: 16 GCIQL training jobs: 4 datasets x 4 alphas.
+for CKPT_IDX in 0 1; do
+    for CFG_IDX in 0 1; do
+        for ALPHA in "${ALPHAS[@]}"; do
+            read -u 9 GPU      # block until a GPU is free
+            TAG="emp_${CKPT_LABELS[${CKPT_IDX}]}_${CFG_TAGS[${CFG_IDX}]}_alpha${ALPHA}"
+            echo "JOB=${JOB} GPU=${GPU} ${TAG}"
+            (
+                trap 'echo "${GPU}" >&9' EXIT
+                train_gciql "${GPU}" "${CKPT_IDX}" "${CFG_IDX}" "${ALPHA}" \
+                    > "${LOG_DIR}/${TAG}.log" 2>&1
+            ) &
+            JOB=$((JOB + 1))
+            sleep 2   # stagger near-simultaneous mujoco-EGL inits
+        done
+    done
+done
 
 echo "Launched ${JOB} jobs across ${NUM_GPUS} GPUs (<=1 per GPU at a time). Waiting..."
 wait
