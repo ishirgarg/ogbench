@@ -70,10 +70,6 @@ export MUJOCO_GL=egl
 export WANDB_DIR=/global/scratch/users/ishirgarg/jaxgcrl
 mkdir -p "$WANDB_DIR"
 
-# Resolve the impls dir from this script's location so sbatch works from anywhere.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}/.." || exit 1
-
 python main.py \
     --env_name=$ENV \
     --agent=agents/dds.py \
