@@ -61,7 +61,15 @@ def evaluate(
     Returns:
         A tuple containing the statistics, trajectories, and rendered videos.
     """
-    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    # Additive hook: agents that commit a skill/option for several steps (e.g. DDS) expose
+    # `init_eval_state`/`sample_actions_with_state`, which thread a small per-episode state
+    # (the committed skill + step counter) through the eval loop. Agents without the hook keep
+    # the original stateless per-step `sample_actions` path unchanged.
+    use_eval_state = hasattr(agent, 'init_eval_state') and hasattr(agent, 'sample_actions_with_state')
+    if use_eval_state:
+        actor_fn = supply_rng(agent.sample_actions_with_state, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    else:
+        actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
 
@@ -76,8 +84,14 @@ def evaluate(
         done = False
         step = 0
         render = []
+        agent_state = agent.init_eval_state() if use_eval_state else None
         while not done:
-            action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
+            if use_eval_state:
+                action, agent_state = actor_fn(
+                    observations=observation, goals=goal, temperature=eval_temperature, agent_state=agent_state
+                )
+            else:
+                action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
             action = np.array(action)
             if not config.get('discrete'):
                 if eval_gaussian is not None:

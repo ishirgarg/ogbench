@@ -1,0 +1,84 @@
+#!/bin/bash
+#SBATCH --job-name=dds_paper_sweep
+#SBATCH --account=co_rail
+#SBATCH --partition=savio4_gpu
+#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --gres=gpu:A5000:1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=144:00:00
+#SBATCH --array=0-11
+
+# Discrete Diffusion Skills (DDS) — faithful OGBench re-implementation of
+# "Offline RL with Discrete Diffusion Skills" (arXiv:2503.20176), trained purely
+# offline (agents/dds.py). This sweep runs DDS on three OGBench navigate datasets:
+#     antmaze-medium-navigate-v0     (continuous action, diffusion decoder)
+#     antsoccer-arena-navigate-v0    (continuous action, diffusion decoder)
+#     pointmaze-teleport-navigate-v0 (continuous action, diffusion decoder)
+#
+# ── Paper setup (already the agents/dds.py get_config() defaults; left unchanged) ─
+#   skill_dim D_z = 128, commitment_beta = 0.25, subgoal_steps H = 10
+#   (sequence_length = H), transformer encoder 256/4-layer/8-head, diffusion
+#   decoder 256/4-block/4x-expand, diffusion_steps = 5, time_dim = 16,
+#   beta_min/max = 0.1/10, value/actor hidden = (256,256), discount = 0.99,
+#   tau = 0.005, expectile (tau_IQL) = 0.7, AWR alpha = 3.0,
+#   skill_pretrain_steps = 500000.
+#   train_steps = 1,000,000 (the default) = 500k skill VQ-VAE pretrain + hard
+#   freeze + 500k high-level (semi-MDP IQL value/critic + AWR code policy) — the
+#   paper's relabel-then-train budget for a single OGBench run (see dds.py B4).
+#   All three envs are continuous-action, so DDS uses its diffusion action
+#   decoder (discrete=False, the default).
+#
+# ── What is swept ───────────────────────────────────────────────────────────
+#   The one hyperparameter the DDS paper sweeps is the codebook size K
+#   (num_skills): paper default 16, ablated over 4-32 (dds.py: "swept 4-32").
+#   We sweep K in {4, 8, 16, 32}. Everything else is held at the paper defaults.
+#   Single seed (0); no seed sweep.
+#
+#   Full sweep = 3 envs x 4 K-values = 12 runs  ->  --array=0-11
+#
+# Index decoding (ENV outer, K inner):
+#   IDX     = SLURM_ARRAY_TASK_ID              (0..11)
+#   K_IDX   = IDX % 4                           (0..3)
+#   ENV_IDX = IDX / 4                           (0..2)
+
+IDX=${SLURM_ARRAY_TASK_ID}
+
+# ── Sweep definitions ─────────────────────────────────────────────────────────
+ENVS=(
+    antmaze-medium-navigate-v0
+    antsoccer-arena-navigate-v0
+    pointmaze-teleport-navigate-v0
+)
+NUM_SKILLS=(4 8 16 32)   # codebook size K (paper default 16; ablated 4-32)
+SEED=0
+
+K_IDX=$((IDX % 4))
+ENV_IDX=$((IDX / 4))
+
+ENV=${ENVS[$ENV_IDX]}
+K=${NUM_SKILLS[$K_IDX]}
+
+SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
+RUN_GROUP="dds_${ENV}_K${K}"
+
+echo "IDX=$IDX  ENV=$ENV  num_skills(K)=$K  SEED=$SEED  RUN_GROUP=$RUN_GROUP"
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+# mujoco rendering for eval videos needs EGL; local wandb data goes to scratch
+# (home quota is small).
+export MUJOCO_GL=egl
+export WANDB_DIR=/global/scratch/users/ishirgarg/jaxgcrl
+mkdir -p "$WANDB_DIR"
+
+# Resolve the impls dir from this script's location so sbatch works from anywhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/.." || exit 1
+
+python main.py \
+    --env_name=$ENV \
+    --agent=agents/dds.py \
+    --agent.num_skills=$K \
+    --seed=$SEED \
+    --train_steps=1000000 \
+    --save_dir=$SAVE_DIR \
+    --run_group=$RUN_GROUP

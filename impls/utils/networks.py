@@ -164,9 +164,10 @@ class GCActor(nn.Module):
     const_std: bool = True
     final_fc_init_scale: float = 1e-2
     gc_encoder: nn.Module = None
+    activations: Any = nn.gelu
 
     def setup(self):
-        self.actor_net = MLP(self.hidden_dims, activate_final=True)
+        self.actor_net = MLP(self.hidden_dims, activate_final=True, activations=self.activations)
         self.mean_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
         if self.state_dependent_std:
             self.log_std_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
@@ -230,9 +231,10 @@ class GCDiscreteActor(nn.Module):
     action_dim: int
     final_fc_init_scale: float = 1e-2
     gc_encoder: nn.Module = None
+    activations: Any = nn.gelu
 
     def setup(self):
-        self.actor_net = MLP(self.hidden_dims, activate_final=True)
+        self.actor_net = MLP(self.hidden_dims, activate_final=True, activations=self.activations)
         self.logit_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
 
     def __call__(
@@ -282,12 +284,15 @@ class GCValue(nn.Module):
     layer_norm: bool = True
     ensemble: bool = True
     gc_encoder: nn.Module = None
+    activations: Any = nn.gelu
 
     def setup(self):
         mlp_module = MLP
         if self.ensemble:
             mlp_module = ensemblize(mlp_module, 2)
-        value_net = mlp_module((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)
+        value_net = mlp_module(
+            (*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm, activations=self.activations
+        )
 
         self.value_net = value_net
 

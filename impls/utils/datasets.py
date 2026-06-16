@@ -202,7 +202,7 @@ class GCDataset:
                 stacked_observations = self.get_stacked_observations(np.arange(self.size))
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
 
-    def sample(self, batch_size, idxs=None, evaluation=False):
+    def sample(self, batch_size, idxs=None, evaluation=False, return_goal_idxs=False):
         """Sample a batch of transitions with goals.
 
         This method samples a batch of transitions with goals (value_goals and actor_goals) from the dataset. They are
@@ -213,6 +213,10 @@ class GCDataset:
             batch_size: Batch size.
             idxs: Indices of the transitions to sample. If None, random indices are sampled.
             evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
+            return_goal_idxs: If True, additionally store the raw sampled goal indices under
+                ``value_goal_idxs`` / ``actor_goal_idxs``. This is an additive opt-in used by
+                ``SequenceDataset`` to compute per-window goal-conditioned rewards; it leaves the
+                default behaviour (and every existing caller) untouched.
         """
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
@@ -242,6 +246,9 @@ class GCDataset:
         successes = (idxs == value_goal_idxs).astype(float)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+        if return_goal_idxs:
+            batch['value_goal_idxs'] = value_goal_idxs
+            batch['actor_goal_idxs'] = actor_goal_idxs
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
@@ -396,5 +403,86 @@ class HGCDataset(GCDataset):
                         'high_actor_targets',
                     ],
                 )
+
+        return batch
+
+
+@dataclasses.dataclass
+class SequenceDataset(GCDataset):
+    """Dataset that additionally returns fixed-length sub-trajectory windows.
+
+    Skill-discovery agents (Skill-DT, QueST, VQ-BeT, DDS, ...) need contiguous
+    windows of observations/actions ``[t, t+T-1]`` from the SAME trajectory rather
+    than the single transitions that ``GCDataset`` provides. This class augments
+    the standard ``GCDataset`` batch (so all goal/reward keys remain available)
+    with:
+
+      - ``observations_seq``: ``[B, T, *obs_shape]`` — obs at ``idx+0 .. idx+T-1``,
+        clamped to the trajectory's terminal index (reads never cross an episode
+        boundary; out-of-trajectory steps repeat the terminal observation).
+      - ``actions_seq``:      ``[B, T, *act_shape]`` — actions over the same window.
+      - ``seq_mask``:         ``[B, T]`` float — 1.0 for in-trajectory steps, 0.0 for
+        steps padded past the terminal. Agents MUST mask padded steps in losses.
+
+    For semi-MDP / option-style agents (e.g. DDS) it also emits the per-window
+    goal-conditioned reward signal and the macro-step bootstrap state — all
+    computed exactly as ``GCDataset`` computes them for a single transition, so
+    that an ``H``-step discounted snippet return can be formed downstream:
+
+      - ``rewards_seq``: ``[B, T]`` float — the goal-conditioned reward at each
+        window step w.r.t. the SAME ``value_goals`` used for the base transition
+        (``successes - 1`` if ``gc_negative`` else ``successes``).
+      - ``masks_seq``:   ``[B, T]`` float — ``1 - successes`` at each window step
+        (0 exactly at the step whose state index equals the value goal).
+      - ``subgoal_observations``: ``[B, *obs_shape]`` — the macro-step next state
+        ``s_{t+T}`` (obs at ``idx+T`` clamped to the terminal), i.e. the state the
+        H-step option transitions into; used for the single-discount bootstrap.
+
+    These extra keys are purely additive; agents that only read the window keys
+    (Skill-DT, QueST, VQ-BeT) are unaffected.
+
+    The window starts at the sampled index ``idx`` (the same index used for the
+    base transition / goals), so ``observations_seq[:, 0]`` equals the base
+    ``observations`` (modulo frame-stacking) and goals refer to that start state.
+
+    Reads one config key:
+      - ``sequence_length``: window length ``T``.
+    """
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        if idxs is None:
+            idxs = self.dataset.get_random_idxs(batch_size)
+
+        # Opt into the raw goal indices so we can replicate GCDataset's reward over the window.
+        batch = super().sample(batch_size, idxs=idxs, evaluation=evaluation, return_goal_idxs=True)
+        value_goal_idxs = batch.pop('value_goal_idxs')
+        batch.pop('actor_goal_idxs', None)
+
+        T = int(self.config['sequence_length'])
+        # Terminal index of each sampled transition's trajectory.
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        steps = np.arange(T)
+        # Absolute indices for the window, clamped within the trajectory.
+        raw_idxs = idxs[:, None] + steps[None, :]                 # [B, T]
+        seq_idxs = np.minimum(raw_idxs, final_state_idxs[:, None])  # clamp to terminal
+        seq_mask = (raw_idxs <= final_state_idxs[:, None]).astype(np.float32)  # [B, T]
+
+        flat = seq_idxs.reshape(-1)
+        obs_flat = self.get_observations(flat)
+        act_flat = jax.tree_util.tree_map(lambda arr: arr[flat], self.dataset['actions'])
+        batch['observations_seq'] = obs_flat.reshape((batch_size, T) + obs_flat.shape[1:])
+        batch['actions_seq'] = jax.tree_util.tree_map(
+            lambda arr: arr.reshape((batch_size, T) + arr.shape[1:]), act_flat
+        )
+        batch['seq_mask'] = seq_mask
+
+        # Per-window goal-conditioned reward/mask w.r.t. the SAME value goal (matches GCDataset).
+        successes_seq = (seq_idxs == value_goal_idxs[:, None]).astype(np.float32)  # [B, T]
+        batch['masks_seq'] = 1.0 - successes_seq
+        batch['rewards_seq'] = successes_seq - (1.0 if self.config['gc_negative'] else 0.0)
+
+        # Macro-step bootstrap state s_{t+T} (obs after the H-step window, clamped to terminal).
+        subgoal_idxs = np.minimum(idxs + T, final_state_idxs)
+        batch['subgoal_observations'] = self.get_observations(subgoal_idxs)
 
         return batch
