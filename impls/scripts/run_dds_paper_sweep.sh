@@ -64,8 +64,8 @@ RUN_GROUP="dds_${ENV}_K${K}"
 echo "IDX=$IDX  ENV=$ENV  num_skills(K)=$K  SEED=$SEED  RUN_GROUP=$RUN_GROUP"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-# mujoco rendering for eval videos needs EGL; local wandb data goes to scratch
-# (home quota is small).
+# mujoco rendering uses EGL; local wandb data goes to scratch (home quota is
+# small). Eval videos are disabled (--video_episodes=0).
 export MUJOCO_GL=egl
 export WANDB_DIR=/global/scratch/users/ishirgarg/jaxgcrl
 mkdir -p "$WANDB_DIR"
@@ -76,5 +76,6 @@ python main.py \
     --agent.num_skills=$K \
     --seed=$SEED \
     --train_steps=1000000 \
+    --video_episodes=0 \
     --save_dir=$SAVE_DIR \
     --run_group=$RUN_GROUP
