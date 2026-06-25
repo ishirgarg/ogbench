@@ -6,14 +6,16 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-11
+#SBATCH --array=0-9
 
 # Discrete Diffusion Skills (DDS) — faithful OGBench re-implementation of
 # "Offline RL with Discrete Diffusion Skills" (arXiv:2503.20176), trained purely
-# offline (agents/dds.py). This sweep runs DDS on three OGBench navigate datasets:
+# offline (agents/dds.py). This sweep runs DDS on five OGBench datasets:
 #     antmaze-medium-navigate-v0     (continuous action, diffusion decoder)
 #     antsoccer-arena-navigate-v0    (continuous action, diffusion decoder)
 #     pointmaze-teleport-navigate-v0 (continuous action, diffusion decoder)
+#     antmaze-medium-stitch-v0       (continuous action, diffusion decoder)
+#     antsoccer-arena-stitch-v0      (continuous action, diffusion decoder)
 #
 # ── Paper setup (already the agents/dds.py get_config() defaults; left unchanged) ─
 #   skill_dim D_z = 128, commitment_beta = 0.25, subgoal_steps H = 10
@@ -31,15 +33,15 @@
 # ── What is swept ───────────────────────────────────────────────────────────
 #   The one hyperparameter the DDS paper sweeps is the codebook size K
 #   (num_skills): paper default 16, ablated over 4-32 (dds.py: "swept 4-32").
-#   We sweep K in {4, 8, 16, 32}. Everything else is held at the paper defaults.
+#   We sweep K in {15, 50}. Everything else is held at the paper defaults.
 #   Single seed (0); no seed sweep.
 #
-#   Full sweep = 3 envs x 4 K-values = 12 runs  ->  --array=0-11
+#   Full sweep = 5 envs x 2 K-values = 10 runs  ->  --array=0-9
 #
 # Index decoding (ENV outer, K inner):
-#   IDX     = SLURM_ARRAY_TASK_ID              (0..11)
-#   K_IDX   = IDX % 4                           (0..3)
-#   ENV_IDX = IDX / 4                           (0..2)
+#   IDX     = SLURM_ARRAY_TASK_ID              (0..9)
+#   K_IDX   = IDX % 2                           (0..1)
+#   ENV_IDX = IDX / 2                           (0..4)
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
@@ -48,12 +50,14 @@ ENVS=(
     antmaze-medium-navigate-v0
     antsoccer-arena-navigate-v0
     pointmaze-teleport-navigate-v0
+    antmaze-medium-stitch-v0
+    antsoccer-arena-stitch-v0
 )
-NUM_SKILLS=(4 8 16 32)   # codebook size K (paper default 16; ablated 4-32)
+NUM_SKILLS=(15 50)   # codebook size K (paper default 16; ablated 4-32)
 SEED=0
 
-K_IDX=$((IDX % 4))
-ENV_IDX=$((IDX / 4))
+K_IDX=$((IDX % 2))
+ENV_IDX=$((IDX / 2))
 
 ENV=${ENVS[$ENV_IDX]}
 K=${NUM_SKILLS[$K_IDX]}
