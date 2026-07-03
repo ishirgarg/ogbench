@@ -1,74 +1,5 @@
-"""QueST: Self-Supervised Skill Abstractions for Learning Continuous Control.
-
-Faithful OGBench re-implementation of QueST (Mete et al., NeurIPS 2024,
-arXiv:2407.15840). The method has two stages, both trained purely offline:
-
-  Stage I  (Sec. 4.1):  A chunked action autoencoder. An encoder maps an action
-      chunk a_{t:t+T-1} to n = T/F latent vectors, which are discretized with
-      Finite Scalar Quantization (FSQ; Mentzer et al. 2023). A transformer
-      decoder reconstructs the chunk. Trained with L1 reconstruction only
-      (Eq. 4). FSQ needs NO codebook / commitment loss.
-
-  Stage II (Sec. 4.2):  An autoregressive (causal Transformer) prior over the
-      discrete skill tokens, conditioned on the (goal-)state. Trained with
-      token-level cross-entropy / NLL (Eq. 6).
-
-This file mirrors the public agent interface used across OGBench
-(`impls/agents/empowerment_skill.py`, `gcbc.py`): a `flax.struct.PyTreeNode`
-with `create`, jitted `update` / `total_loss`, `sample_actions`, and a
-module-level `get_config()`.
-
-================================================================================
-ASSUMPTIONS & DEVIATIONS FROM THE PAPER (arXiv:2407.15840)
-================================================================================
-Read this first. Everything below is either an assumption forced by the OGBench
-interface, or a point where this code is NOT an exact match to the paper. Each
-line gives a one-line reason + paper section. `quest_NOTES.md` expands on these.
-
-A. ASSUMPTIONS FORCED BY THE OGBENCH INTERFACE
-  A1. Execution horizon = 1 (replan every step). Paper executes T_a = 8 actions
-      open-loop before replanning (Sec. 4.3, Table 4), but OGBench's eval loop
-      calls `sample_actions` every env step and is stateless, so we decode the
-      chunk and return only the first action a_t. More compute at eval; more
-      conservative behavior.
-  A2. Conditioning e = goal observation, not a CLIP / learned task embedding.
-      Paper uses CLIP (LIBERO) or a learned task embedding (MetaWorld) for e
-      (Sec. 4.2); OGBench is goal-conditioned, so e is the goal observation
-      (`actor_goals`), optionally encoded by a visual `GCEncoder`. Toggle with
-      `goal_conditioned`.
-  A3. Conditioning is injected as a single prefix token that plays the role of
-      the learnable start token <s> at position 0 (Eq. 5). Paper conditions on a
-      short observation history (h = 1) plus e; we fold the current observation
-      (+ goal) into one MLP-produced prefix token.
-  A4. Two-stage schedule is realized by step-gating inside one `update`
-      (`stage1_steps`) rather than two separate training scripts (Sec. 5). The
-      two losses are gradient-decoupled (prior targets are stop-grad integer
-      tokens), so this is equivalent; the split point is our hyperparameter.
-  A5. Few-shot decoder finetuning (Eq. 7, Table 7) is NOT implemented — it is a
-      transfer/adaptation step outside the offline pretraining objective.
-
-B. NON-EXACT MATCHES (with reason)
-  B1. No attention/embedding dropout. Paper Table 4 lists attention dropout 0.1
-      for the prior; OGBench networks do not thread a train/eval flag or dropout
-      rng through agents, so we omit it (regularization only; affects training
-      dynamics, not architecture).
-  B2. Decoder interleaves self- then cross-attention within every block (paper:
-      "alternate masked self-attention and cross-attention layers", Sec. 4.1) —
-      same operator set, packaged per-block rather than as strictly alternating
-      standalone layers.
-  B3. Minor underspecified details follow standard GPT/ViT practice: pre-LN,
-      MLP ratio 4, GELU (prior/decoder MLPs). Capacities (dims/layers/heads/
-      kernels/strides, FSQ levels, T, F, n, vocab) match Tables 3-4 exactly.
-
-Matched to the official repo (github.com/pairlab/QueST) after audit: the encoder
-now uses FIXED SINUSOIDAL positional embeddings (official Summer(PositionalEncoding1D))
-and GroupNorm(4)+Mish conv blocks (official Conv1dBlock); the decoder adds no
-positional embedding to the code memory tokens. Decoder query inputs and prior
-token positions are fixed sinusoidal, as in the paper/official code.
-
-See `quest_NOTES.md` for per-component paper citations and full detail.
-"""
-
+import glob
+import pickle
 from typing import Any, Optional, Sequence
 
 import flax
@@ -84,25 +15,11 @@ from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import MLP
 
 
-# ── Finite Scalar Quantization (paper Sec. 3.2, Eq. 1-2) ───────────────────────
-#
-# FSQ (Mentzer et al. 2023, arXiv:2309.15505) quantizes each latent channel to a
-# fixed small number of levels with a bounded, straight-through rounding op. The
-# implicit codebook has size prod(levels) and needs no learned embeddings and no
-# auxiliary VQ losses — that is precisely why QueST's Stage I objective is a pure
-# reconstruction loss.
-
-
 def _round_ste(z):
-    """Round with a straight-through estimator: forward=round, backward=identity."""
     return z + jax.lax.stop_gradient(jnp.round(z) - z)
 
 
 def fsq_bound(z, levels, eps=1e-3):
-    """Bound z into the open interval covering `levels` quantization cells.
-
-    f(z) = tanh(z + shift) * half_l - offset   (Mentzer et al., Eq. 4 of FSQ).
-    """
     levels = levels.astype(z.dtype)
     half_l = (levels - 1.0) * (1.0 - eps) / 2.0
     offset = jnp.where(levels % 2 == 0, 0.5, 0.0)
@@ -111,55 +28,64 @@ def fsq_bound(z, levels, eps=1e-3):
 
 
 def fsq_quantize(z, levels):
-    """Quantize z (straight-through) and renormalize codes to ~[-1, 1].
-
-    This is the differentiable path used for reconstruction. Gradients flow
-    through `_round_ste` unchanged (QueST Sec. 3.2 / Eq. 2).
-    """
     quantized = _round_ste(fsq_bound(z, levels))
     half_width = (levels // 2).astype(z.dtype)
     return quantized / half_width
 
 
 def _fsq_basis(levels):
-    """Mixed-radix place values for flattening per-channel codes to an index."""
     levels = jnp.asarray(levels)
     ones = jnp.ones((1,), dtype=jnp.int32)
     return jnp.concatenate([ones, jnp.cumprod(levels[:-1]).astype(jnp.int32)])
 
 
 def fsq_codes_to_indices(codes, levels):
-    """Map renormalized codes [..., d] -> integer token ids [...] in [0, prod(levels))."""
     half_width = (levels // 2)
-    zhat = jnp.round(codes * half_width + half_width)  # per-channel 0..L_i-1
+    zhat = jnp.round(codes * half_width + half_width)
     basis = _fsq_basis(levels)
     return (zhat.astype(jnp.int32) * basis).sum(axis=-1)
 
 
 def fsq_indices_to_codes(indices, levels):
-    """Inverse map: integer token ids [...] -> renormalized codes [..., d]."""
     basis = _fsq_basis(levels)
-    codes_non_centered = (indices[..., None] // basis) % levels  # 0..L_i-1
+    codes_non_centered = (indices[..., None] // basis) % levels
     half_width = (levels // 2).astype(jnp.float32)
     return (codes_non_centered.astype(jnp.float32) - half_width) / half_width
 
 
-# ── Attention building blocks (real Flax attention) ────────────────────────────
+# FSQ per-channel level factorizations by effective codebook size (== product).
+# The official get_fsq_level (skill_vae.py) values plus 15/50 for DDS-style
+# codebook-size sweeps (15 = [5,3] matches the official smallest; 50 = [10,5],
+# the exact product-50 factorization with all levels >= 3 — FSQ's tanh/arctanh
+# bound is undefined for level 2, so [5,5,2] is not usable).
+_FSQ_LEVELS = {
+    15: (5, 3),
+    50: (10, 5),
+    64: (8, 8),
+    240: (8, 6, 5),
+    512: (8, 8, 8),
+    1000: (8, 5, 5, 5),
+    1920: (8, 8, 6, 5),
+    4375: (7, 5, 5, 5, 5),
+}
+
+
+def get_fsq_level(codebook_size):
+    if codebook_size not in _FSQ_LEVELS:
+        raise ValueError(
+            f'No FSQ level factorization registered for codebook_size={codebook_size}. '
+            f'Known sizes: {sorted(_FSQ_LEVELS)}. Set fsq_levels directly for others.'
+        )
+    return _FSQ_LEVELS[codebook_size]
 
 
 class MultiHeadAttention(nn.Module):
-    """Scaled dot-product multi-head attention with an optional additive mask.
-
-    Supports both self-attention (q_in is kv_in) and cross-attention.
-    `mask` is a boolean array broadcastable to [B, n_heads, Tq, Tk]; positions
-    that are False are forbidden (set to -inf before softmax).
-    """
-
     dim: int
     num_heads: int
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, q_in, kv_in, mask=None):
+    def __call__(self, q_in, kv_in, mask=None, deterministic=True):
         B, Tq, _ = q_in.shape
         Tk = kv_in.shape[1]
         h, hd = self.num_heads, self.dim // self.num_heads
@@ -172,49 +98,45 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             attn = jnp.where(mask, attn, jnp.finfo(attn.dtype).min)
         attn = jax.nn.softmax(attn, axis=-1)
+        attn = nn.Dropout(self.dropout_rate)(attn, deterministic=deterministic)
         out = jnp.einsum('bhqk,bkhd->bqhd', attn, v).reshape(B, Tq, self.dim)
         return nn.Dense(self.dim, name='out_proj')(out)
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN transformer block: (self-attn) -> [optional cross-attn] -> MLP."""
-
     dim: int
     num_heads: int
     mlp_ratio: int = 4
     cross: bool = False
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, x, context=None, self_mask=None, cross_mask=None):
-        x = x + MultiHeadAttention(self.dim, self.num_heads, name='self_attn')(
-            nn.LayerNorm()(x), nn.LayerNorm()(x), self_mask
+    def __call__(self, x, context=None, self_mask=None, cross_mask=None, deterministic=True):
+        h = nn.LayerNorm()(x)
+        attn = MultiHeadAttention(self.dim, self.num_heads, self.dropout_rate, name='self_attn')(
+            h, h, self_mask, deterministic=deterministic
         )
+        x = x + nn.Dropout(self.dropout_rate)(attn, deterministic=deterministic)
         if self.cross:
             xq = nn.LayerNorm()(x)
-            ctx = nn.LayerNorm()(context)
-            x = x + MultiHeadAttention(self.dim, self.num_heads, name='cross_attn')(
-                xq, ctx, cross_mask
+            cattn = MultiHeadAttention(self.dim, self.num_heads, self.dropout_rate, name='cross_attn')(
+                xq, context, cross_mask, deterministic=deterministic
             )
+            x = x + nn.Dropout(self.dropout_rate)(cattn, deterministic=deterministic)
         y = nn.LayerNorm()(x)
         y = nn.Dense(self.dim * self.mlp_ratio)(y)
-        y = nn.gelu(y)
+        y = nn.gelu(y, approximate=False)
+        y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
         y = nn.Dense(self.dim)(y)
+        y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
         return x + y
 
 
 def _causal_mask(length):
-    """Lower-triangular [length, length] boolean self-attention mask."""
     return jnp.tril(jnp.ones((length, length), dtype=bool))
 
 
 def sinusoidal_embedding(length, dim):
-    """Fixed (non-learned) sinusoidal positional embeddings [length, dim].
-
-    Standard Vaswani et al. (2017) construction. QueST uses *fixed sinusoidal*
-    positional embeddings for the decoder query inputs and the prior's skill
-    tokens (paper Sec. 4.1-4.2), so we use this rather than learned `nn.param`s
-    at those two sites to match the paper exactly.
-    """
     pos = jnp.arange(length)[:, None]
     idx = jnp.arange(dim)[None, :]
     angle_rates = 1.0 / jnp.power(10000.0, (2 * (idx // 2)) / dim)
@@ -222,12 +144,7 @@ def sinusoidal_embedding(length, dim):
     return jnp.where(idx % 2 == 0, jnp.sin(angles), jnp.cos(angles))
 
 
-# ── Stage I: chunked action autoencoder (paper Sec. 4.1) ───────────────────────
-
-
 class CausalConv1d(nn.Module):
-    """Left-padded (causal) strided 1-D convolution over the time axis."""
-
     features: int
     kernel_size: int
     stride: int
@@ -242,182 +159,124 @@ class CausalConv1d(nn.Module):
 
 
 class ActionEncoder(nn.Module):
-    """phi_theta: action chunk [B, T, A] -> latent tokens [B, n, fsq_dim].
-
-    Causal strided convolutions downsample time by F, followed by masked
-    (causal) self-attention (QueST Sec. 4.1; Table 3). The final linear layer
-    projects to the FSQ latent dimension d = len(levels).
-    """
-
     dim: int
     fsq_dim: int
     conv_kernels: Sequence[int]
     conv_strides: Sequence[int]
     num_layers: int
     num_heads: int
+    attn_pdrop: float = 0.0
 
     @nn.compact
-    def __call__(self, action_chunk):
-        x = action_chunk
+    def __call__(self, action_chunk, train=False):
+        deterministic = not train
+        x = nn.Dense(self.dim)(action_chunk)
         for k, s in zip(self.conv_kernels, self.conv_strides):
             x = CausalConv1d(self.dim, k, s)(x)
-            # Official Conv1dBlock (skill_vae.py): GroupNorm(4) + Mish.
-            x = nn.GroupNorm(num_groups=4)(x)
-            x = x * jnp.tanh(jax.nn.softplus(x))  # Mish
+            x = nn.GroupNorm(num_groups=8)(x)
+            x = x * jnp.tanh(jax.nn.softplus(x))
         n = x.shape[1]
-        # Fixed sinusoidal positional embeddings (the official encoder uses
-        # Summer(PositionalEncoding1D)), not a learned parameter.
         x = x + sinusoidal_embedding(n, self.dim)[None]
         mask = _causal_mask(n)[None, None]
         for _ in range(self.num_layers):
-            x = TransformerBlock(self.dim, self.num_heads)(x, self_mask=mask)
-        x = nn.LayerNorm()(x)
-        return nn.Dense(self.fsq_dim)(x)  # [B, n, fsq_dim]
+            x = TransformerBlock(self.dim, self.num_heads, dropout_rate=self.attn_pdrop)(
+                x, self_mask=mask, deterministic=deterministic
+            )
+        return nn.Dense(self.fsq_dim)(x)
 
 
 class ActionDecoder(nn.Module):
-    """psi_theta: latent codes [B, n, fsq_dim] -> reconstructed chunk [B, T, A].
-
-    Fixed sinusoidal per-timestep positional query inputs cross-attend to ALL n
-    skill tokens; the query self-attention is causal (masked). This matches the
-    paper: "the decoder cross attends between fixed sinusoidal positional
-    embedding inputs and the skill tokens", "attending to all codes while
-    maintaining causality" (QueST Sec. 4.1; Table 3).
-    """
-
     dim: int
     horizon: int
     num_tokens: int
     action_dim: int
     num_layers: int
     num_heads: int
+    attn_pdrop: float = 0.0
 
     @nn.compact
-    def __call__(self, codes):
+    def __call__(self, codes, train=False):
+        deterministic = not train
         B = codes.shape[0]
 
-        # Official decoder adds NO positional embedding to the code memory tokens
-        # (only the sinusoidal query inputs carry positions).
         skill = nn.Dense(self.dim)(codes)
 
-        # Fixed sinusoidal positional embeddings are the decoder query inputs
-        # (paper Sec. 4.1), not learned parameters.
         queries = sinusoidal_embedding(self.horizon, self.dim)
         x = jnp.broadcast_to(queries[None], (B, self.horizon, self.dim))
 
         self_mask = _causal_mask(self.horizon)[None, None]
-        # The decoder cross-attends to ALL skill codes (cross_mask=None); causality
-        # is maintained by the masked self-attention over query positions, not by
-        # masking the cross-attention (paper Sec. 4.1).
         cross_mask = None
 
         for _ in range(self.num_layers):
-            x = TransformerBlock(self.dim, self.num_heads, cross=True)(
-                x, context=skill, self_mask=self_mask, cross_mask=cross_mask
+            x = TransformerBlock(self.dim, self.num_heads, cross=True, dropout_rate=self.attn_pdrop)(
+                x, context=skill, self_mask=self_mask, cross_mask=cross_mask, deterministic=deterministic
             )
-        x = nn.LayerNorm()(x)
-        return nn.Dense(self.action_dim)(x)  # [B, T, A]
-
-
-# ── Stage II: autoregressive skill prior (paper Sec. 4.2) ──────────────────────
+        return nn.Dense(self.action_dim)(x)
 
 
 class SkillPrior(nn.Module):
-    """pi_phi: causal Transformer over discrete skill tokens.
-
-    Factorizes pi(Z | state, goal) = prod_i pi(z_i | <s>, z_{<i}, state, goal)
-    (QueST Eq. 5). A conditioning token built from the (goal-)state observation
-    plays the role of the learnable start token <s> at position 0; teacher-forced
-    token embeddings fill positions 1..n-1. The head predicts a distribution over
-    the full vocabulary at every position. Trained with NLL / cross-entropy
-    (Eq. 6).
-    """
-
     vocab_size: int
     num_tokens: int
     dim: int
     num_layers: int
     num_heads: int
+    attn_pdrop: float = 0.0
+    embd_pdrop: float = 0.0
     gc_encoder: Optional[nn.Module] = None
 
     @nn.compact
-    def __call__(self, observations, goals, tokens):
+    def __call__(self, observations, goals, tokens, train=False):
+        deterministic = not train
         B = tokens.shape[0]
 
-        # Conditioning embedding from state (+ goal) -> the <s>/prefix token.
         if self.gc_encoder is not None:
             cond_in = self.gc_encoder(observations, goals)
         elif goals is not None:
             cond_in = jnp.concatenate([observations, goals], axis=-1)
         else:
             cond_in = observations
-        cond = MLP((self.dim, self.dim), activate_final=True)(cond_in)  # [B, dim]
+        cond = MLP((self.dim, self.dim), activate_final=True)(cond_in)
 
         tok_embed = nn.Embed(self.vocab_size, self.dim, name='tok_embed')
-        # Input sequence: [cond, e(z_0), ..., e(z_{n-2})], length n.
-        prev = tok_embed(tokens[:, : self.num_tokens - 1])  # [B, n-1, dim]
-        x = jnp.concatenate([cond[:, None, :], prev], axis=1)  # [B, n, dim]
-        # Fixed sinusoidal positional embeddings over the token sequence
-        # (paper Sec. 4.2: "sinusoidal positional embeddings"), not learned.
+        prev = tok_embed(tokens[:, : self.num_tokens - 1])
+        x = jnp.concatenate([cond[:, None, :], prev], axis=1)
         x = x + sinusoidal_embedding(self.num_tokens, self.dim)[None]
+        x = nn.Dropout(self.embd_pdrop)(x, deterministic=deterministic)
 
         mask = _causal_mask(self.num_tokens)[None, None]
         for _ in range(self.num_layers):
-            x = TransformerBlock(self.dim, self.num_heads)(x, self_mask=mask)
+            x = TransformerBlock(self.dim, self.num_heads, dropout_rate=self.attn_pdrop)(
+                x, self_mask=mask, deterministic=deterministic
+            )
         x = nn.LayerNorm()(x)
-        return nn.Dense(self.vocab_size, name='head')(x)  # [B, n, vocab]
-
-
-# ── Agent ──────────────────────────────────────────────────────────────────────
+        return nn.Dense(self.vocab_size, name='head')(x)
 
 
 class QueSTAgent(flax.struct.PyTreeNode):
-    """QueST offline skill-abstraction agent (discrete FSQ skill tokens)."""
-
     rng: Any
     network: Any
     config: Any = nonpytree_field()
-
-    # ── helpers ────────────────────────────────────────────────────────────────
 
     @property
     def _levels(self):
         return jnp.asarray(self.config['fsq_levels'])
 
     def _get_chunk(self, batch):
-        """Return (action chunk [B, T, A], step mask [B, T]).
+        return batch['actions_seq']
 
-        Consumes the real sub-trajectory action sequence from `SequenceDataset`
-        (`batch['actions_seq']`, [B, T, A]); `batch['seq_mask']` ([B, T]) marks
-        real vs padded (past-terminal) steps and must gate any per-timestep loss.
-        """
-        chunk = batch['actions_seq']  # [B, T, A]
-        mask = batch.get('seq_mask')
-        if mask is None:
-            mask = jnp.ones(chunk.shape[:2], dtype=chunk.dtype)
-        return chunk, mask
-
-    def _encode_indices(self, chunk, grad_params=None):
-        """Encode + FSQ-quantize a chunk to integer token ids [B, n] (stop-grad)."""
-        z = self.network.select('encoder')(chunk, params=grad_params)
+    def reconstruction_loss(self, batch, grad_params, train=False, rng=None):
+        chunk = self._get_chunk(batch)
+        enc_kwargs = {}
+        dec_kwargs = {}
+        if train:
+            ke, kd = jax.random.split(rng)
+            enc_kwargs = {'rngs': {'dropout': ke}}
+            dec_kwargs = {'rngs': {'dropout': kd}}
+        z = self.network.select('encoder')(chunk, params=grad_params, train=train, **enc_kwargs)
         codes = fsq_quantize(z, self._levels)
         indices = fsq_codes_to_indices(jax.lax.stop_gradient(codes), self._levels)
-        return z, codes, indices
-
-    # ── losses ───────────────────────────────────────────────────────────────
-
-    def reconstruction_loss(self, batch, grad_params):
-        """Stage I L1 reconstruction loss (paper Eq. 4)."""
-        chunk, mask = self._get_chunk(batch)
-        z, codes, indices = self._encode_indices(chunk, grad_params)
-        recon = self.network.select('decoder')(codes, params=grad_params)
-        # Mask out padded (past-terminal) timesteps; average over real
-        # (step, action-dim) elements only.
-        step_mask = mask[..., None]  # [B, T, 1]
-        l1_elem = jnp.abs(recon - chunk) * step_mask
-        denom = jnp.maximum(step_mask.sum() * chunk.shape[-1], 1.0)
-        l1 = l1_elem.sum() / denom
-        # Codebook usage diagnostic (fraction of unique tokens in the batch).
+        recon = self.network.select('decoder')(codes, params=grad_params, train=train, **dec_kwargs)
+        l1 = jnp.abs(recon - chunk).mean()
         usage = jnp.unique(indices, size=indices.size, fill_value=-1)
         usage = (usage >= 0).sum() / self.config['vocab_size']
         return l1, {
@@ -426,17 +285,19 @@ class QueSTAgent(flax.struct.PyTreeNode):
             'z_abs_mean': jnp.abs(z).mean(),
         }
 
-    def prior_loss(self, batch, grad_params):
-        """Stage II token cross-entropy / NLL (paper Eq. 5-6)."""
-        chunk, _ = self._get_chunk(batch)
-        # Encoder params are frozen w.r.t. the prior gradient (tokens are integer
-        # and stop-gradient'd); pass None so no grad flows into the encoder here.
-        _, _, indices = self._encode_indices(chunk, grad_params=None)
+    def prior_loss(self, batch, grad_params, train=False, rng=None):
+        chunk = self._get_chunk(batch)
+        z = self.network.select('encoder')(chunk, params=None, train=False)
+        codes = fsq_quantize(z, self._levels)
+        indices = fsq_codes_to_indices(jax.lax.stop_gradient(codes), self._levels)
         goals = batch.get('actor_goals') if self.config['goal_conditioned'] else None
+        prior_kwargs = {}
+        if train:
+            prior_kwargs = {'rngs': {'dropout': rng}}
         logits = self.network.select('prior')(
-            batch['observations'], goals, indices, params=grad_params
+            batch['observations'], goals, indices, params=grad_params, train=train, **prior_kwargs
         )
-        ce = optax.softmax_cross_entropy_with_integer_labels(logits, indices)  # [B, n]
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, indices)
         ce = ce.mean()
         acc = (logits.argmax(axis=-1) == indices).mean()
         return ce, {
@@ -445,26 +306,33 @@ class QueSTAgent(flax.struct.PyTreeNode):
             'prior_perplexity': jnp.exp(ce),
         }
 
-    # ── training ───────────────────────────────────────────────────────────────
-
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         info = {}
-        recon_loss, recon_info = self.reconstruction_loss(batch, grad_params)
+        train = rng is not None
+        if train:
+            r_recon, r_prior = jax.random.split(rng)
+        else:
+            r_recon = r_prior = None
+        recon_loss, recon_info = self.reconstruction_loss(batch, grad_params, train, r_recon)
         info.update({f'ae/{k}': v for k, v in recon_info.items()})
 
-        prior_loss, prior_info = self.prior_loss(batch, grad_params)
+        prior_loss, prior_info = self.prior_loss(batch, grad_params, train, r_prior)
         info.update({f'prior/{k}': v for k, v in prior_info.items()})
 
-        # Two-stage gating (offline). Before `stage1_steps` only the autoencoder
-        # trains; afterwards the autoencoder is frozen (zero weight -> zero grad)
-        # and only the prior trains. `joint_training=True` trains both at once.
         step = jnp.asarray(self.network.step, dtype=jnp.float32)
-        if self.config['joint_training']:
+        stage = self.config['stage']
+        if stage == 'ae':
+            w_recon = jnp.array(1.0)
+            w_prior = jnp.array(0.0)
+        elif stage == 'prior':
+            w_recon = jnp.array(0.0)
+            w_prior = jnp.array(self.config['prior_weight'])
+        elif self.config['joint_training']:
             w_recon = jnp.array(1.0)
             w_prior = jnp.array(self.config['prior_weight'])
         else:
-            in_stage1 = step < self.config['stage1_steps']
+            in_stage1 = (step - 1.0) < self.config['stage1_steps']
             w_recon = jnp.where(in_stage1, 1.0, 0.0)
             w_prior = jnp.where(in_stage1, 0.0, self.config['prior_weight'])
         info['ae/weight'] = w_recon
@@ -482,20 +350,13 @@ class QueSTAgent(flax.struct.PyTreeNode):
         )
         return self.replace(network=new_network, rng=new_rng), info
 
-    # ── evaluation / inference (paper Sec. 4.3) ────────────────────────────────
-
     def _sample_tokens(self, observations, goals, rng, temperature):
-        """Autoregressively sample skill tokens [B, n] from the prior.
-
-        Top-k filtering (default k=5) then temperature sampling; temperature==0
-        falls back to greedy argmax (used by OGBench eval, which sets temp=0).
-        """
         B = observations.shape[0]
         n = self.config['num_tokens']
         top_k = self.config['top_k']
 
         def sample_one(logits, key):
-            kth = jax.lax.top_k(logits, top_k)[0][:, -1:]  # [B, 1]
+            kth = jax.lax.top_k(logits, top_k)[0][:, -1:]
             logits = jnp.where(logits < kth, jnp.finfo(logits.dtype).min, logits)
             greedy = logits.argmax(axis=-1)
             scaled = logits / jnp.maximum(temperature, 1e-8)
@@ -516,12 +377,6 @@ class QueSTAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions(self, observations, goals=None, seed=None, temperature=1.0):
-        """Sample skill tokens, decode to an action chunk, return the first action.
-
-        OGBench's evaluation loop calls `sample_actions` every environment step,
-        so we replan each step and return a_t (open-loop horizon 1) rather than
-        executing T_a actions before replanning (deviation; see quest_NOTES.md).
-        """
         if seed is None:
             seed = self.rng
 
@@ -535,14 +390,12 @@ class QueSTAgent(flax.struct.PyTreeNode):
         cond_goals = goals if self.config['goal_conditioned'] else None
         tokens = self._sample_tokens(observations, cond_goals, seed, temperature)
         codes = fsq_indices_to_codes(tokens, self._levels)
-        chunk = self.network.select('decoder')(codes)  # [B, T, A]
+        chunk = self.network.select('decoder')(codes)
         actions = jnp.clip(chunk[:, 0, :], -1, 1)
 
         if single_obs:
             actions = actions[0]
         return actions
-
-    # ── constructor ────────────────────────────────────────────────────────────
 
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
@@ -557,14 +410,22 @@ class QueSTAgent(flax.struct.PyTreeNode):
         assert config['sequence_length'] == T, (
             'sequence_length must equal horizon_length so actions_seq spans the chunk.'
         )
+        stage = config['stage']
+        assert stage in ('both', 'ae', 'prior'), "stage must be 'both', 'ae', or 'prior'."
+        if stage == 'both':
+            assert config['joint_training'] or config['total_steps'] > config['stage1_steps'], (
+                'total_steps must exceed stage1_steps (and equal --train_steps) so the prior stage runs.'
+            )
         num_tokens = T // F
         levels = tuple(config['fsq_levels'])
+        if config.get('codebook_size') is not None:
+            levels = get_fsq_level(config['codebook_size'])
         vocab_size = int(np.prod(levels))
         config = dict(config)
+        config['fsq_levels'] = tuple(int(l) for l in levels)
         config['num_tokens'] = num_tokens
         config['vocab_size'] = vocab_size
 
-        # Optional visual encoder for the prior's conditioning input.
         prior_encoder = None
         if config.get('encoder') is not None:
             enc = encoder_modules[config['encoder']]
@@ -577,6 +438,7 @@ class QueSTAgent(flax.struct.PyTreeNode):
             conv_strides=tuple(config['conv_strides']),
             num_layers=config['enc_layers'],
             num_heads=config['enc_heads'],
+            attn_pdrop=config['attn_pdrop'],
         )
         decoder_def = ActionDecoder(
             dim=config['ae_dim'],
@@ -585,6 +447,7 @@ class QueSTAgent(flax.struct.PyTreeNode):
             action_dim=action_dim,
             num_layers=config['dec_layers'],
             num_heads=config['dec_heads'],
+            attn_pdrop=config['attn_pdrop'],
         )
         prior_def = SkillPrior(
             vocab_size=vocab_size,
@@ -592,6 +455,8 @@ class QueSTAgent(flax.struct.PyTreeNode):
             dim=config['prior_dim'],
             num_layers=config['prior_layers'],
             num_heads=config['prior_heads'],
+            attn_pdrop=config['attn_pdrop'],
+            embd_pdrop=config['embd_pdrop'],
             gc_encoder=prior_encoder,
         )
 
@@ -610,46 +475,118 @@ class QueSTAgent(flax.struct.PyTreeNode):
             prior=(ex_observations, ex_goals, ex_tokens),
         )['params']
 
-        network = TrainState.create(
-            network_def, network_params, tx=optax.adam(config['lr'])
+        # Two-run stage split: for stage='prior', load the trained autoencoder
+        # (encoder+decoder) params from a stage='ae' run's checkpoint and keep a
+        # FRESH optimizer for the prior (fresh Adam bias-correction, fresh cosine)
+        # — bit-exactly reproducing the official's separate stage-0/stage-1 jobs.
+        if stage == 'prior' and config.get('restore_ae_path') is not None:
+            candidates = glob.glob(config['restore_ae_path'])
+            assert len(candidates) == 1, f'restore_ae_path matched {len(candidates)} dirs: {candidates}'
+            ckpt = candidates[0] + f"/params_{config['restore_ae_epoch']}.pkl"
+            with open(ckpt, 'rb') as f:
+                loaded = pickle.load(f)['agent']['network']['params']
+
+            def _leaf_shapes(tree):
+                return {'/'.join(str(getattr(k, 'key', k)) for k in p): tuple(v.shape)
+                        for p, v in jax.tree_util.tree_leaves_with_path(tree)}
+
+            network_params = flax.core.unfreeze(network_params)
+            for mod in ('modules_encoder', 'modules_decoder'):
+                restored = flax.serialization.from_state_dict(network_params[mod], loaded[mod])
+                assert _leaf_shapes(network_params[mod]) == _leaf_shapes(restored), (
+                    f'AE checkpoint architecture mismatch in {mod}: the stage="ae" run must use '
+                    f'the same encoder/decoder config as this stage="prior" run.'
+                )
+                network_params[mod] = restored
+        elif stage == 'prior':
+            raise ValueError("stage='prior' requires restore_ae_path (the stage='ae' checkpoint).")
+
+        lr = config['lr']
+        alpha = (config['lr_eta_min'] / lr) if lr > 0 else 0.0
+
+        def _cos(n):
+            return optax.cosine_decay_schedule(lr, max(int(n), 1), alpha)
+        _zero = optax.constant_schedule(0.0)
+
+        if stage == 'ae':
+            ae_sched, prior_sched = _cos(config['total_steps']), _zero
+        elif stage == 'prior':
+            ae_sched, prior_sched = _zero, _cos(config['total_steps'])
+        elif config['joint_training']:
+            ae_sched = prior_sched = _cos(config['total_steps'])
+        else:
+            s1 = max(int(config['stage1_steps']), 1)
+            s2 = max(int(config['total_steps']) - s1, 1)
+            ae_sched = optax.join_schedules([_cos(s1), _zero], boundaries=[s1])
+            prior_sched = optax.join_schedules([_zero, _cos(s2)], boundaries=[s1])
+
+        def _param_labels(params):
+            def label(path, leaf):
+                name = '/'.join(str(getattr(k, 'key', k)) for k in path).lower()
+                group = 'prior' if 'prior' in name else 'ae'
+                is_norm_or_embed = ('norm' in name) or ('embed' in name)
+                decay = (leaf.ndim >= 2) and (not is_norm_or_embed)
+                return f'{group}_{"decay" if decay else "nodecay"}'
+            return jax.tree_util.tree_map_with_path(label, params)
+
+        wd = config['weight_decay']
+
+        def _adamw(schedule, weight_decay):
+            return optax.adamw(learning_rate=schedule, b1=0.9, b2=0.999, weight_decay=weight_decay)
+
+        tx = optax.chain(
+            optax.clip_by_global_norm(config['grad_clip']),
+            optax.multi_transform(
+                {
+                    'ae_decay': _adamw(ae_sched, wd),
+                    'ae_nodecay': _adamw(ae_sched, 0.0),
+                    'prior_decay': _adamw(prior_sched, wd),
+                    'prior_nodecay': _adamw(prior_sched, 0.0),
+                },
+                _param_labels(network_params),
+            ),
         )
+        network = TrainState.create(network_def, network_params, tx=tx)
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
-
-
-# ── Config ──────────────────────────────────────────────────────────────────────
 
 
 def get_config():
     return ml_collections.ConfigDict(dict(
         agent_name='quest',
         lr=1e-4,
-        batch_size=1024,
-        # ── Stage I: chunked action autoencoder (paper Table 3) ──────────────
-        horizon_length=32,        # action chunk length T.
-        downsample_factor=4,      # F; num_tokens n = T / F = 8.
-        fsq_levels=(8, 5, 5, 5),  # FSQ levels; implicit vocab = prod = 1000.
-        ae_dim=256,               # autoencoder hidden dim.
-        conv_kernels=(5, 3, 3),   # encoder causal-conv kernel sizes.
-        conv_strides=(2, 2, 1),   # encoder causal-conv strides (downsample x4).
-        enc_layers=2,             # encoder self-attention layers.
+        batch_size=128,
+        weight_decay=1e-4,
+        grad_clip=100.0,
+        lr_eta_min=1e-5,
+        total_steps=1000000,
+        attn_pdrop=0.1,
+        embd_pdrop=0.1,
+        horizon_length=32,
+        downsample_factor=4,
+        fsq_levels=(8, 5, 5, 5),
+        codebook_size=ml_collections.config_dict.placeholder(int),
+        ae_dim=256,
+        conv_kernels=(5, 3, 3),
+        conv_strides=(2, 2, 1),
+        enc_layers=2,
         enc_heads=4,
-        dec_layers=4,             # decoder transformer layers.
+        dec_layers=4,
         dec_heads=4,
-        # ── Stage II: autoregressive skill prior (paper Table 4) ─────────────
         prior_dim=384,
         prior_layers=6,
         prior_heads=6,
-        top_k=5,                  # top-k token sampling at inference.
-        prior_weight=1.0,         # weight on the prior CE term.
-        # ── Two-stage offline schedule ───────────────────────────────────────
-        stage1_steps=500000,      # steps of AE-only training before prior-only.
-        joint_training=False,     # if True, train AE + prior simultaneously.
-        goal_conditioned=True,    # condition the prior on the goal observation.
-        # ── Standard OGBench plumbing ────────────────────────────────────────
+        top_k=5,
+        prior_weight=1.0,
+        stage='both',
+        stage1_steps=500000,
+        joint_training=False,
+        restore_ae_path=ml_collections.config_dict.placeholder(str),
+        restore_ae_epoch=ml_collections.config_dict.placeholder(int),
+        goal_conditioned=True,
         discrete=False,
         encoder=ml_collections.config_dict.placeholder(str),
         dataset_class='SequenceDataset',
-        sequence_length=32,       # = horizon_length T; window length for SequenceDataset.
+        sequence_length=32,
         value_p_curgoal=0.0,
         value_p_trajgoal=1.0,
         value_p_randomgoal=0.0,
