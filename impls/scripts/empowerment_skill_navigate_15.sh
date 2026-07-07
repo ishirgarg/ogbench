@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-14
+#SBATCH --array=0-11
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
@@ -14,11 +14,10 @@ IDX=${SLURM_ARRAY_TASK_ID}
 # Sweep definitions
 # -----------------------------
 ENVS=(
-    antmaze-medium-navigate-v0
-    antsoccer-medium-navigate-v0
-    antsoccer-arena-navigate-v0
-    pointmaze-teleport-navigate-v0
-    visual-antmaze-medium-navigate-v0
+    antmaze-medium-stitch-v0
+    antsoccer-medium-stitch-v0
+    antsoccer-arena-stitch-v0
+    pointmaze-teleport-stitch-v0
 )
 BC_ALPHAS=(0.01 0.03 0.1)
 
@@ -30,12 +29,6 @@ ENV=${ENVS[$ENV_INDEX]}
 BC_ALPHA=${BC_ALPHAS[$BC_INDEX]}
 
 SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
-
-# Visual envs need a CNN encoder + smaller batch size to fit on GPU.
-EXTRA_ARGS=""
-if [[ "$ENV" == visual-* ]]; then
-    EXTRA_ARGS="--agent.batch_size=256 --agent.encoder=impala_small"
-fi
 
 # -----------------------------
 # Run
@@ -49,4 +42,4 @@ python main.py \
     --agent.num_skills=15 \
     --agent.bc_alpha=$BC_ALPHA \
     --train_steps=1500000 \
-    $EXTRA_ARGS
+    --video_episodes=0
