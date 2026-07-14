@@ -21,7 +21,7 @@ def _round_ste(z):
 
 def fsq_bound(z, levels, eps=1e-3):
     levels = levels.astype(z.dtype)
-    half_l = (levels - 1.0) * (1.0 - eps) / 2.0
+    half_l = (levels - 1.0) * (1.0 + eps) / 2.0
     offset = jnp.where(levels % 2 == 0, 0.5, 0.0)
     shift = jnp.arctanh(offset / half_l)
     return jnp.tanh(z + shift) * half_l - offset
@@ -53,30 +53,41 @@ def fsq_indices_to_codes(indices, levels):
     return (codes_non_centered.astype(jnp.float32) - half_width) / half_width
 
 
-# FSQ per-channel level factorizations by effective codebook size (== product).
-# The official get_fsq_level (skill_vae.py) values plus 15/50 for DDS-style
-# codebook-size sweeps (15 = [5,3] matches the official smallest; 50 = [10,5],
-# the exact product-50 factorization with all levels >= 3 — FSQ's tanh/arctanh
-# bound is undefined for level 2, so [5,5,2] is not usable).
-_FSQ_LEVELS = {
+_FSQ_LEVELS_BY_POWER = {
+    4: (5, 3),
+    6: (8, 8),
+    8: (8, 6, 5),
+    9: (8, 8, 8),
+    10: (8, 5, 5, 5),
+    11: (8, 8, 6, 5),
+    12: (7, 5, 5, 5, 5),
+}
+
+_FSQ_LEVELS_EXTRA = {
     15: (5, 3),
     50: (10, 5),
-    64: (8, 8),
-    240: (8, 6, 5),
-    512: (8, 8, 8),
-    1000: (8, 5, 5, 5),
-    1920: (8, 8, 6, 5),
-    4375: (7, 5, 5, 5, 5),
 }
 
 
 def get_fsq_level(codebook_size):
-    if codebook_size not in _FSQ_LEVELS:
+    if codebook_size in _FSQ_LEVELS_EXTRA:
+        return _FSQ_LEVELS_EXTRA[codebook_size]
+    power = int(np.log2(codebook_size))
+    if power not in _FSQ_LEVELS_BY_POWER:
         raise ValueError(
-            f'No FSQ level factorization registered for codebook_size={codebook_size}. '
-            f'Known sizes: {sorted(_FSQ_LEVELS)}. Set fsq_levels directly for others.'
+            f'No FSQ level factorization registered for codebook_size={codebook_size}.'
         )
-    return _FSQ_LEVELS[codebook_size]
+    return _FSQ_LEVELS_BY_POWER[power]
+
+
+def top_k_sampling(logits, k, temperature, key):
+    temp = jnp.maximum(temperature, 1e-8)
+    scaled = logits / temp
+    top_vals, top_idx = jax.lax.top_k(scaled, k)
+    choice = jax.random.categorical(key, top_vals, axis=-1)
+    sampled = jnp.take_along_axis(top_idx, choice[:, None], axis=-1)[:, 0]
+    greedy = jnp.argmax(logits, axis=-1)
+    return jnp.where(temperature == 0, greedy, sampled).astype(jnp.int32)
 
 
 class MultiHeadAttention(nn.Module):
@@ -112,18 +123,18 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, context=None, self_mask=None, cross_mask=None, deterministic=True):
-        h = nn.LayerNorm()(x)
+        h = nn.LayerNorm(epsilon=1e-5)(x)
         attn = MultiHeadAttention(self.dim, self.num_heads, self.dropout_rate, name='self_attn')(
             h, h, self_mask, deterministic=deterministic
         )
         x = x + nn.Dropout(self.dropout_rate)(attn, deterministic=deterministic)
         if self.cross:
-            xq = nn.LayerNorm()(x)
+            xq = nn.LayerNorm(epsilon=1e-5)(x)
             cattn = MultiHeadAttention(self.dim, self.num_heads, self.dropout_rate, name='cross_attn')(
                 xq, context, cross_mask, deterministic=deterministic
             )
             x = x + nn.Dropout(self.dropout_rate)(cattn, deterministic=deterministic)
-        y = nn.LayerNorm()(x)
+        y = nn.LayerNorm(epsilon=1e-5)(x)
         y = nn.Dense(self.dim * self.mlp_ratio)(y)
         y = nn.gelu(y, approximate=False)
         y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
@@ -173,7 +184,7 @@ class ActionEncoder(nn.Module):
         x = nn.Dense(self.dim)(action_chunk)
         for k, s in zip(self.conv_kernels, self.conv_strides):
             x = CausalConv1d(self.dim, k, s)(x)
-            x = nn.GroupNorm(num_groups=8)(x)
+            x = nn.GroupNorm(num_groups=8, epsilon=1e-5)(x)
             x = x * jnp.tanh(jax.nn.softplus(x))
         n = x.shape[1]
         x = x + sinusoidal_embedding(n, self.dim)[None]
@@ -220,35 +231,42 @@ class SkillPrior(nn.Module):
     dim: int
     num_layers: int
     num_heads: int
+    lowdim_embed_dim: int
     attn_pdrop: float = 0.0
     embd_pdrop: float = 0.0
+    goal_conditioned: bool = True
     gc_encoder: Optional[nn.Module] = None
 
     @nn.compact
-    def __call__(self, observations, goals, tokens, train=False):
+    def __call__(self, tokens, observations, goals, train=False):
         deterministic = not train
-        B = tokens.shape[0]
 
-        if self.gc_encoder is not None:
-            cond_in = self.gc_encoder(observations, goals)
-        elif goals is not None:
-            cond_in = jnp.concatenate([observations, goals], axis=-1)
-        else:
-            cond_in = observations
-        cond = MLP((self.dim, self.dim), activate_final=True)(cond_in)
-
-        tok_embed = nn.Embed(self.vocab_size, self.dim, name='tok_embed')
-        prev = tok_embed(tokens[:, : self.num_tokens - 1])
-        x = jnp.concatenate([cond[:, None, :], prev], axis=1)
+        tok_emb = nn.Embed(self.vocab_size + 1, self.dim, name='tok_emb')
+        x = tok_emb(tokens)
         x = x + sinusoidal_embedding(self.num_tokens, self.dim)[None]
+
+        obs_feat = self.gc_encoder(observations) if self.gc_encoder is not None else observations
+        obs_tok = nn.Dense(self.dim, name='obs_proj')(
+            nn.Dense(self.lowdim_embed_dim, name='obs_lowdim')(obs_feat)
+        )
+        context = [obs_tok]
+        if self.goal_conditioned and goals is not None:
+            goal_feat = self.gc_encoder(goals) if self.gc_encoder is not None else goals
+            goal_tok = nn.Dense(self.dim, name='goal_proj')(goal_feat)
+            context = [goal_tok, obs_tok]
+        context = jnp.stack(context, axis=1)
+
+        x = jnp.concatenate([context, x], axis=1)
         x = nn.Dropout(self.embd_pdrop)(x, deterministic=deterministic)
 
-        mask = _causal_mask(self.num_tokens)[None, None]
+        length = x.shape[1]
+        mask = _causal_mask(length)[None, None]
         for _ in range(self.num_layers):
             x = TransformerBlock(self.dim, self.num_heads, dropout_rate=self.attn_pdrop)(
                 x, self_mask=mask, deterministic=deterministic
             )
-        x = nn.LayerNorm()(x)
+        x = x[:, context.shape[1]:, :]
+        x = nn.LayerNorm(epsilon=1e-5)(x)
         return nn.Dense(self.vocab_size, name='head')(x)
 
 
@@ -291,19 +309,42 @@ class QueSTAgent(flax.struct.PyTreeNode):
         codes = fsq_quantize(z, self._levels)
         indices = fsq_codes_to_indices(jax.lax.stop_gradient(codes), self._levels)
         goals = batch.get('actor_goals') if self.config['goal_conditioned'] else None
+
+        B = indices.shape[0]
+        start = jnp.full((B, 1), self.config['vocab_size'], dtype=indices.dtype)
+        x_in = jnp.concatenate([start, indices[:, :-1]], axis=1)
+
         prior_kwargs = {}
         if train:
-            prior_kwargs = {'rngs': {'dropout': rng}}
+            rng, r_drop = jax.random.split(rng)
+            prior_kwargs = {'rngs': {'dropout': r_drop}}
         logits = self.network.select('prior')(
-            batch['observations'], goals, indices, params=grad_params, train=train, **prior_kwargs
+            x_in, batch['observations'], goals, params=grad_params, train=train, **prior_kwargs
         )
-        ce = optax.softmax_cross_entropy_with_integer_labels(logits, indices)
-        ce = ce.mean()
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, indices).mean()
         acc = (logits.argmax(axis=-1) == indices).mean()
-        return ce, {
+
+        l1 = jnp.array(0.0)
+        if self.config['l1_loss_scale'] > 0:
+            dec_kwargs = {}
+            if train:
+                rng, r_sample, r_dec = jax.random.split(rng, 3)
+                sampled = jax.random.categorical(r_sample, logits, axis=-1)
+                dec_kwargs = {'rngs': {'dropout': r_dec}}
+            else:
+                sampled = jnp.argmax(logits, axis=-1)
+            sampled = jax.lax.stop_gradient(sampled)
+            recon = self.network.select('decoder')(
+                fsq_indices_to_codes(sampled, self._levels), params=grad_params, train=train, **dec_kwargs
+            )
+            l1 = jnp.abs(recon - chunk).mean()
+
+        total = ce + self.config['l1_loss_scale'] * l1
+        return total, {
             'prior_ce': ce,
             'prior_token_acc': acc,
             'prior_perplexity': jnp.exp(ce),
+            'prior_l1': l1,
         }
 
     @jax.jit
@@ -353,27 +394,24 @@ class QueSTAgent(flax.struct.PyTreeNode):
     def _sample_tokens(self, observations, goals, rng, temperature):
         B = observations.shape[0]
         n = self.config['num_tokens']
-        top_k = self.config['top_k']
-
-        def sample_one(logits, key):
-            kth = jax.lax.top_k(logits, top_k)[0][:, -1:]
-            logits = jnp.where(logits < kth, jnp.finfo(logits.dtype).min, logits)
-            greedy = logits.argmax(axis=-1)
-            scaled = logits / jnp.maximum(temperature, 1e-8)
-            sampled = jax.random.categorical(key, scaled, axis=-1)
-            return jnp.where(temperature == 0, greedy, sampled)
+        k = self.config['top_k']
+        start = self.config['vocab_size']
 
         def body(i, carry):
-            tokens, key = carry
+            tokens, out, key = carry
             key, sub = jax.random.split(key)
-            logits = self.network.select('prior')(observations, goals, tokens)
-            next_tok = sample_one(logits[:, i, :], sub)
-            tokens = tokens.at[:, i].set(next_tok)
-            return tokens, key
+            logits = self.network.select('prior')(tokens, observations, goals)
+            s = top_k_sampling(logits[:, i, :], k, temperature, sub)
+            out = out.at[:, i].set(s)
+            tokens = jnp.where(
+                i + 1 < n, tokens.at[:, jnp.clip(i + 1, 0, n - 1)].set(s), tokens
+            )
+            return tokens, out, key
 
-        tokens0 = jnp.zeros((B, n), dtype=jnp.int32)
-        tokens, _ = jax.lax.fori_loop(0, n, body, (tokens0, rng))
-        return tokens
+        tokens0 = jnp.zeros((B, n), dtype=jnp.int32).at[:, 0].set(start)
+        out0 = jnp.zeros((B, n), dtype=jnp.int32)
+        _, out, _ = jax.lax.fori_loop(0, n, body, (tokens0, out0, rng))
+        return out
 
     @jax.jit
     def sample_actions(self, observations, goals=None, seed=None, temperature=1.0):
@@ -407,6 +445,9 @@ class QueSTAgent(flax.struct.PyTreeNode):
         T = config['horizon_length']
         F = config['downsample_factor']
         assert T % F == 0, 'horizon_length must be divisible by downsample_factor.'
+        assert int(np.prod(config['conv_strides'])) == F, (
+            'product(conv_strides) must equal downsample_factor so the encoder output length == num_tokens.'
+        )
         assert config['sequence_length'] == T, (
             'sequence_length must equal horizon_length so actions_seq spans the chunk.'
         )
@@ -429,7 +470,7 @@ class QueSTAgent(flax.struct.PyTreeNode):
         prior_encoder = None
         if config.get('encoder') is not None:
             enc = encoder_modules[config['encoder']]
-            prior_encoder = GCEncoder(concat_encoder=enc())
+            prior_encoder = GCEncoder(state_encoder=enc())
 
         encoder_def = ActionEncoder(
             dim=config['ae_dim'],
@@ -455,8 +496,10 @@ class QueSTAgent(flax.struct.PyTreeNode):
             dim=config['prior_dim'],
             num_layers=config['prior_layers'],
             num_heads=config['prior_heads'],
+            lowdim_embed_dim=config['lowdim_embed_dim'],
             attn_pdrop=config['attn_pdrop'],
             embd_pdrop=config['embd_pdrop'],
+            goal_conditioned=config['goal_conditioned'],
             gc_encoder=prior_encoder,
         )
 
@@ -472,13 +515,10 @@ class QueSTAgent(flax.struct.PyTreeNode):
             init_rng,
             encoder=(ex_chunk,),
             decoder=(ex_codes,),
-            prior=(ex_observations, ex_goals, ex_tokens),
+            prior=(ex_tokens, ex_observations, ex_goals),
         )['params']
 
-        # Two-run stage split: for stage='prior', load the trained autoencoder
-        # (encoder+decoder) params from a stage='ae' run's checkpoint and keep a
-        # FRESH optimizer for the prior (fresh Adam bias-correction, fresh cosine)
-        # — bit-exactly reproducing the official's separate stage-0/stage-1 jobs.
+
         if stage == 'prior' and config.get('restore_ae_path') is not None:
             candidates = glob.glob(config['restore_ae_path'])
             assert len(candidates) == 1, f'restore_ae_path matched {len(candidates)} dirs: {candidates}'
@@ -503,27 +543,39 @@ class QueSTAgent(flax.struct.PyTreeNode):
 
         lr = config['lr']
         alpha = (config['lr_eta_min'] / lr) if lr > 0 else 0.0
+        finetune = config['l1_loss_scale'] > 0
 
         def _cos(n):
             return optax.cosine_decay_schedule(lr, max(int(n), 1), alpha)
         _zero = optax.constant_schedule(0.0)
 
         if stage == 'ae':
-            ae_sched, prior_sched = _cos(config['total_steps']), _zero
+            enc_sched = dec_sched = _cos(config['total_steps'])
+            prior_sched = _zero
         elif stage == 'prior':
-            ae_sched, prior_sched = _zero, _cos(config['total_steps'])
+            enc_sched = _zero
+            prior_sched = _cos(config['total_steps'])
+            dec_sched = _cos(config['total_steps']) if finetune else _zero
         elif config['joint_training']:
-            ae_sched = prior_sched = _cos(config['total_steps'])
+            enc_sched = dec_sched = prior_sched = _cos(config['total_steps'])
         else:
             s1 = max(int(config['stage1_steps']), 1)
             s2 = max(int(config['total_steps']) - s1, 1)
-            ae_sched = optax.join_schedules([_cos(s1), _zero], boundaries=[s1])
+            enc_sched = optax.join_schedules([_cos(s1), _zero], boundaries=[s1])
             prior_sched = optax.join_schedules([_zero, _cos(s2)], boundaries=[s1])
+            dec_sched = optax.join_schedules(
+                [_cos(s1), _cos(s2) if finetune else _zero], boundaries=[s1]
+            )
 
         def _param_labels(params):
             def label(path, leaf):
                 name = '/'.join(str(getattr(k, 'key', k)) for k in path).lower()
-                group = 'prior' if 'prior' in name else 'ae'
+                if 'prior' in name:
+                    group = 'prior'
+                elif 'decoder' in name:
+                    group = 'decoder'
+                else:
+                    group = 'encoder'
                 is_norm_or_embed = ('norm' in name) or ('embed' in name)
                 decay = (leaf.ndim >= 2) and (not is_norm_or_embed)
                 return f'{group}_{"decay" if decay else "nodecay"}'
@@ -538,8 +590,10 @@ class QueSTAgent(flax.struct.PyTreeNode):
             optax.clip_by_global_norm(config['grad_clip']),
             optax.multi_transform(
                 {
-                    'ae_decay': _adamw(ae_sched, wd),
-                    'ae_nodecay': _adamw(ae_sched, 0.0),
+                    'encoder_decay': _adamw(enc_sched, wd),
+                    'encoder_nodecay': _adamw(enc_sched, 0.0),
+                    'decoder_decay': _adamw(dec_sched, wd),
+                    'decoder_nodecay': _adamw(dec_sched, 0.0),
                     'prior_decay': _adamw(prior_sched, wd),
                     'prior_nodecay': _adamw(prior_sched, 0.0),
                 },
@@ -575,8 +629,10 @@ def get_config():
         prior_dim=384,
         prior_layers=6,
         prior_heads=6,
+        lowdim_embed_dim=128,
         top_k=5,
         prior_weight=1.0,
+        l1_loss_scale=0.0,
         stage='both',
         stage1_steps=500000,
         joint_training=False,

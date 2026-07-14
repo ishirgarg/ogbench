@@ -30,7 +30,8 @@
 #   6-layer/6-head causal transformer, token cross-entropy; top_k 5.
 #   Dropout 0.1 (attn + embd). Optimizer: AdamW(lr 1e-4, wd 1e-4, betas
 #   0.9/0.999, no decay on norms/biases/embeddings), CosineAnnealingLR -> 1e-5,
-#   global-norm grad clip 100. batch_size 128.
+#   global-norm grad clip 100. batch_size: 256 for Stage I autoencoder
+#   (config/train_autoencoder.yaml), 128 for Stage II prior (config/train_base.yaml).
 #
 #   Each array task runs the two stages as TWO SEQUENTIAL python commands in the
 #   SAME job — exactly like the official pipeline (autoencoder.sh then main.sh):
@@ -102,9 +103,11 @@ python main.py \
     --agent=agents/quest.py \
     --agent.codebook_size=$K \
     --agent.stage=ae \
+    --agent.batch_size=256 \
     --agent.total_steps=500000 \
     --seed=$SEED \
     --train_steps=500000 \
+    --eval_interval=1000000 \
     --save_interval=500000 \
     --video_episodes=0 \
     --save_dir=$SAVE_DIR \
