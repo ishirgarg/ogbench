@@ -21,6 +21,56 @@ from utils.flax_utils import restore_agent
 from utils.log_utils import reshape_video
 
 
+# Step intervals at which to drop a color-coded marker along each skill path.
+INTERVAL_STEPS = [500, 1000, 1500, 2000, 2500, 3000]
+
+
+def _raise_time_limit(env, min_steps):
+    """Lift the env's TimeLimit so rollouts can run the full requested horizon.
+
+    These envs wrap a gymnasium TimeLimit with max_episode_steps=1000, so a
+    rollout would truncate at step 1000 no matter how many steps we ask for.
+    Walk the wrapper chain and bump every _max_episode_steps (and the spec) to
+    at least min_steps + 1 so `truncated` only fires at our horizon.
+    """
+    target = int(min_steps) + 1
+    e = env
+    while e is not None:
+        if getattr(e, "_max_episode_steps", None) is not None and e._max_episode_steps < target:
+            e._max_episode_steps = target
+        e = getattr(e, "env", None)
+    spec = getattr(env, "spec", None)
+    if spec is not None and getattr(spec, "max_episode_steps", None) is not None \
+            and spec.max_episode_steps < target:
+        spec.max_episode_steps = target
+
+
+def _draw_interval_dots(ax, xy_per_skill, intervals=INTERVAL_STEPS):
+    """Drop a small color-coded dot on every skill path at each step interval.
+
+    xy_traj index t == env step t (index 0 is the start state), so the dot for
+    interval `step` lives at xy[step] when the trajectory ran that long. All
+    dots for a given interval share one color (from tab10) so it's clear which
+    marker corresponds to which step across skills. Returns legend handles.
+    """
+    cmap = plt.get_cmap('tab10')
+    handles = []
+    for j, step in enumerate(intervals):
+        color = cmap(j % 10)
+        xs, ys = [], []
+        for xy in xy_per_skill:
+            if len(xy) > step:
+                xs.append(float(xy[step, 0]))
+                ys.append(float(xy[step, 1]))
+        if xs:
+            ax.scatter(xs, ys, c=[color], s=14, marker='o', edgecolors='black',
+                       linewidths=0.3, zorder=7)
+        handles.append(plt.Line2D([0], [0], marker='o', linestyle='', color=color,
+                                   markeredgecolor='black', markersize=5,
+                                   label=f"step {step}"))
+    return handles
+
+
 def _latest_run_dir(ckpt_root: str) -> str:
     run_dirs = [p for p in glob.glob(os.path.join(ckpt_root, "*")) if os.path.isdir(p)]
     if not run_dirs:
@@ -159,6 +209,8 @@ def plot_skill_paths_ant(xy_per_skill, ant_start_xy, overlay_maze, extent,
                marker='o', edgecolors='white', linewidths=0.8, zorder=5,
                label='Ant start')
 
+    interval_handles = _draw_interval_dots(ax, xy_per_skill)
+
     x_lo, x_hi, y_lo, y_hi = extent
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
@@ -168,7 +220,10 @@ def plot_skill_paths_ant(xy_per_skill, ant_start_xy, overlay_maze, extent,
     if title is not None:
         ax.set_title(title)
     if K <= 15:
-        ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
+        skill_leg = ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
+        ax.add_artist(skill_leg)
+    ax.legend(handles=interval_handles, loc='lower left', fontsize=6,
+              framealpha=0.85, title='interval')
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=180)
@@ -238,7 +293,7 @@ def main():
         help="Render the empowerment map. On by default; pass --no-skill_map "
              "to skip the (slow) map computation.",
     )
-    parser.add_argument("--video_steps", type=int, default=500)
+    parser.add_argument("--video_steps", type=int, default=3000)
     parser.add_argument("--video_frame_skip", type=int, default=3)
     parser.add_argument("--video_fps", type=int, default=15)
     parser.add_argument("--video_ant_xy", type=str, default=None,
@@ -338,6 +393,9 @@ def main():
     # ── Skill-rollout branch (video grid + ant-path plot) ──────────────────
     if args.skill_video or args.skill_paths:
         num_skills = int(agent_cfg.get('num_skills'))
+
+        # Lift the 1000-step TimeLimit so paths run the full requested horizon.
+        _raise_time_limit(env, args.video_steps)
 
         if args.video_ant_xy is not None:
             ax_, ay_ = _parse_xy(args.video_ant_xy)
