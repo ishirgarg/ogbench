@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-11
+#SBATCH --array=0-7
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
@@ -19,11 +19,11 @@ ENVS=(
     antsoccer-arena-stitch-v0
     pointmaze-teleport-stitch-v0
 )
-BC_ALPHAS=(0.01 0.03 0.1)
+BC_ALPHAS=(0.01 0.03)
 
 # Decode index: ENV outer, BC inner.
-ENV_INDEX=$((IDX / 3))
-BC_INDEX=$((IDX % 3))
+ENV_INDEX=$((IDX / 2))
+BC_INDEX=$((IDX % 2))
 
 ENV=${ENVS[$ENV_INDEX]}
 BC_ALPHA=${BC_ALPHAS[$BC_INDEX]}
