@@ -10,6 +10,7 @@ from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
 from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
+from agents.opal import OPALAgent
 from agents.qrl import QRLAgent
 from agents.quest import QueSTAgent
 from agents.sac import SACAgent
@@ -30,6 +31,7 @@ agents = dict(
     gciql=GCIQLAgent,
     gcivl=GCIVLAgent,
     hiql=HIQLAgent,
+    opal=OPALAgent,
     qrl=QRLAgent,
     quest=QueSTAgent,
     sac=SACAgent,
