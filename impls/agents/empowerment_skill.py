@@ -819,6 +819,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         info['bc/alpha'] = alpha
         
         total = q_loss + v_loss + pi_loss + alpha * bc_loss
+        info['total_loss'] = total
         jax.lax.cond(
             jnp.isnan(total),
             lambda: jax.debug.print("⚠️ NaN in total_loss: {x}", x=total, ordered=True),
