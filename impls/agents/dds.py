@@ -957,12 +957,15 @@ def get_config():
         dict(
             # ── Agent ───────────────────────────────────────────────────────
             agent_name='dds',                # Agent name.
+            # NOTE: shared constants below are matched to
+            # agents/empowerment_skill.py for a like-for-like empowerment
+            # comparison (paper defaults noted per line).
             batch_size=256,                  # IQL/high-level batch size (paper Table 7).
             skill_batch_size=128,            # Skill VQ-VAE batch size (paper Table 6).
-            skill_lr=5e-5,                   # Skill optimizer lr (paper Table 6).
-            iql_lr=1e-4,                     # IQL/AWR optimizer lr (paper Table 7).
+            skill_lr=3e-4,                   # Matched (paper Table 6: 5e-5).
+            iql_lr=3e-4,                     # Matched (paper Table 7: 1e-4).
             # ── VQ skill model (Sec. 3.2, Eq. 14) ──────────────────────────
-            num_skills=16,                   # Codebook size K (paper default 16; swept 4-32).
+            num_skills=15,                   # Matched (paper default 16; swept 4-32).
             skill_dim=128,                   # Skill / codebook latent dim D_z (paper Table 6).
             commitment_beta=0.25,            # VQ commitment coefficient beta (paper Eq. 14).
             subgoal_steps=10,                # Skill horizon H (paper default 10).
@@ -980,8 +983,8 @@ def get_config():
             beta_min=0.1,                    # VP schedule beta_min (paper Table 5).
             beta_max=10.0,                   # VP schedule beta_max (paper Table 5).
             # ── High-level IQL value + AWR policy (Sec. 3.3) ────────────────
-            value_hidden_dims=(256, 256),    # Value / skill-indexed critic hidden dims (paper: 2x256).
-            actor_hidden_dims=(256, 256),    # High-level (code) policy hidden dims (paper: 2x256).
+            value_hidden_dims=(512, 512, 512),  # Matched (paper: 2x256).
+            actor_hidden_dims=(512, 512, 512),  # Matched (paper: 2x256).
             layer_norm=True,                 # Layer normalization.
             discount=0.99,                   # Discount factor (paper Table 7).
             tau=0.005,                       # Target value soft-update / EMA (paper Table 7).
