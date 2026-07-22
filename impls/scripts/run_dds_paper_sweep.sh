@@ -6,14 +6,13 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-9
+#SBATCH --array=0-7
 
 # Discrete Diffusion Skills (DDS) — faithful OGBench re-implementation of
 # "Offline RL with Discrete Diffusion Skills" (arXiv:2503.20176), trained purely
-# offline (agents/dds.py). This sweep runs DDS on five OGBench datasets:
+# offline (agents/dds.py). This sweep runs DDS on the four antmaze/antsoccer datasets:
 #     antmaze-medium-navigate-v0     (continuous action, diffusion decoder)
 #     antsoccer-arena-navigate-v0    (continuous action, diffusion decoder)
-#     pointmaze-teleport-navigate-v0 (continuous action, diffusion decoder)
 #     antmaze-medium-stitch-v0       (continuous action, diffusion decoder)
 #     antsoccer-arena-stitch-v0      (continuous action, diffusion decoder)
 #
@@ -36,12 +35,12 @@
 #   We sweep K in {15, 50}. Everything else is held at the paper defaults.
 #   Single seed (0); no seed sweep.
 #
-#   Full sweep = 5 envs x 2 K-values = 10 runs  ->  --array=0-9
+#   Full sweep = 4 envs x 2 K-values = 8 runs  ->  --array=0-7
 #
 # Index decoding (ENV outer, K inner):
-#   IDX     = SLURM_ARRAY_TASK_ID              (0..9)
+#   IDX     = SLURM_ARRAY_TASK_ID              (0..7)
 #   K_IDX   = IDX % 2                           (0..1)
-#   ENV_IDX = IDX / 2                           (0..4)
+#   ENV_IDX = IDX / 2                           (0..3)
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
@@ -49,7 +48,6 @@ IDX=${SLURM_ARRAY_TASK_ID}
 ENVS=(
     antmaze-medium-navigate-v0
     antsoccer-arena-navigate-v0
-    pointmaze-teleport-navigate-v0
     antmaze-medium-stitch-v0
     antsoccer-arena-stitch-v0
 )

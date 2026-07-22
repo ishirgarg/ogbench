@@ -2,11 +2,11 @@
 #SBATCH --job-name=opal_paper_sweep
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-4
+#SBATCH --array=0-3
 
 # OPAL — faithful OGBench re-implementation of the OFFLINE VAE skill-controller
 # pretraining used by SUPE ("Leveraging Skills from Unlabeled Prior Data for
@@ -16,10 +16,9 @@
 # Only the low-level skill controller (the VAE) is learned; the SUPE/OPAL IQL
 # high-level skill policy ("reward labeling") and online exploration are omitted.
 #
-# This sweep runs OPAL on the SAME five OGBench datasets as the QueST sweep:
+# This sweep runs OPAL on the four antmaze/antsoccer datasets:
 #     antmaze-medium-navigate-v0     (continuous action)
 #     antsoccer-arena-navigate-v0    (continuous action)
-#     pointmaze-teleport-navigate-v0 (continuous action)
 #     antmaze-medium-stitch-v0       (continuous action)
 #     antsoccer-arena-stitch-v0      (continuous action)
 # All are continuous-action, state-based tasks — OPAL's target setting
@@ -42,11 +41,11 @@
 #   jointly in ONE stage, so this is a single python command per run.
 #
 # ── What is swept ──────────────────────────────────────────────────────────────
-#   Just the five envs (single seed 0, all other hyperparameters at the faithful
-#   OPAL defaults).  Full sweep = 5 envs  ->  --array=0-4
+#   Just the four envs (single seed 0, all other hyperparameters at the faithful
+#   OPAL defaults).  Full sweep = 4 envs  ->  --array=0-3
 #
 # Index decoding:
-#   IDX = SLURM_ARRAY_TASK_ID   (0..4)  -> ENV index
+#   IDX = SLURM_ARRAY_TASK_ID   (0..3)  -> ENV index
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
@@ -54,7 +53,6 @@ IDX=${SLURM_ARRAY_TASK_ID}
 ENVS=(
     antmaze-medium-navigate-v0
     antsoccer-arena-navigate-v0
-    pointmaze-teleport-navigate-v0
     antmaze-medium-stitch-v0
     antsoccer-arena-stitch-v0
 )
