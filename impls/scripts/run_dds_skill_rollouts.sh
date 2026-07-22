@@ -19,6 +19,12 @@ NGPU=${#GPUS[@]}
 STEPS=${STEPS:-3000}
 export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.3}
 
+# Central ant start position per env family (world x,y). Overridable via env vars.
+# antmaze-medium: (8,8) is the most central *free* maze cell (true center borders a wall).
+# antsoccer-arena: (10,10) is the true center of the open arena.
+ANTMAZE_XY=${ANTMAZE_XY:-8,8}
+ANTSOCCER_XY=${ANTSOCCER_XY:-10,10}
+
 ENV_DIRS=(
   "antmaze-medium-navigate-v0"
   "antmaze-medium-stitch-v0"
@@ -41,10 +47,11 @@ echo "Dispatching ${#RUN_DIRS[@]} DDS runs across GPUs: ${GPUS[*]}  (steps=$STEP
 i=0
 for run_dir in "${RUN_DIRS[@]}"; do
   gpu=${GPUS[$((i % NGPU))]}
+  if [[ "$run_dir" == *antsoccer* ]]; then ant_xy="$ANTSOCCER_XY"; else ant_xy="$ANTMAZE_XY"; fi
   log="logs/dds_paths_$(echo "$run_dir" | tr '/' '_').log"
-  echo "[gpu $gpu] $run_dir -> $log"
+  echo "[gpu $gpu] $run_dir  ant_xy=$ant_xy -> $log"
   CUDA_VISIBLE_DEVICES=$gpu python plot_dds_skill_paths.py \
-    --run_dir "$run_dir" --steps "$STEPS" > "$log" 2>&1 &
+    --run_dir "$run_dir" --steps "$STEPS" --ant_xy "$ant_xy" > "$log" 2>&1 &
   i=$((i + 1))
   (( i % NGPU == 0 )) && wait
 done
