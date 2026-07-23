@@ -5,6 +5,7 @@ from agents.ddpgbc import DDPGBCAgent
 from agents.dds import DDSAgent
 from agents.empowerment_crl import EmpowermentCRLAgent
 from agents.empowerment_crl_flowbc import EmpowermentCRLFlowBCAgent
+from agents.empowerment_dads import EmpowermentDADSAgent
 from agents.empowerment_dv import EmpowermentDVAgent
 from agents.empowerment_opal_dads import EmpowermentOPALDADSAgent
 from agents.empowerment_skill import EmpowermentAgent as EmpowermentSkillAgent
@@ -28,6 +29,7 @@ agents = dict(
     dds=DDSAgent,
     empowerment_crl=EmpowermentCRLAgent,
     empowerment_crl_flowbc=EmpowermentCRLFlowBCAgent,
+    empowerment_dads=EmpowermentDADSAgent,
     empowerment_dv=EmpowermentDVAgent,
     empowerment_opal_dads=EmpowermentOPALDADSAgent,
     empowerment_skill=EmpowermentSkillAgent,
