@@ -18,34 +18,41 @@
 #
 #   Full sweep = 4 agents x 2 envs = 8 runs  ->  --array=0-7
 #
-# Agents are ordered so that the last two launched runs (IDX 6,7) are the
-# normal empowerment_crl on each env.
+# Launch order (explicit per-index schedule):
+#   IDX 0-2 : the three comparison agents on antsoccer
+#   IDX 3-5 : the three comparison agents on antmaze
+#   IDX 6-7 : the normal empowerment_crl on each env (launched last)
 #
-# Index decoding (AGENT outer, ENV inner):
-#   IDX       = SLURM_ARRAY_TASK_ID   (0..7)
-#   ENV_IDX   = IDX % 2               (0..1)
-#   AGENT_IDX = IDX / 2               (0..3)
+#   IDX = SLURM_ARRAY_TASK_ID   (0..7)
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
 # ── Sweep definitions ─────────────────────────────────────────────────────────
-ENVS=(
-    antmaze-medium-navigate-v0
-    antsoccer-arena-navigate-v0
+# Parallel arrays: RUN_ENVS[$IDX] / RUN_AGENTS[$IDX] give the (env, agent) pair.
+RUN_ENVS=(
+    antsoccer-arena-navigate-v0   # 0
+    antsoccer-arena-navigate-v0   # 1
+    antsoccer-arena-navigate-v0   # 2
+    antmaze-medium-navigate-v0    # 3
+    antmaze-medium-navigate-v0    # 4
+    antmaze-medium-navigate-v0    # 5
+    antsoccer-arena-navigate-v0   # 6
+    antmaze-medium-navigate-v0    # 7
 )
-AGENTS=(
-    empowerment_crl_flowbc
-    empowerment_opal_dads
-    empowerment_dv
-    empowerment_crl
+RUN_AGENTS=(
+    empowerment_crl_flowbc        # 0
+    empowerment_opal_dads         # 1
+    empowerment_dv                # 2
+    empowerment_crl_flowbc        # 3
+    empowerment_opal_dads         # 4
+    empowerment_dv                # 5
+    empowerment_crl               # 6
+    empowerment_crl               # 7
 )
 SEED=0
 
-ENV_IDX=$((IDX % 2))
-AGENT_IDX=$((IDX / 2))
-
-ENV=${ENVS[$ENV_IDX]}
-AGENT=${AGENTS[$AGENT_IDX]}
+ENV=${RUN_ENVS[$IDX]}
+AGENT=${RUN_AGENTS[$IDX]}
 
 # 15 skills for the skill-based agent (empowerment_crl / _flowbc / _dv are
 # action-level and have no num_skills key).
