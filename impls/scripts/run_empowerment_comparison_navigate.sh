@@ -2,25 +2,29 @@
 #SBATCH --job-name=emp_comparison_navigate
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-5
+#SBATCH --array=0-7
 
 # Offline empowerment comparison on the two navigate envs, matched configs
-# (all three agents share lr 3e-4, batch 1024, (512,512,512) trunks,
-# layer_norm, discount 0.99; 15 skills where the agent has skills):
-#     empowerment_crl         — dual-CRL critics + distilled E(s)
+# (all agents share lr 3e-4, batch 1024, (512,512,512) trunks, layer_norm,
+# discount 0.99; 15 skills where the agent has skills):
 #     empowerment_crl_flowbc  — InfoNCE with flow-matching BC negatives
 #     empowerment_opal_dads   — discrete-skill stochastic EM + BA bracket
+#     empowerment_dv          — Donsker-Varadhan critic with flow-matching negatives
+#     empowerment_crl         — dual-CRL critics + distilled E(s)  (launched last)
 #
-#   Full sweep = 2 envs x 3 agents = 6 runs  ->  --array=0-5
+#   Full sweep = 4 agents x 2 envs = 8 runs  ->  --array=0-7
 #
-# Index decoding (ENV outer, AGENT inner):
-#   IDX       = SLURM_ARRAY_TASK_ID   (0..5)
-#   AGENT_IDX = IDX % 3               (0..2)
-#   ENV_IDX   = IDX / 3               (0..1)
+# Agents are ordered so that the last two launched runs (IDX 6,7) are the
+# normal empowerment_crl on each env.
+#
+# Index decoding (AGENT outer, ENV inner):
+#   IDX       = SLURM_ARRAY_TASK_ID   (0..7)
+#   ENV_IDX   = IDX % 2               (0..1)
+#   AGENT_IDX = IDX / 2               (0..3)
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
@@ -30,19 +34,20 @@ ENVS=(
     antsoccer-arena-navigate-v0
 )
 AGENTS=(
-    empowerment_crl
     empowerment_crl_flowbc
     empowerment_opal_dads
+    empowerment_dv
+    empowerment_crl
 )
 SEED=0
 
-AGENT_IDX=$((IDX % 3))
-ENV_IDX=$((IDX / 3))
+ENV_IDX=$((IDX % 2))
+AGENT_IDX=$((IDX / 2))
 
 ENV=${ENVS[$ENV_IDX]}
 AGENT=${AGENTS[$AGENT_IDX]}
 
-# 15 skills for the skill-based agent (empowerment_crl / _flowbc are
+# 15 skills for the skill-based agent (empowerment_crl / _flowbc / _dv are
 # action-level and have no num_skills key).
 EXTRA_FLAGS=""
 if [ "$AGENT" = "empowerment_opal_dads" ]; then
