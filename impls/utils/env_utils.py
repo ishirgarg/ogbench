@@ -8,6 +8,7 @@ import numpy as np
 from gymnasium.spaces import Box
 
 import ogbench
+from utils.dataset_slicing import make_sliced_datasets, parse_slice_token
 from utils.datasets import Dataset
 
 
@@ -171,12 +172,21 @@ def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None):
     surfaces — env step/reset, info['goal'], and the offline dataset arrays —
     is augmented with two extra channels.
 
+    A `-slice<K>-` token (e.g. `antmaze-medium-stitch-slice50-v0`) loads a
+    trajectory-sliced version of the dataset: each source trajectory is cut into
+    sub-trajectories of `K` transitions, each terminated at its own last state.
+    The sliced `.npz` is generated once into the regular dataset directory
+    (`~/.ogbench/data`) under that same name and cached there afterwards. The env
+    itself is unchanged (the token is stripped before the env is built). See
+    `utils/dataset_slicing.py`.
+
     Args:
         dataset_name: Name of the dataset.
         frame_stack: Number of frames to stack.
         dataset_path: (Optional) Path to a custom `.npz` dataset file. When set, the env is still built from
             `dataset_name` (so the environment and evaluation tasks are unchanged), but the offline data is loaded
-            from this file (and the matching `-val.npz`) instead of the default download location.
+            from this file (and the matching `-val.npz`) instead of the default download location. Takes precedence
+            over a `-slice<K>-` token.
 
     Returns:
         A tuple of the environment, training dataset, and validation dataset.
@@ -184,6 +194,11 @@ def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None):
     splits = dataset_name.split('-')
     is_colored = 'colored' in splits
     underlying_name = '-'.join(t for t in splits if t != 'colored') if is_colored else dataset_name
+
+    # Strip the slice token (if any) from the name and point the loader at the sliced file instead.
+    underlying_name, slice_length = parse_slice_token(underlying_name)
+    if slice_length is not None and dataset_path is None:
+        dataset_path = make_sliced_datasets(underlying_name, slice_length)
 
     # Use compact dataset to save memory.
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(
