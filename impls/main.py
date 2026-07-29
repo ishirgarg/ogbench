@@ -162,6 +162,16 @@ def main(_):
         else:
             print(f'[resume] No matching checkpoint under {FLAGS.save_dir}; starting fresh.')
 
+    # A run whose latest checkpoint already reached train_steps has an empty training
+    # loop. Bail out BEFORE wandb.init: attaching and exiting cleanly would finalize the
+    # run as `finished`, silently flipping a crashed run to done in the dashboard.
+    if resume_epoch is not None and resume_epoch >= FLAGS.train_steps:
+        print(
+            f'[resume] {resume_dir} is already at step {resume_epoch} >= --train_steps={FLAGS.train_steps}; '
+            f'nothing to train. Pass a larger --train_steps to extend it. Leaving wandb untouched.'
+        )
+        return
+
     # Set up logger.
     if resume_dir is not None:
         exp_name = os.path.basename(resume_dir)

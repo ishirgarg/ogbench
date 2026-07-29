@@ -45,5 +45,6 @@ python main.py \
     --agent.num_skills=15 \
     --seed=$SEED \
     --train_steps=1000000 \
+    --save_interval=25000 \
     --video_episodes=0 \
     --save_dir=$SAVE_DIR
