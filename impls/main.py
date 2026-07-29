@@ -7,6 +7,7 @@ import time
 from collections import defaultdict
 
 import jax
+import ml_collections
 import numpy as np
 import tqdm
 import wandb
@@ -33,6 +34,11 @@ flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 flags.DEFINE_bool('resume', False, 'Auto-resume the latest crashed run for this run_group+seed.')
+flags.DEFINE_string(
+    'resume_dir', None,
+    'Resume this exact run directory (the folder holding flags.json / params_*.pkl), continuing from its latest '
+    'checkpoint and re-attaching to its wandb run. Takes precedence over --resume.',
+)
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -49,6 +55,43 @@ flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
+# Flags replayed from the resumed run's flags.json under --resume_dir. `save_dir`,
+# `restore_*` and `resume*` are excluded: --resume_dir names the run folder itself.
+RESUME_REPLAY_FLAGS = (
+    'run_group',
+    'seed',
+    'env_name',
+    'dataset_path',
+    'train_steps',
+    'log_interval',
+    'eval_interval',
+    'save_interval',
+    'eval_tasks',
+    'eval_episodes',
+    'eval_temperature',
+    'eval_gaussian',
+    'video_episodes',
+    'video_frame_skip',
+    'eval_on_cpu',
+)
+
+
+def restore_config(config, saved):
+    """Write a `flags.json` agent dict back into the live agent ConfigDict.
+
+    JSON has no tuples, so sequence fields (hidden dims, ...) come back as lists and
+    would trip ml_collections' type check on assignment; they are coerced back to the
+    field's own type. Nested sub-configs are restored recursively.
+    """
+    for key, value in saved.items():
+        current = config[key] if key in config else None
+        if isinstance(current, ml_collections.ConfigDict) and isinstance(value, dict):
+            restore_config(current, value)
+        elif isinstance(current, tuple) and isinstance(value, list):
+            config[key] = tuple(value)
+        else:
+            config[key] = value
+
 
 def main(_):
     # Auto-resume: scan every run folder under save_dir, match on the `agent` config dict,
@@ -56,7 +99,36 @@ def main(_):
     resume_dir = None
     resume_epoch = None
     resume_run_id = None
-    if FLAGS.resume:
+    if FLAGS.resume_dir is not None:
+        resume_dir = FLAGS.resume_dir.rstrip('/')
+        ckpts = glob.glob(os.path.join(resume_dir, 'params_*.pkl'))
+        if not ckpts:
+            raise FileNotFoundError(f'[resume] No params_*.pkl under {resume_dir}.')
+        resume_epoch = max(int(re.search(r'params_(\d+)\.pkl', p).group(1)) for p in ckpts)
+
+        # Replay the original run's configuration from its own flags.json, so relaunching
+        # only needs --resume_dir. The agent config is restored wholesale (the checkpoint
+        # only loads into a network built from it); training flags are restored only where
+        # the relaunch left them at their default, so anything passed explicitly still wins.
+        with open(os.path.join(resume_dir, 'flags.json')) as f:
+            saved = json.load(f)
+        if FLAGS.agent['agent_name'] != saved['agent']['agent_name']:
+            raise ValueError(
+                f'[resume] {resume_dir} was trained with agent "{saved["agent"]["agent_name"]}" but this launch '
+                f'passed "{FLAGS.agent["agent_name"]}". Add --agent=agents/{saved["agent"]["agent_name"]}.py.'
+            )
+        restore_config(FLAGS.agent, saved['agent'])
+        for key in RESUME_REPLAY_FLAGS:
+            if key in saved and FLAGS[key].using_default_value:
+                FLAGS[key].value = saved[key]
+        id_path = os.path.join(resume_dir, 'wandb_run_id.txt')
+        if os.path.exists(id_path):
+            with open(id_path) as f:
+                resume_run_id = f.read().strip()
+        else:
+            print(f'[resume] {id_path} missing; a NEW wandb run will be created.')
+        print(f'[resume] Resuming {resume_dir} from epoch {resume_epoch} (wandb id={resume_run_id}).')
+    elif FLAGS.resume:
         current_agent = FLAGS.agent.to_dict() if hasattr(FLAGS.agent, 'to_dict') else dict(FLAGS.agent)
         matches = []
         for flags_path in glob.glob(os.path.join(FLAGS.save_dir, '**', 'flags.json'), recursive=True):
@@ -70,6 +142,10 @@ def main(_):
             except (json.JSONDecodeError, OSError):
                 continue
             if saved.get('agent') != current_agent:
+                continue
+            # The agent config alone does not pin down a run: two seeds / two envs of the
+            # same sweep share it. Match those explicitly so --resume cannot cross-attach.
+            if (saved.get('env_name'), saved.get('seed')) != (FLAGS.env_name, FLAGS.seed):
                 continue
             epochs = [int(re.search(r'params_(\d+)\.pkl', p).group(1)) for p in ckpts]
             matches.append((os.path.getmtime(cand), cand, max(epochs)))
