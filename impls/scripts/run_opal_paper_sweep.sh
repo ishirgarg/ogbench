@@ -61,9 +61,8 @@ SEED=0
 ENV=${ENVS[$IDX]}
 
 SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
-RUN_GROUP="opal_${ENV}"
 
-echo "IDX=$IDX  ENV=$ENV  SEED=$SEED  RUN_GROUP=$RUN_GROUP"
+echo "IDX=$IDX  ENV=$ENV  SEED=$SEED"
 
 # ── Env ─────────────────────────────────────────────────────────────────────
 # mujoco rendering uses EGL; local wandb data goes to scratch (home quota is
@@ -81,5 +80,4 @@ python main.py \
     --seed=$SEED \
     --train_steps=1000000 \
     --video_episodes=0 \
-    --save_dir=$SAVE_DIR \
-    --run_group=$RUN_GROUP
+    --save_dir=$SAVE_DIR

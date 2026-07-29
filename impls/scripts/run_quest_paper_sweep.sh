@@ -80,10 +80,8 @@ ENV=${ENVS[$ENV_IDX]}
 K=${CODEBOOK_SIZES[$K_IDX]}
 
 SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
-AE_GROUP="quest_ae_${ENV}_K${K}"        # Stage I run group (autoencoder)
-RUN_GROUP="quest_${ENV}_K${K}"          # Stage II run group (prior; the eval run)
 
-echo "IDX=$IDX  ENV=$ENV  codebook_size(K)=$K  SEED=$SEED  RUN_GROUP=$RUN_GROUP"
+echo "IDX=$IDX  ENV=$ENV  codebook_size(K)=$K  SEED=$SEED"
 
 # ── Env ─────────────────────────────────────────────────────────────────────
 # mujoco rendering uses EGL; local wandb data goes to scratch (home quota is
@@ -97,7 +95,7 @@ set -e   # if Stage I fails, do not launch Stage II with no checkpoint to restor
 
 # ── Stage I — autoencoder (official stage 0) ───────────────────────────────────
 # Saves exactly one checkpoint (params_500000.pkl) at the end of the run under
-# $SAVE_DIR/OGBench/$AE_GROUP/<exp_name>/  (exp_name embeds this job's SLURM_JOB_ID).
+# $SAVE_DIR/OGBench/Debug/<exp_name>/  (exp_name embeds this job's SLURM_JOB_ID).
 python main.py \
     --env_name=$ENV \
     --agent=agents/quest.py \
@@ -110,8 +108,7 @@ python main.py \
     --eval_interval=1000000 \
     --save_interval=500000 \
     --video_episodes=0 \
-    --save_dir=$SAVE_DIR \
-    --run_group=$AE_GROUP
+    --save_dir=$SAVE_DIR
 
 # ── Stage II — prior (official stage 1) ────────────────────────────────────────
 # Restore ONLY the trained autoencoder params (fresh prior + fresh optimizer).
@@ -125,10 +122,9 @@ python main.py \
     --agent.codebook_size=$K \
     --agent.stage=prior \
     --agent.total_steps=500000 \
-    --agent.restore_ae_path="$SAVE_DIR/OGBench/$AE_GROUP/*${SLURM_JOB_ID}*" \
+    --agent.restore_ae_path="$SAVE_DIR/OGBench/Debug/*${SLURM_JOB_ID}*" \
     --agent.restore_ae_epoch=500000 \
     --seed=$SEED \
     --train_steps=500000 \
     --video_episodes=0 \
-    --save_dir=$SAVE_DIR \
-    --run_group=$RUN_GROUP
+    --save_dir=$SAVE_DIR

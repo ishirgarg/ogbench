@@ -62,9 +62,8 @@ if [ "$AGENT" = "empowerment_opal_dads" ]; then
 fi
 
 SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
-RUN_GROUP="emp_cmp_${AGENT}_${ENV}"
 
-echo "IDX=$IDX  ENV=$ENV  AGENT=$AGENT  SEED=$SEED  RUN_GROUP=$RUN_GROUP  EXTRA=$EXTRA_FLAGS"
+echo "IDX=$IDX  ENV=$ENV  AGENT=$AGENT  SEED=$SEED  EXTRA=$EXTRA_FLAGS"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 export MUJOCO_GL=egl
@@ -78,5 +77,4 @@ python main.py \
     --seed=$SEED \
     --train_steps=1000000 \
     --video_episodes=0 \
-    --save_dir=$SAVE_DIR \
-    --run_group=$RUN_GROUP
+    --save_dir=$SAVE_DIR

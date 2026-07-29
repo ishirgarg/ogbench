@@ -53,9 +53,8 @@ ENV=${ENVS[$CFG_IDX]}
 AGENT=${AGENTS[$CFG_IDX]}
 ALPHA=${ALPHAS[$CFG_IDX]}
 
-RUN_GROUP="${ENV}__${AGENT}_a${ALPHA}"
 
-echo "IDX=$IDX  ENV=$ENV  AGENT=$AGENT  ALPHA=$ALPHA  SEED=$SEED  GROUP=$RUN_GROUP"
+echo "IDX=$IDX  ENV=$ENV  AGENT=$AGENT  ALPHA=$ALPHA  SEED=$SEED"
 
 cd "$IMPLS_DIR"
 
@@ -65,5 +64,4 @@ python main.py \
         --agent=agents/${AGENT}.py \
         --agent.alpha=$ALPHA \
         --seed=$SEED \
-        --save_dir=$SAVE_DIR \
-        --run_group=$RUN_GROUP
+        --save_dir=$SAVE_DIR

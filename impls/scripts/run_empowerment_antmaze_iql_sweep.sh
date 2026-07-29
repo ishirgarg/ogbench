@@ -167,8 +167,7 @@ train_gciql() {
         --video_episodes=0 \
         --agent=agents/gciql.py \
         --agent.alpha=${ALPHA} \
-        --save_dir=${SAVE_DIR} \
-        --run_group=emp_antmaze_iql_${RUN_LABEL}_alpha${ALPHA}
+        --save_dir=${SAVE_DIR}
 }
 
 # -----------------------------

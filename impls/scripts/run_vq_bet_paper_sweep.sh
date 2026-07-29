@@ -78,10 +78,8 @@ ENV=${ENVS[$ENV_IDX]}
 K=${NUM_SKILLS[$K_IDX]}
 
 SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
-VQVAE_GROUP="vq_bet_vqvae_${ENV}_K${K}"   # Stage I run group (tokenizer)
-RUN_GROUP="vq_bet_${ENV}_K${K}"           # Stage II run group (transformer; the eval run)
 
-echo "IDX=$IDX  ENV=$ENV  num_skills(K)=$K  SEED=$SEED  RUN_GROUP=$RUN_GROUP"
+echo "IDX=$IDX  ENV=$ENV  num_skills(K)=$K  SEED=$SEED"
 
 # ── Env ─────────────────────────────────────────────────────────────────────
 # mujoco rendering uses EGL; local wandb data goes to scratch (home quota is
@@ -95,7 +93,7 @@ set -e   # if Stage I fails, do not launch Stage II with no tokenizer to restore
 # ── Stage I — VQ-VAE tokenizer (official pretrain_vqvae.py) ─────────────────────
 # Trains ONLY the encoder/decoder (Adam lr=1e-3) with the EMA codebook; the
 # transformer optimizer is frozen. Saves exactly one checkpoint (params_500000.pkl)
-# under $SAVE_DIR/OGBench/$VQVAE_GROUP/<exp_name>/ (exp_name embeds SLURM_JOB_ID).
+# under $SAVE_DIR/OGBench/Debug/<exp_name>/ (exp_name embeds SLURM_JOB_ID).
 # Eval is skipped during this stage (the policy is untrained here).
 python main.py \
     --env_name=$ENV \
@@ -107,8 +105,7 @@ python main.py \
     --eval_interval=1000000 \
     --save_interval=500000 \
     --video_episodes=0 \
-    --save_dir=$SAVE_DIR \
-    --run_group=$VQVAE_GROUP
+    --save_dir=$SAVE_DIR
 
 # ── Stage II — transformer (official train.py) ─────────────────────────────────
 # Restore ONLY the trained tokenizer (fresh transformer + fresh optimizer). The
@@ -122,11 +119,10 @@ python main.py \
     --agent.num_skills=$K \
     --agent.stage=bet \
     --agent.bet_stage1_steps=250000 \
-    --agent.restore_vqvae_path="$SAVE_DIR/OGBench/$VQVAE_GROUP/*${SLURM_JOB_ID}*" \
+    --agent.restore_vqvae_path="$SAVE_DIR/OGBench/Debug/*${SLURM_JOB_ID}*" \
     --agent.restore_vqvae_epoch=500000 \
     --seed=$SEED \
     --train_steps=500000 \
     --eval_temperature=1.0 \
     --video_episodes=0 \
-    --save_dir=$SAVE_DIR \
-    --run_group=$RUN_GROUP
+    --save_dir=$SAVE_DIR
