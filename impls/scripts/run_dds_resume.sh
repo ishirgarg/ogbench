@@ -6,9 +6,9 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-7
+#SBATCH --array=0-3
 
-# Resume the 8 interrupted DDS paper-sweep runs (scripts/run_dds_paper_sweep.sh)
+# Resume 4 of the interrupted DDS paper-sweep runs (scripts/run_dds_paper_sweep.sh)
 # from their latest checkpoint, in place. Submit from impls/:
 #   sbatch scripts/run_dds_resume.sh
 #
@@ -39,10 +39,6 @@ BASE=/global/scratch/users/ishirgarg/ogbench/OGBench
 RUNS=(
     "sd000_s_35757533.0.20260721_190340"  # antmaze-medium-navigate-v0
     "sd000_s_35757534.0.20260721_190340"  # antmaze-medium-navigate-v0
-    "sd000_s_35757538.0.20260721_190340"  # antmaze-medium-stitch-v0
-    "sd000_s_35757537.0.20260721_190341"  # antmaze-medium-stitch-v0
-    "sd000_s_35757535.0.20260721_190341"  # antsoccer-arena-navigate-v0
-    "sd000_s_35757536.0.20260721_190341"  # antsoccer-arena-navigate-v0
     "sd000_s_35757532.0.20260721_190340"  # antsoccer-arena-stitch-v0
     "sd000_s_35757539.0.20260721_190340"  # antsoccer-arena-stitch-v0
 )
