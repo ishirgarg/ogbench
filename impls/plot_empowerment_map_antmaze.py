@@ -4,6 +4,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 
 import argparse
 import glob
+import inspect
 import json
 import re
 from typing import List
@@ -446,7 +447,7 @@ def main():
                 extent=(x_low_plot, x_high_plot, y_low_plot, y_high_plot),
                 output_path=paths_out,
                 title=(
-                    f"Ant paths | run={os.path.basename(run_dir)} | epoch={epoch}\n"
+                    f"Ant paths | run={os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
                     f"K={num_skills}, steps={args.video_steps}, "
                     f"start=({ant_xy[0]:.2f}, {ant_xy[1]:.2f})"
                 ),
@@ -473,12 +474,16 @@ def main():
     point_root_key = jax.random.PRNGKey(point_root_seed)
     num_points = obs_batch_jnp.shape[0]
     point_keys = jax.random.split(point_root_key, num_points)
+    # Some agents (e.g. empowerment_crl) expose a deterministic E(s) with no rng arg.
+    _emp_takes_rng = "rng" in inspect.signature(agent.empowerment).parameters
+
     @jax.jit
     def _emp_batch(obs_b, keys_b):
-        return jax.vmap(
-            lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
-            in_axes=(0, 0),
-        )(obs_b, keys_b)
+        if _emp_takes_rng:
+            fn = lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze()
+        else:
+            fn = lambda ob, key: agent.empowerment(ob[None, ...]).squeeze()
+        return jax.vmap(fn, in_axes=(0, 0))(obs_b, keys_b)
 
     batch_size = max(1, int(args.batch_size))
     emp_chunks = []
@@ -504,7 +509,7 @@ def main():
     ax.set_xlabel("Ant x")
     ax.set_ylabel("Ant y")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle(f"AntMaze empowerment | run={os.path.basename(run_dir)} | epoch={epoch}")
+    fig.suptitle(f"AntMaze empowerment | run={os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}")
     plt.tight_layout()
     plt.savefig(out_img, dpi=180)
     np.save(out_npy, emp_map)

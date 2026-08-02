@@ -107,7 +107,10 @@ def _parse_xy(text):
 
 def rollout_dds_skill(env, agent, skill_vec, is_antsoccer, ant_xy, ball_xy,
                       n_steps, temperature=0.0, seed=0):
-    """Roll out a single fixed DDS codebook skill; return the agent xy trajectory."""
+    """Roll out one fixed DDS codebook skill.
+
+    Returns (agent_xy_traj, ball_xy_traj); ball_xy_traj is None off antsoccer.
+    """
     skills = jnp.asarray(skill_vec, dtype=jnp.float32)[None, :]  # [1, D_z]
 
     @jax.jit
@@ -123,12 +126,15 @@ def rollout_dds_skill(env, agent, skill_vec, is_antsoccer, ant_xy, ball_xy,
             np.asarray(ball_xy, dtype=np.float64),
         )
         get_xy = lambda: np.asarray(base_env.get_agent_ball_xy()[0], dtype=np.float32)
+        get_ball = lambda: np.asarray(base_env.get_agent_ball_xy()[1], dtype=np.float32)
     else:
         base_env.set_xy(np.asarray(ant_xy, dtype=np.float64))
         get_xy = lambda: np.asarray(base_env.get_xy(), dtype=np.float32)
+        get_ball = None
 
     obs = np.asarray(base_env.get_ob(), dtype=np.float32)
     xy_traj = [get_xy()]
+    ball_traj = [get_ball()] if get_ball is not None else None
     rng = jax.random.PRNGKey(int(seed))
     for _ in range(n_steps):
         rng, key = jax.random.split(rng)
@@ -136,13 +142,16 @@ def rollout_dds_skill(env, agent, skill_vec, is_antsoccer, ant_xy, ball_xy,
         obs, _, terminated, truncated, _ = env.step(action)
         obs = np.asarray(obs, dtype=np.float32)
         xy_traj.append(get_xy())
+        if ball_traj is not None:
+            ball_traj.append(get_ball())
         if terminated or truncated:
             break
-    return np.stack(xy_traj, axis=0)
+    return (np.stack(xy_traj, axis=0),
+            np.stack(ball_traj, axis=0) if ball_traj is not None else None)
 
 
 def plot_skill_paths(xy_per_skill, ant_start_xy, overlay_maze, extent,
-                     output_path, title=None, ball_xy=None):
+                     output_path, title=None, ball_xy=None, show_intervals=True):
     fig, ax = plt.subplots(1, 1, figsize=(7, 7))
     overlay_maze(ax)
     K = len(xy_per_skill)
@@ -163,12 +172,46 @@ def plot_skill_paths(xy_per_skill, ant_start_xy, overlay_maze, extent,
     ax.set_ylabel('Ant y')
     if title is not None:
         ax.set_title(title)
-    interval_handles = _draw_interval_dots(ax, xy_per_skill)
+    interval_handles = _draw_interval_dots(ax, xy_per_skill) if show_intervals else None
     if K <= 16:
         skill_leg = ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
         ax.add_artist(skill_leg)
-    ax.legend(handles=interval_handles, loc='lower left', fontsize=6,
-              framealpha=0.85, title='interval')
+    if interval_handles:
+        ax.legend(handles=interval_handles, loc='lower left', fontsize=6,
+                  framealpha=0.85, title='interval')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_ball_paths(ball_xy_per_skill, ant_start_xy, ball_start_xy, overlay_maze,
+                    extent, output_path, title=None):
+    """Companion to plot_skill_paths: one line per skill, but for the *ball*.
+
+    Same extent and per-skill colors as the ant figure so the two can be read
+    side by side. Only the start positions are marked.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+    overlay_maze(ax)
+    K = len(ball_xy_per_skill)
+    cmap = plt.get_cmap('hsv')
+    for z, bxy in enumerate(ball_xy_per_skill):
+        ax.plot(bxy[:, 0], bxy[:, 1], color=cmap(z / max(K, 1)),
+                linewidth=1.0, alpha=0.9, label=f"skill {z}")
+    ax.scatter([ant_start_xy[0]], [ant_start_xy[1]], c='black', s=40, marker='o',
+               edgecolors='white', linewidths=0.8, zorder=5, label='Ant start')
+    ax.scatter([ball_start_xy[0]], [ball_start_xy[1]], c='red', s=70, marker='o',
+               edgecolors='white', linewidths=1.0, zorder=6, label='Ball start')
+    x_lo, x_hi, y_lo, y_hi = extent
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_aspect('equal')
+    ax.set_xlabel('Ball x')
+    ax.set_ylabel('Ball y')
+    if title is not None:
+        ax.set_title(title)
+    if K <= 16:
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
     plt.tight_layout()
     plt.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -257,13 +300,17 @@ def main():
           + (f" ball={np.asarray(ball_xy).tolist()}" if is_antsoccer else ""))
 
     xy_per_skill = []
+    ball_xy_per_skill = []
     for z in range(num_skills):
         print(f"  rolling out skill {z + 1}/{num_skills}...")
-        xy_per_skill.append(rollout_dds_skill(
+        xy_traj, ball_traj = rollout_dds_skill(
             env=env, agent=agent, skill_vec=codebook[z],
             is_antsoccer=is_antsoccer, ant_xy=ant_xy, ball_xy=ball_xy,
             n_steps=args.steps, temperature=args.temperature, seed=z,
-        ))
+        )
+        xy_per_skill.append(xy_traj)
+        if ball_traj is not None:
+            ball_xy_per_skill.append(ball_traj)
 
     x_low, x_high = args.x_min - half, args.x_max + half
     y_low, y_high = args.y_min - half, args.y_max + half
@@ -271,11 +318,27 @@ def main():
     plot_skill_paths(
         xy_per_skill=xy_per_skill, ant_start_xy=ant_xy, overlay_maze=overlay_maze,
         extent=(x_low, x_high, y_low, y_high), output_path=out, ball_xy=ball_xy,
-        title=(f"DDS ant paths | {os.path.basename(run_dir)} | epoch={epoch}\n"
+        # On antsoccer the ant and ball figures are read together; the
+        # along-the-path interval dots only clutter them.
+        show_intervals=not is_antsoccer,
+        title=(f"DDS ant paths | {os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
                f"K={num_skills}, steps={args.steps}, "
                f"start=({float(ant_xy[0]):.2f}, {float(ant_xy[1]):.2f})"),
     )
     print(f"Saved: {out}")
+
+    if ball_xy_per_skill:
+        ball_out = os.path.join(run_dir, f"dds_ball_paths_e{epoch}.png")
+        plot_ball_paths(
+            ball_xy_per_skill=ball_xy_per_skill, ant_start_xy=ant_xy,
+            ball_start_xy=ball_xy, overlay_maze=overlay_maze,
+            extent=(x_low, x_high, y_low, y_high), output_path=ball_out,
+            title=(f"DDS ball paths | {os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
+                   f"K={num_skills}, steps={args.steps}, "
+                   f"ant start=({float(ant_xy[0]):.2f}, {float(ant_xy[1]):.2f}), "
+                   f"ball start=({float(ball_xy[0]):.2f}, {float(ball_xy[1]):.2f})"),
+        )
+        print(f"Saved: {ball_out}")
 
 
 if __name__ == "__main__":

@@ -26,10 +26,10 @@ ANTMAZE_XY=${ANTMAZE_XY:-8,8}
 ANTSOCCER_XY=${ANTSOCCER_XY:-10,10}
 
 ENV_DIRS=(
-  "antmaze-medium-navigate-v0"
-  "antmaze-medium-stitch-v0"
-  "antsoccer-arena-navigate-v0"
-  "antsoccer-arena-stitch-v0"
+  "antmaze-medium-navigate"
+  "antmaze-medium-stitch"
+  "antsoccer-arena-navigate"
+  "antsoccer-arena-stitch"
 )
 
 RUN_DIRS=()

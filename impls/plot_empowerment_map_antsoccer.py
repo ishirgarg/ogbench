@@ -4,6 +4,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 
 import argparse
 import glob
+import inspect
 import json
 import re
 
@@ -18,10 +19,6 @@ from agents import agents as agent_registry
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import restore_agent
 from utils.log_utils import reshape_video
-
-
-# Step intervals at which to drop a color-coded marker along each skill path.
-INTERVAL_STEPS = [500, 1000, 1500, 2000, 2500, 3000]
 
 
 def _raise_time_limit(env, min_steps):
@@ -42,32 +39,6 @@ def _raise_time_limit(env, min_steps):
     if spec is not None and getattr(spec, "max_episode_steps", None) is not None \
             and spec.max_episode_steps < target:
         spec.max_episode_steps = target
-
-
-def _draw_interval_dots(ax, xy_per_skill, intervals=INTERVAL_STEPS):
-    """Drop a small color-coded dot on every skill path at each step interval.
-
-    xy_traj index t == env step t (index 0 is the start state), so the dot for
-    interval `step` lives at xy[step] when the trajectory ran that long. All
-    dots for a given interval share one color (from tab10) so it's clear which
-    marker corresponds to which step across skills. Returns legend handles.
-    """
-    cmap = plt.get_cmap('tab10')
-    handles = []
-    for j, step in enumerate(intervals):
-        color = cmap(j % 10)
-        xs, ys = [], []
-        for xy in xy_per_skill:
-            if len(xy) > step:
-                xs.append(float(xy[step, 0]))
-                ys.append(float(xy[step, 1]))
-        if xs:
-            ax.scatter(xs, ys, c=[color], s=14, marker='o', edgecolors='black',
-                       linewidths=0.3, zorder=7)
-        handles.append(plt.Line2D([0], [0], marker='o', linestyle='', color=color,
-                                   markeredgecolor='black', markersize=5,
-                                   label=f"step {step}"))
-    return handles
 
 
 def _latest_run_dir(ckpt_root: str) -> str:
@@ -106,10 +77,10 @@ def rollout_skill(env, agent, num_skills, skill_id, ant_xy, ball_xy,
 
     Resets the env, overrides ant + ball XY (and optionally the goal) so the
     starting state is identical across skills, then runs deterministic
-    policy(.|s, skill_onehot) for n_steps. Returns (frames, ant_xy_traj),
-    where each is None if not requested. Frames are captured every
-    frame_skip steps to match OGBench's eval video cadence; the xy
-    trajectory captures every step.
+    policy(.|s, skill_onehot) for n_steps. Returns
+    (frames, ant_xy_traj, ball_xy_traj), where each is None if not requested.
+    Frames are captured every frame_skip steps to match OGBench's eval video
+    cadence; the xy trajectories capture every step.
     """
     K = num_skills
     skill_onehot = jnp.eye(K, dtype=jnp.float32)[skill_id][None, :]
@@ -138,8 +109,13 @@ def rollout_skill(env, agent, num_skills, skill_id, ant_xy, ball_xy,
     obs = np.asarray(base_env.get_ob(), dtype=np.float32)
 
     frames = [env.render().copy()] if collect_frames else None
-    xy_traj = [np.asarray(base_env.get_agent_ball_xy()[0], dtype=np.float32)] \
-        if collect_xy else None
+    if collect_xy:
+        a0, b0 = base_env.get_agent_ball_xy()
+        xy_traj = [np.asarray(a0, dtype=np.float32)]
+        ball_traj = [np.asarray(b0, dtype=np.float32)]
+    else:
+        xy_traj = None
+        ball_traj = None
     rng = jax.random.PRNGKey(int(seed))
 
     for step in range(1, n_steps + 1):
@@ -150,13 +126,16 @@ def rollout_skill(env, agent, num_skills, skill_id, ant_xy, ball_xy,
         if collect_frames and (step % frame_skip == 0 or step == n_steps):
             frames.append(env.render().copy())
         if collect_xy:
-            xy_traj.append(np.asarray(base_env.get_agent_ball_xy()[0], dtype=np.float32))
+            a_, b_ = base_env.get_agent_ball_xy()
+            xy_traj.append(np.asarray(a_, dtype=np.float32))
+            ball_traj.append(np.asarray(b_, dtype=np.float32))
         if terminated or truncated:
             break
 
     frames_out = np.asarray(frames, dtype=np.uint8) if collect_frames else None
     xy_out = np.stack(xy_traj, axis=0) if collect_xy else None
-    return frames_out, xy_out
+    ball_out = np.stack(ball_traj, axis=0) if collect_xy else None
+    return frames_out, xy_out, ball_out
 
 
 def compose_skill_grid(renders_per_skill, n_cols=None):
@@ -196,9 +175,13 @@ def plot_skill_paths(xy_per_skill, ball_xy, ant_start_xy, overlay_maze, extent,
                      output_path, title=None):
     """One 2D plot: a thin line per skill (ant xy over time), plus the ball.
 
+    Ant paths only -- the per-skill ball trajectories get their own figure via
+    plot_ball_paths(), since overlaying them here buries the (much smaller)
+    ball motion under 50 ant lines.
+
     Args:
         xy_per_skill: list of np.ndarray[T_i, 2] giving the ant (x, y) per step.
-        ball_xy: (x, y) of the fixed ball.
+        ball_xy: (x, y) of the fixed ball start.
         ant_start_xy: (x, y) of the fixed starting ant position.
         overlay_maze: callable that draws maze walls onto an Axes.
         extent: (x_lo, x_hi, y_lo, y_hi) plot bounds.
@@ -218,9 +201,7 @@ def plot_skill_paths(xy_per_skill, ball_xy, ant_start_xy, overlay_maze, extent,
                marker='o', edgecolors='white', linewidths=0.8, zorder=5,
                label='Ant start')
     ax.scatter([ball_xy[0]], [ball_xy[1]], c='red', s=70, marker='o',
-               edgecolors='white', linewidths=1.0, zorder=6, label='Ball')
-
-    interval_handles = _draw_interval_dots(ax, xy_per_skill)
+               edgecolors='white', linewidths=1.0, zorder=6, label='Ball start')
 
     x_lo, x_hi, y_lo, y_hi = extent
     ax.set_xlim(x_lo, x_hi)
@@ -233,10 +214,49 @@ def plot_skill_paths(xy_per_skill, ball_xy, ant_start_xy, overlay_maze, extent,
 
     # Legend only sensible for small K; collapse otherwise.
     if K <= 15:
-        skill_leg = ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
-        ax.add_artist(skill_leg)
-    ax.legend(handles=interval_handles, loc='lower left', fontsize=6,
-              framealpha=0.85, title='interval')
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_ball_paths(ball_xy_per_skill, ball_xy, ant_start_xy, overlay_maze,
+                    extent, output_path, title=None):
+    """Companion to plot_skill_paths: one line per skill, but for the *ball*.
+
+    Same arena extent and per-skill colors as the ant plot so the two figures
+    can be read side by side, minus the ant lines that otherwise bury the (much
+    smaller) ball motion. Only the ant/ball start positions are marked; the
+    paths themselves carry no along-the-way markers.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+    overlay_maze(ax)
+
+    K = len(ball_xy_per_skill)
+    cmap = plt.get_cmap('hsv')
+    for z, bxy in enumerate(ball_xy_per_skill):
+        color = cmap(z / max(K, 1))
+        ax.plot(bxy[:, 0], bxy[:, 1], color=color, linewidth=1.0, alpha=0.9,
+                label=f"skill {z}")
+
+    ax.scatter([ant_start_xy[0]], [ant_start_xy[1]], c='black', s=40,
+               marker='o', edgecolors='white', linewidths=0.8, zorder=5,
+               label='Ant start')
+    ax.scatter([ball_xy[0]], [ball_xy[1]], c='red', s=70, marker='o',
+               edgecolors='white', linewidths=1.0, zorder=6, label='Ball start')
+
+    x_lo, x_hi, y_lo, y_hi = extent
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_aspect('equal')
+    ax.set_xlabel('Ball x')
+    ax.set_ylabel('Ball y')
+    if title is not None:
+        ax.set_title(title)
+
+    if K <= 15:
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=180)
@@ -460,9 +480,10 @@ def main():
 
         renders_per_skill = []
         xy_per_skill = []
+        ball_xy_per_skill = []
         for z in range(num_skills):
             print(f"  rolling out skill {z + 1}/{num_skills}...")
-            frames, xy_traj = rollout_skill(
+            frames, xy_traj, ball_traj = rollout_skill(
                 env=env,
                 agent=agent,
                 num_skills=num_skills,
@@ -481,6 +502,7 @@ def main():
                 renders_per_skill.append(frames)
             if args.skill_paths:
                 xy_per_skill.append(xy_traj)
+                ball_xy_per_skill.append(ball_traj)
 
         if args.skill_video:
             grid = compose_skill_grid(renders_per_skill)
@@ -500,12 +522,29 @@ def main():
                 extent=(x_low_plot, x_high_plot, y_low_plot, y_high_plot),
                 output_path=paths_out,
                 title=(
-                    f"Ant paths | run={os.path.basename(run_dir)} | epoch={epoch}\n"
+                    f"Ant paths | run={os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
                     f"K={num_skills}, steps={args.video_steps}, "
                     f"ball=({ball_xy[0]:.2f}, {ball_xy[1]:.2f})"
                 ),
             )
             print(f"Saved skill ant-path plot: {paths_out}")
+
+            ball_paths_out = os.path.join(run_dir, f"skill_ball_paths_e{epoch}.png")
+            plot_ball_paths(
+                ball_xy_per_skill=ball_xy_per_skill,
+                ball_xy=ball_xy,
+                ant_start_xy=ant_xy,
+                overlay_maze=overlay_maze,
+                extent=(x_low_plot, x_high_plot, y_low_plot, y_high_plot),
+                output_path=ball_paths_out,
+                title=(
+                    f"Ball paths | run={os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
+                    f"K={num_skills}, steps={args.video_steps}, "
+                    f"ant=({ant_xy[0]:.2f}, {ant_xy[1]:.2f}), "
+                    f"ball start=({ball_xy[0]:.2f}, {ball_xy[1]:.2f})"
+                ),
+            )
+            print(f"Saved skill ball-path plot: {ball_paths_out}")
 
     def is_valid_xy(x: float, y: float) -> bool:
         if maze_map is None:
@@ -529,12 +568,16 @@ def main():
     ys = np.linspace(y_low, y_high, args.grid_res, dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
 
+    # Some agents (e.g. empowerment_crl) expose a deterministic E(s) with no rng arg.
+    _emp_takes_rng = "rng" in inspect.signature(agent.empowerment).parameters
+
     @jax.jit
     def _emp_batch(obs_b, keys_b):
-        return jax.vmap(
-            lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
-            in_axes=(0, 0),
-        )(obs_b, keys_b)
+        if _emp_takes_rng:
+            fn = lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze()
+        else:
+            fn = lambda ob, key: agent.empowerment(ob[None, ...]).squeeze()
+        return jax.vmap(fn, in_axes=(0, 0))(obs_b, keys_b)
 
     def compute_empowerment_map(fixed_ball_xy: tuple[float, float], goal_xy_override: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         # Build observations for Ant Soccer directly via env state, or explicit rel4 fallback.
@@ -679,7 +722,7 @@ def main():
         ax.set_xlabel(f"Ant x")
         ax.set_ylabel(f"Ant y")
         ax.set_title(
-            f"Empowerment map | run={os.path.basename(run_dir)} | epoch={epoch}\n"
+            f"Empowerment map | run={os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
             f"fixed ball=({fixed_ball[0]:.3f}, {fixed_ball[1]:.3f})"
         )
         plt.tight_layout()
@@ -723,7 +766,7 @@ def main():
             ax.set_xlabel(f"Ant x")
             ax.set_ylabel(f"Ant y")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.suptitle(f"Empowerment maps | run={os.path.basename(run_dir)} | epoch={epoch}")
+        fig.suptitle(f"Empowerment maps | run={os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}")
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(out_img, dpi=180)
         np.save(out_npy, np.stack(maps, axis=0))

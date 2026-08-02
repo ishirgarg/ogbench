@@ -24,21 +24,20 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.3}
 ANTMAZE_XY=${ANTMAZE_XY:-8,8}
 ANTSOCCER_XY=${ANTSOCCER_XY:-10,10}
 
-# Map each env-dir prefix to its plot script.
-declare -A SCRIPT_FOR=(
-  ["antmaze-medium-navigate"]="plot_empowerment_map_antmaze.py"
-  ["antsoccer-arena-navigate"]="plot_empowerment_map_antsoccer.py"
-)
-
+# Covers every env dir under ckpts/empowerment (navigate, stitch, -slice50),
+# picking the plot script by env family.
 RUN_DIRS=()
 SCRIPTS=()
-for env_dir in "${!SCRIPT_FOR[@]}"; do
-  for run_dir in ckpts/empowerment/"$env_dir"/*/; do
-    [ -d "$run_dir" ] || continue
-    ls "$run_dir"params_*.pkl >/dev/null 2>&1 || { echo "SKIP (no params): $run_dir"; continue; }
-    RUN_DIRS+=("$run_dir")
-    SCRIPTS+=("${SCRIPT_FOR[$env_dir]}")
-  done
+for run_dir in ckpts/empowerment/*/*/; do
+  [ -d "$run_dir" ] || continue
+  ls "$run_dir"params_*.pkl >/dev/null 2>&1 || { echo "SKIP (no params): $run_dir"; continue; }
+  case "$run_dir" in
+    *antsoccer*) script="plot_empowerment_map_antsoccer.py" ;;
+    *antmaze*)   script="plot_empowerment_map_antmaze.py" ;;
+    *) echo "SKIP (no plot script for env): $run_dir"; continue ;;
+  esac
+  RUN_DIRS+=("$run_dir")
+  SCRIPTS+=("$script")
 done
 
 mkdir -p logs
