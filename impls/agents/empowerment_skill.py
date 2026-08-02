@@ -259,12 +259,36 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         skills = jax.random.randint(rng, (batch_size,), 0, K)
         return skills, jnp.eye(K)[skills]
 
-    def _policy_actions(self, observations, skills_onehot, params):
-        """Deterministic policy actions (mode / argmax)."""
+    def _policy_actions(self, observations, skills_onehot, params, rng=None,
+                        num_noise_samples=None):
+        """Policy actions (mode / argmax), optionally through a noisy actuation channel.
+
+        With `stochastic_policy_actions` the emitted action is perturbed by a
+        fixed-scale Gaussian, a = π(s,z) + η, η ~ N(0, σ_a² I), and clipped back
+        to the valid range.  σ_a is a constant (`action_noise_std`), *not* the
+        actor's learned log_std — a learnable scale could be driven to zero,
+        which would collapse the channel back to the deterministic case.
+
+        The noise is what makes the skill occupancies genuinely overlapping
+        measures rather than atoms; without it the empowerment objective is
+        invariant to how far apart the skills actually travel.  Requires an rng;
+        callers that pass rng=None stay deterministic.
+
+        `num_noise_samples=M` draws M independent η per state around the *same*
+        deterministic mode (one actor forward pass), returning [M, batch, A]
+        instead of [batch, A].  Only meaningful with the channel on.
+        """
         dist = self.network.select('policy')(observations, skills_onehot, params=params)
         if self.config['discrete']:
+            # A Gaussian actuation channel is not meaningful on action indices.
             return dist.probs.argmax(axis=-1)
-        return dist.mode()
+        actions = dist.mode()
+        if self.config.get('stochastic_policy_actions', False) and rng is not None:
+            shape = (actions.shape if num_noise_samples is None
+                     else (num_noise_samples, *actions.shape))
+            noise = jax.random.normal(rng, shape) * self.config['action_noise_std']
+            actions = jnp.clip(actions + noise, -1.0, 1.0)
+        return actions
 
     def _logits_from_embeddings(self, phi_emb, psi_emb, latent_dim):
         """log p(ψ | φ) for ψ ~ N(φ, (d/2)·I).
@@ -281,7 +305,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         return -l2_sq / latent_dim
 
     def _v_phi(self, observations, skills_onehot, *, use_target: bool,
-                policy_params=None):
+                policy_params=None, rng=None):
         """φ_V embedding for a single skill batch  →  [batch, d].
 
         Args:
@@ -291,6 +315,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             policy_params: params for the policy network;
                            None = frozen policy (no grad);
                            grad_params = gradient flows through policy.
+            rng:           key for the noisy actuation channel (None = off).
         """
         if self.config['separate_qv']:
             key = 'target_v' if use_target else 'v'
@@ -306,19 +331,25 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                 {'params': self.network.params[f'modules_{key}']}
             )
             actions = self._policy_actions(observations, skills_onehot,
-                                           params=policy_params)
+                                           params=policy_params, rng=rng)
             return net.apply(vars_, observations, actions, skills_onehot,
                              method=net.phi)
 
     def _v_phi_all_skills(self, observations, *, use_target: bool,
-                           policy_params=None):
+                           policy_params=None, rng=None):
         """φ_V embeddings for *all* K skills  →  [K, batch, d].
 
-        Args: same as _v_phi.  Internally vmaps over the skill index.
+        Args: same as _v_phi.  Internally vmaps over the skill index.  Each
+        skill gets its own actuation-noise key so the perturbations are
+        independent across skills rather than shared.
         """
         K = self.config['num_skills']
         batch_size = observations.shape[0]
         skills_onehot = jnp.eye(K)
+        # vmap needs a concrete array of keys even when the channel is off.
+        act_rngs = jax.random.split(
+            rng if rng is not None else jax.random.PRNGKey(0), K
+        )
 
         if self.config['separate_qv']:
             key = 'target_v' if use_target else 'v'
@@ -327,7 +358,9 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                 {'params': self.network.params[f'modules_{key}']}
             )
 
-            def phi_for_skill(z_onehot):
+            def phi_for_skill(z_onehot, act_rng):
+                # V is action-free in separate_qv mode; act_rng is unused here.
+                del act_rng
                 z_batch = jnp.repeat(z_onehot[None, :], batch_size, axis=0)
                 return net.apply(vars_, observations, z_batch, method=net.phi)
         else:
@@ -337,14 +370,15 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                 {'params': self.network.params[f'modules_{key}']}
             )
 
-            def phi_for_skill(z_onehot):
+            def phi_for_skill(z_onehot, act_rng):
                 z_batch = jnp.repeat(z_onehot[None, :], batch_size, axis=0)
                 actions = self._policy_actions(observations, z_batch,
-                                               params=policy_params)
+                                               params=policy_params,
+                                               rng=act_rng if rng is not None else None)
                 return net.apply(vars_, observations, actions, z_batch,
                                  method=net.phi)
 
-        return jax.vmap(phi_for_skill)(skills_onehot)   # [K, batch, d]
+        return jax.vmap(phi_for_skill)(skills_onehot, act_rngs)   # [K, batch, d]
 
     def _q_phi(self, observations, actions, skills_onehot, *, use_target: bool):
         """φ_Q embedding  →  [batch, d].
@@ -378,7 +412,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         )
 
     def compute_v_logits(self, observations, skills_onehot, future_states,
-                          params=None, policy_params=None):
+                          params=None, policy_params=None, rng=None):
         """log V^z(s⁺ | s) — online network, params differentiable.
 
         Combined mode: evaluates Q(s, π(s,z), z, s⁺) with the given `params`
@@ -393,14 +427,14 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             )
         else:
             actions = self._policy_actions(observations, skills_onehot,
-                                           params=policy_params)
+                                           params=policy_params, rng=rng)
             return self.network.select('q')(
                 observations, actions, skills_onehot, future_extracted,
                 params=params
             )
 
     def compute_v_logits_target(self, observations, skills_onehot, future_states,
-                                 policy_params=None):
+                                 policy_params=None, rng=None):
         """log V^z(s⁺ | s) — target network (frozen).
 
         Combined mode: evaluates target_Q(s, π(s,z), z, s⁺).
@@ -413,7 +447,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             )
         else:
             actions = self._policy_actions(observations, skills_onehot,
-                                           params=policy_params)
+                                           params=policy_params, rng=rng)
             return self.network.select('target_q')(
                 observations, actions, skills_onehot, future_extracted,
                 params=None
@@ -427,12 +461,13 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         d = self.config['value_latent_dim']
         log_K = jnp.log(K)
 
+        act_rng = jax.random.fold_in(rng, 5)
         rng, sample_rng = jax.random.split(rng)
         skill_rngs = jax.random.split(sample_rng, K)
 
         # φ_V for all skills: [K, batch, d]  (policy frozen, no grad needed)
         phi_all = self._v_phi_all_skills(
-            observations, use_target=False, policy_params=None
+            observations, use_target=False, policy_params=None, rng=act_rng
         )
 
         def empowerment_for_skill(phi_z, skill_rng):
@@ -460,7 +495,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     # No branching on separate_qv inside any loss.  All mode-specific
     # dispatching is handled by the V modulation interface above.
 
-    def q_loss(self, batch, grad_params, skills_onehot):
+    def q_loss(self, batch, grad_params, skills_onehot, rng=None):
         """Q loss.
 
         separate_qv=True:
@@ -528,8 +563,10 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             return loss, metrics
 
         # Shared Q/V mode: no V loss; Q carries both Bellman terms.
+        # One action sample shared by both Bellman terms — they are the same
+        # V(·|s') evaluated at two different s⁺.
         actions_next = self._policy_actions(
-            batch['next_observations'], skills_onehot, params=None
+            batch['next_observations'], skills_onehot, params=None, rng=rng
         )
         # 1) Q(s+ | s,a) = gamma * Q(s+ | s', pi(s',z), z)
         log_q_next_future = self.compute_q_logits_target(
@@ -578,7 +615,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         return loss, metrics
 
-    def v_loss(self, batch, grad_params, skills_onehot):
+    def v_loss(self, batch, grad_params, skills_onehot, rng=None):
         """L_V — Bellman backup for the occupancy V (eqs. 16-17).
 
 
@@ -598,8 +635,10 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         future = batch['value_goals']
 
         # Regress V(s+ | s, z) onto Q(s+ | s, π(s,z), z) (no discount, no self V loss).
+        # This is where V becomes the occupancy of the *noisy* policy: with the
+        # actuation channel on, the single-sample target makes V ≈ E_η[Q(s, π+η)].
         actions_pi = self._policy_actions(
-            batch['observations'], skills_onehot, params=None
+            batch['observations'], skills_onehot, params=None, rng=rng
         )
         log_q_pi = self.compute_q_logits_target(
             batch['observations'], actions_pi, skills_onehot, future
@@ -640,7 +679,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             'bc_log_prob_min': log_prob.min(),
         }
 
-    def policy_loss(self, batch, grad_params, skills, skills_onehot):
+    def policy_loss(self, batch, grad_params, skills, skills_onehot, rng=None):
         """Policy loss via empowerment gradient.
 
         Unified IS scheme.  For each sample slot m we have a skill z'_m and
@@ -667,7 +706,14 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         d = self.config['value_latent_dim']
         log_K = jnp.log(K)
 
-        rng, sample_rng = jax.random.split(self.rng)
+        # Must use a key derived from total_loss's rng, NOT self.rng:
+        # update() splits self.rng the same way, so re-splitting it here made
+        # sample_rng collide with total_loss's rng — z' sampling reproduced the
+        # skills draw exactly (z' == z in slot 0 every step).
+        rng = rng if rng is not None else self.rng
+        rng, sample_rng = jax.random.split(rng)
+        act_rng_v = jax.random.fold_in(rng, 3)
+        act_rng_q = jax.random.fold_in(rng, 4)
 
         # use_target=False routes the policy loss through the online Q/V
         # networks (no target bootstrap on the policy gradient).
@@ -679,6 +725,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # modes — every V reference downstream is stop_grad'd anyway.
         phi_all = self._v_phi_all_skills(
             batch['observations'], use_target=use_target, policy_params=None,
+            rng=act_rng_v,
         )  # [K, batch, d]
 
         # ── Build z' for each of M sample slots ─────────────────────────────
@@ -705,13 +752,36 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         )  # [M, batch, d]
 
         # ── log Q^z(ψ | s, π(s,z)) ──────────────────────────────────────────
-        policy_actions = self._policy_actions(
-            batch['observations'], skills_onehot, params=grad_params,
-        )
-        phi_z_q = self._q_phi(
-            batch['observations'], policy_actions, skills_onehot, use_target=use_target,
-        )  # [batch, d]
-        log_q = self._logits_from_embeddings(phi_z_q[None], psi, d)  # [M, batch]
+        # Reparameterized: the noise is an additive constant w.r.t. grad_params,
+        # so the policy gradient still flows through the action mean.  Each of
+        # the M sample slots gets its own independent η draw so the MC average
+        # over slots also averages over the actuation noise, rather than
+        # conditioning every slot on one shared η.  The mode is computed once;
+        # only the noise carries the extra M axis.
+        if self.config.get('stochastic_policy_actions', False):
+            policy_actions = self._policy_actions(
+                batch['observations'], skills_onehot, params=grad_params,
+                rng=act_rng_q, num_noise_samples=M,
+            )  # [M, batch, action_dim]
+            # vmap over the M axis: obs/skills stay [batch, ...] and φ_Q
+            # concatenates on the last axis, so map rather than broadcast.
+            phi_z_q = jax.vmap(
+                lambda a: self._q_phi(
+                    batch['observations'], a, skills_onehot,
+                    use_target=use_target,
+                )
+            )(policy_actions)  # [M, batch, d]
+        else:
+            # Channel off: all slots share the deterministic action; evaluate
+            # the policy and φ_Q once.
+            policy_actions = self._policy_actions(
+                batch['observations'], skills_onehot, params=grad_params,
+            )
+            phi_z_q = self._q_phi(
+                batch['observations'], policy_actions, skills_onehot,
+                use_target=use_target,
+            )[None]  # [1, batch, d] — broadcasts over M
+        log_q = self._logits_from_embeddings(phi_z_q, psi, d)  # [M, batch]
 
         # ── log V_{z''}(ψ) for all z''; pick out V^z (assigned skill) ───────
         log_v_all = self._logits_from_embeddings(phi_all[None], psi[:, None], d)  # [M, K, batch]
@@ -764,17 +834,24 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
     def total_loss(self, batch, grad_params, rng=None):
         rng = rng if rng is not None else self.rng
         skills_rng, empowerment_rng = jax.random.split(rng, 2)
+        # fold_in rather than widening the split above, so the pre-existing
+        # rng streams (and hence the default-config results) are unchanged.
+        # Constants must be >= 2: split(rng, 2)[i] == fold_in(rng, i), so
+        # small constants would collide with skills_rng/empowerment_rng.
+        q_act_rng, v_act_rng = jax.random.fold_in(rng, 101), jax.random.fold_in(rng, 102)
+        policy_rng = jax.random.fold_in(rng, 103)
         batch_size = batch['observations'].shape[0]
         skills, skills_onehot = self._sample_skills(skills_rng, batch_size)
         info = {}
 
-        q_loss, q_info = self.q_loss(batch, grad_params, skills_onehot)
+        q_loss, q_info = self.q_loss(batch, grad_params, skills_onehot, rng=q_act_rng)
         info.update({f'q/{k}': v for k, v in q_info.items()})
 
-        v_loss, v_info = self.v_loss(batch, grad_params, skills_onehot)
+        v_loss, v_info = self.v_loss(batch, grad_params, skills_onehot, rng=v_act_rng)
         info.update({f'v/{k}': v for k, v in v_info.items()})
 
-        pi_loss, pi_info = self.policy_loss(batch, grad_params, skills, skills_onehot)
+        pi_loss, pi_info = self.policy_loss(batch, grad_params, skills, skills_onehot,
+                                            rng=policy_rng)
         info.update({f'policy/{k}': v for k, v in pi_info.items()})
 
         bc_loss, bc_info = self.bc_loss(batch, grad_params, skills_onehot)
@@ -1060,6 +1137,10 @@ def get_config():
         # Policy-loss flags
         no_target_q_for_policy=True,  # Use main Q/V networks (not target) when computing the policy loss.
         sample_z=True,                # Sample one z per batch element for the policy loss instead of summing analytically over all Z.
+        # ── Noisy actuation channel ─────────────────────────────────────────
+        # When enabled, a = π(s,z) + η, ignored when discrete=True.
+        stochastic_policy_actions=False,
+        action_noise_std=0.1,
         # Log gating
         log_interval=5000,            # Skip empowerment() inside total_loss except on steps that match this interval.
         # ───────────────────────────────────────────────────────────────────
