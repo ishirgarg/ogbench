@@ -383,8 +383,13 @@ def main():
         flags = json.load(f)
 
     agent_cfg = flags["agent"]
-    # Override MC sample count for plotting fidelity.
+    # Override MC sample count for plotting fidelity. Different agents key
+    # their per-state sample count differently (e.g. empowerment_dads uses
+    # est_num_joints, not num_splus_samples) -- set whichever key this
+    # agent's saved config has.
     agent_cfg["num_splus_samples"] = int(args.num_splus_samples)
+    if "est_num_joints" in agent_cfg:
+        agent_cfg["est_num_joints"] = int(args.num_splus_samples)
     env_name = flags["env_name"]
 
     env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
