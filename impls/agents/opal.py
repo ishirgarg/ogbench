@@ -77,6 +77,10 @@ ADAPTATIONS TO THE OGBench SETTING (documented, minimal)
 
 Everything else (network widths, GRU encoder, Gaussian heads, skill_dim, kl_coef,
 lr, chunk size, log-std clipping, reparameterization) matches the source.
+Setting `latent_type="discrete"` instead runs the paper's Appendix F offline-DADS
+path: sub-trajectories are clustered into `num_skills` primitives by EM on
+p(tau,z) = p_omega(z) prod_t p_phi(s_t|s_{t-1},z), then pi(a|s,z) is BC-trained on
+the frozen posterior's labels (EM for `cluster_steps`, BC for the rest).
 ================================================================================
 """
 
@@ -262,6 +266,19 @@ class GaussianModule(nn.Module):
         return distribution
 
 
+# ── Categorical mixture prior p_omega(z) (Appendix F) ──────────────────────────
+
+
+class CategoricalPrior(nn.Module):
+    """Unconditional mixture prior over k skills. Returns unnormalized logits."""
+
+    num_skills: int
+
+    @nn.compact
+    def __call__(self):
+        return self.param("logits", nn.initializers.zeros, (self.num_skills,))
+
+
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 
@@ -324,9 +341,88 @@ class OPALAgent(flax.struct.PyTreeNode):
             "posterior_std": posteriors.scale_diag.mean(),
         }
 
+    # ── Discrete path: Appendix F clustering + BC ──────────────────────────────
+
+    def _log_p_tau_given_z(self, obs_seq, seq_mask, grad_params):
+        """log p_phi(tau|z) = sum_{t=1..c-1} log p_phi(s_t|s_{t-1}, z), for every z.
+
+        Returns [k, B]. The constant log p(s_0) is dropped (no phi dependence).
+        """
+        B, C, D = obs_seq.shape
+        K = self.config["num_skills"]
+
+        prev = obs_seq[:, :-1]
+        deltas = obs_seq[:, 1:] - prev
+        step_mask = seq_mask[:, 1:]
+
+        def log_p_for_skill(z_onehot):
+            zs = jnp.broadcast_to(z_onehot, (B, C - 1, K))
+            dist = self.network.select("traj_model")(
+                jnp.concatenate([prev, zs], axis=-1), params=grad_params
+            )
+            return (dist.log_prob(deltas) * step_mask).sum(axis=-1)
+
+        return jax.vmap(log_p_for_skill)(jnp.eye(K))
+
+    def discrete_loss(self, batch, grad_params, rng):
+        """EM on p(tau,z) for `cluster_steps`, then BC on the frozen posterior."""
+        obs_seq = batch["observations_seq"]
+        act_seq = batch["actions_seq"]
+        seq_mask = batch["seq_mask"]
+        B, C = seq_mask.shape
+        K = self.config["num_skills"]
+
+        # E-step: p(z|tau) by Bayes rule, held fixed via stop_gradient.
+        log_prior = jax.nn.log_softmax(
+            self.network.select("skill_prior")(params=grad_params)
+        )
+        log_p_tau = self._log_p_tau_given_z(obs_seq, seq_mask, grad_params)
+        log_joint = log_prior[:, None] + log_p_tau
+        log_evidence = jax.scipy.special.logsumexp(log_joint, axis=0)
+        log_resp = log_joint - log_evidence[None]
+        resp = jax.lax.stop_gradient(jnp.exp(log_resp))
+
+        # M-step, normalized per real step to match the VAE path's loss scale.
+        denom = jnp.maximum(seq_mask.sum(), 1.0)
+        em_loss = -(resp * log_joint).sum(axis=0).sum() / denom
+
+        # BC on one z per window sampled from the posterior.
+        label_rng, _ = jax.random.split(rng)
+        z_idx = jax.random.categorical(
+            label_rng, jax.lax.stop_gradient(log_resp).T, axis=-1
+        )
+        zs = jnp.broadcast_to(jnp.eye(K)[z_idx][:, None, :], (B, C, K))
+        szs = jnp.concatenate([obs_seq, zs], axis=-1)
+        bc_logprob = self.network.select("decoder")(szs, params=grad_params).log_prob(act_seq)
+        bc_loss = -(bc_logprob * seq_mask).sum() / denom
+
+        in_bc = (self.network.step >= self.config["cluster_steps"]).astype(jnp.float32)
+        total_loss = (1.0 - in_bc) * em_loss + in_bc * bc_loss
+
+        prior_probs = jnp.exp(log_prior)
+        prior_entropy = -(prior_probs * log_prior).sum()
+        post_entropy = -(resp * log_resp).sum(axis=0).mean()
+
+        return total_loss, {
+            "total_loss": total_loss,
+            "em_loss": em_loss,
+            "bc_loss": bc_loss,
+            "in_bc_stage": in_bc,
+            "log_evidence": log_evidence.mean(),
+            "mutual_information": prior_entropy - post_entropy,
+            "prior_entropy": prior_entropy,
+            "posterior_entropy": post_entropy,
+            "prior_min_prob": prior_probs.min(),
+            "prior_max_prob": prior_probs.max(),
+            "num_active_skills": (resp.mean(axis=1) > 1e-3).sum().astype(jnp.float32),
+            "bc_log_prob": (bc_logprob * seq_mask).sum() / denom,
+        }
+
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         rng = rng if rng is not None else self.rng
+        if self.config["latent_type"] == "discrete":
+            return self.discrete_loss(batch, grad_params, rng)
         loss, info = self.vae_loss(batch, grad_params, rng)
         return loss, info
 
@@ -336,25 +432,51 @@ class OPALAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(
             loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
         )
+
+        if self.config["latent_type"] == "discrete":
+            # Revert the clustering params in the BC stage: their gradient is zero
+            # there, but leftover Adam momentum would keep moving them.
+            in_bc = self.network.step >= self.config["cluster_steps"]
+            frozen = {
+                key: jax.tree_util.tree_map(
+                    lambda old, new: jnp.where(in_bc, old, new),
+                    self.network.params[key],
+                    new_network.params[key],
+                )
+                for key in ("modules_traj_model", "modules_skill_prior")
+            }
+            new_network = new_network.replace(params={**new_network.params, **frozen})
+
         return self.replace(network=new_network, rng=new_rng), info
 
-    # ── Evaluation: roll out skills sampled from the learned prior p(z|s_1) ─────
+    # ── Evaluation: roll out skills sampled from the learned prior ──────────────
     #
-    # No high-level policy (excluded by request), so the prior is the skill source.
-    # Each skill is committed for `chunk_size` steps (option horizon) and the
-    # decoder produces a_i = pi(a | s_i, z). Not goal-directed by construction.
+    # No high-level policy (excluded by request), so the prior is the skill source:
+    # p(z|s_1) on the continuous path, p_omega(z) on the discrete one. Each skill
+    # is committed for `chunk_size` steps (option horizon) and the decoder produces
+    # a_i = pi(a | s_i, z). Not goal-directed by construction.
+
+    def _sample_prior_skills(self, obs, seed, temperature):
+        """Draw one skill per batch row from the learned prior. [B, skill_width]."""
+        if self.config["latent_type"] == "discrete":
+            K = self.config["num_skills"]
+            logits = jax.nn.log_softmax(self.network.select("skill_prior")())
+            idx = jax.random.categorical(
+                seed, jnp.broadcast_to(logits, (obs.shape[0], K)), axis=-1
+            )
+            return jnp.eye(K)[idx]
+        return self.network.select("prior")(obs, temperature).sample(seed=seed)
 
     @jax.jit
     def sample_actions(self, observations, goals=None, seed=None, temperature=1.0):
-        """Stateless: draw z ~ p(z|s) and decode a ~ pi(a|s,z). `goals` unused."""
+        """Stateless: draw z from the prior and decode a ~ pi(a|s,z). `goals` unused."""
         if seed is None:
             seed = self.rng
         single_obs = observations.ndim == 1
         obs = observations[None] if single_obs else observations
 
         skill_seed, action_seed = jax.random.split(seed)
-        prior = self.network.select("prior")(obs, temperature)
-        skills = prior.sample(seed=skill_seed)
+        skills = self._sample_prior_skills(obs, skill_seed, temperature)
         szs = jnp.concatenate([obs, skills], axis=-1)
         actions = self.network.select("decoder")(szs, temperature).sample(seed=action_seed)
         actions = jnp.clip(actions, -1.0, 1.0)
@@ -363,10 +485,16 @@ class OPALAgent(flax.struct.PyTreeNode):
             actions = actions[0]
         return actions
 
+    def _skill_width(self):
+        """Width of the skill vector fed to the decoder."""
+        if self.config["latent_type"] == "discrete":
+            return int(self.config["num_skills"])
+        return int(self.config["skill_dim"])
+
     def init_eval_state(self):
         """Per-episode option state: committed skill + step counter."""
         return {
-            "skill": jnp.zeros((self.config["skill_dim"],)),
+            "skill": jnp.zeros((self._skill_width(),)),
             "count": jnp.zeros((), jnp.int32),
         }
 
@@ -374,8 +502,8 @@ class OPALAgent(flax.struct.PyTreeNode):
     def sample_actions_with_state(
         self, observations, goals=None, agent_state=None, seed=None, temperature=1.0
     ):
-        """Option-style: draw a fresh z ~ p(z|s) every `chunk_size` steps, hold it,
-        and decode a_i = pi(a|s_i, z). Returns (action, new_state). `goals` unused."""
+        """Option-style: draw a fresh z from the prior every `chunk_size` steps, hold
+        it, and decode a_i = pi(a|s_i, z). Returns (action, new_state). `goals` unused."""
         if seed is None:
             seed = self.rng
         if agent_state is None:
@@ -388,8 +516,7 @@ class OPALAgent(flax.struct.PyTreeNode):
         chunk_size = int(self.config["chunk_size"])
         reselect = (agent_state["count"] % chunk_size) == 0
 
-        prior = self.network.select("prior")(obs, temperature)
-        sampled = prior.sample(seed=skill_seed)                         # [B, skill_dim]
+        sampled = self._sample_prior_skills(obs, skill_seed, temperature)  # [B, skill_width]
         committed = jnp.broadcast_to(agent_state["skill"], sampled.shape)
         skills = jnp.where(reselect, sampled, committed)               # hold for chunk_size
 
@@ -416,6 +543,9 @@ class OPALAgent(flax.struct.PyTreeNode):
         assert int(config["sequence_length"]) == int(config["chunk_size"]), (
             "sequence_length (SequenceDataset window) must equal chunk_size (skill horizon)."
         )
+        assert config["latent_type"] in ("continuous", "discrete"), (
+            f'latent_type must be "continuous" or "discrete"; got {config["latent_type"]!r}.'
+        )
 
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng)
@@ -423,6 +553,7 @@ class OPALAgent(flax.struct.PyTreeNode):
         config = dict(config)
         skill_dim = config["skill_dim"]
         action_dim = ex_actions.shape[-1]
+        obs_dim = ex_observations.shape[-1]
 
         B = ex_observations.shape[0]
         C = int(config["chunk_size"])
@@ -437,6 +568,41 @@ class OPALAgent(flax.struct.PyTreeNode):
         ex_obs0 = ex_observations                       # [B, obs_dim]
         ex_skills = jnp.zeros((B, skill_dim))
         ex_sz = jnp.concatenate([ex_obs0, ex_skills], axis=-1)
+
+        if config["latent_type"] == "discrete":
+            assert int(config["cluster_steps"]) > 0, (
+                "cluster_steps must be > 0: the BC stage needs a trained p(z|tau)."
+            )
+            K = int(config["num_skills"])
+
+            traj_model_def = GaussianModule(
+                hidden_dims=tuple(config["vae_hidden_dims"]),
+                output_dim=obs_dim,
+                log_std_min=config["traj_log_std_min"],
+            )
+            skill_prior_def = CategoricalPrior(num_skills=K)
+            decoder_def = GaussianModule(
+                hidden_dims=tuple(config["vae_hidden_dims"]), output_dim=action_dim
+            )
+
+            ex_onehot = jnp.zeros((B, K))
+            ex_traj_in = jnp.concatenate([ex_obs0, ex_onehot], axis=-1)
+            network_def = ModuleDict(
+                dict(
+                    traj_model=traj_model_def,
+                    skill_prior=skill_prior_def,
+                    decoder=decoder_def,
+                )
+            )
+            network_params = network_def.init(
+                init_rng,
+                traj_model=(ex_traj_in,),
+                skill_prior=(),
+                decoder=(jnp.concatenate([ex_obs0, ex_onehot], axis=-1),),
+            )["params"]
+            network_tx = optax.adam(learning_rate=config["lr"])
+            network = TrainState.create(network_def, network_params, tx=network_tx)
+            return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
         encoder_def = SeqEncoder(
             num_recur_layers=2,
@@ -477,22 +643,27 @@ def get_config():
             agent_name="opal",
             lr=3e-4,                     # source opal_config.lr
             batch_size=256,              # source run_opal.py batch_size
+            latent_type="continuous",    # "continuous" (VAE) | "discrete" (Appendix F)
             skill_dim=8,                 # source opal_config.skill_dim (latent z dim)
             kl_coef=0.1,                 # source opal_config.kl_coef (antmaze/antsoccer/pointmaze)
             beta_coef=0.25,              # source opal_config.beta_coef (STORED-BUT-UNUSED by the VAE)
-            chunk_size=4,                # source run_opal.py horizon_length (skill / option horizon c)
+            chunk_size=10,               # skill / option horizon c
             # ── VAE networks ─────────────────────────────────────────────────
             # OGBench setting from run_opal.py: `if is_ogbench:` overrides the base
             # D4RL widths (256 / (256,256)) with the wider OGBench widths below.
             vae_hidden_dims=(512, 512, 512),  # prior + decoder MLP widths (OGBench override)
             vae_encoder_hidden_size=512,      # BiGRU / obs-MLP width (OGBench override)
+            # ── Discrete path (latent_type="discrete"; Appendix F) ───────────
+            num_skills=10,               # k (Appendix F.1 tried 5/10/20, chose 10)
+            cluster_steps=500_000,       # EM stage length; BC for the remaining steps
+            traj_log_std_min=-5.0,       # floor for p_phi; guards mixture collapse
             # ── Misc ────────────────────────────────────────────────────────
             discrete=False,              # continuous control only (Gaussian decoder)
             encoder=ml_collections.config_dict.placeholder(str),  # visual encoder (unsupported; keep None)
             # ── Dataset: SequenceDataset feeds length-c windows ─────────────
             # (observations_seq/actions_seq/seq_mask). sequence_length == chunk_size.
             dataset_class="SequenceDataset",
-            sequence_length=10,
+            sequence_length=10,          # must equal chunk_size (asserted in create)
             discount=0.99,               # source opal_config.discount (GCDataset geom sampling; VAE-irrelevant)
             # Goal/reward sampler knobs are unused by the VAE loss but required by
             # GCDataset; kept as harmless defaults.
