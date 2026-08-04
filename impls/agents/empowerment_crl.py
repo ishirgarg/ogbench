@@ -397,14 +397,14 @@ def get_config():
         # NOTE: shared constants matched to agents/empowerment_skill.py for a
         # like-for-like empowerment comparison (previous defaults per line).
         # ── Optimisation ─────────────────────────────────────────────────────
-        lr=3e-4,
-        batch_size=1024,                       # Matched (was 512).
+        lr=1e-3,
+        batch_size=512,                       # Matched (was 512).
         # ── CRL critic (φ, φ', ψ) ───────────────────────────────────────────
-        value_hidden_dims=(512, 512, 512),     # Matched (was 4x512).
+        value_hidden_dims=(256, 256),     # Matched (was 4x512).
         latent_dim=256,                        # Matched to value_latent_dim (was 512).
         layer_norm=True,
         # ── Empowerment distillation network E_θ(s) ─────────────────────────
-        empowerment_hidden_dims=(512, 512, 512),  # Matched (was 4x512).
+        empowerment_hidden_dims=(256, 256),  # Matched (was 4x512).
         # ── Two-phase schedule ──────────────────────────────────────────────
         crl_pretrain_steps=500_000,
         # ── Compatibility with main.py / GCDataset ──────────────────────────
