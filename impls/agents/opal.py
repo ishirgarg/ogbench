@@ -492,7 +492,7 @@ def get_config():
             # ── Dataset: SequenceDataset feeds length-c windows ─────────────
             # (observations_seq/actions_seq/seq_mask). sequence_length == chunk_size.
             dataset_class="SequenceDataset",
-            sequence_length=4,
+            sequence_length=10,
             discount=0.99,               # source opal_config.discount (GCDataset geom sampling; VAE-irrelevant)
             # Goal/reward sampler knobs are unused by the VAE loss but required by
             # GCDataset; kept as harmless defaults.
