@@ -247,12 +247,12 @@ def get_config():
         # Matched to agents/empowerment_skill.py for a like-for-like comparison
         # (same lr, batch size, trunk architecture, layer norm).
         lr=3e-4,
-        batch_size=1024,
+        batch_size=256,
         flow_hidden_dims=(512, 512, 512),
         critic_hidden_dims=(512, 512, 512),
         layer_norm=True,
-        flow_steps=16,           # Euler steps for flow sampling
-        num_negatives=63,        # InfoNCE N; cap = log(N+1) = 4.16 nats
+        flow_steps=8,           # Euler steps for flow sampling
+        num_negatives=7,        # InfoNCE N; cap = log(N+1) = 4.16 nats
         pretrain_steps=100000,   # bc/dyn-only steps before the critic trains
         est_num_joints=16,       # M joints per state in empowerment()
         # main.py / GCDataset wiring: value_goals = geometric discounted future.

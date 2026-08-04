@@ -264,12 +264,12 @@ def get_config():
         # Matched to agents/empowerment_crl_flowbc.py for a like-for-like
         # comparison (same lr, batch size, trunk architecture, layer norm).
         lr=3e-4,
-        batch_size=1024,
+        batch_size=256,
         flow_hidden_dims=(512, 512, 512),
         critic_hidden_dims=(512, 512, 512),
         layer_norm=True,
-        flow_steps=16,           # Euler steps for flow sampling
-        num_negatives=63,        # DV N: deranged product-of-marginals negatives
+        flow_steps=8,           # Euler steps for flow sampling
+        num_negatives=7,        # DV N: deranged product-of-marginals negatives
         pretrain_steps=100000,   # bc/dyn-only steps before the critic trains
         est_num_joints=16,       # K positive joints per state in empowerment()
         # main.py / GCDataset wiring: value_goals = geometric discounted future.
