@@ -18,11 +18,12 @@ NGPU=${#GPUS[@]}
 STEPS=${STEPS:-3000}
 export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.3}
 
-# Central ant start position per env family (world x,y). Overridable via env vars.
+# Central ant/ball start position per env family (world x,y). Overridable via env vars.
 # antmaze-medium: (8,8) is the most central *free* maze cell (true center borders a wall).
-# antsoccer-arena: (10,10) is the true center of the open arena.
+# antsoccer-arena: ant (14,14), ball (7,7).
 ANTMAZE_XY=${ANTMAZE_XY:-8,8}
-ANTSOCCER_XY=${ANTSOCCER_XY:-10,10}
+ANTSOCCER_XY=${ANTSOCCER_XY:-14,14}
+ANTSOCCER_BALL_XY=${ANTSOCCER_BALL_XY:-7,7}
 
 # Covers every env dir under ckpts/empowerment (navigate, stitch, -slice50),
 # picking the plot script by env family.
@@ -48,12 +49,20 @@ for idx in "${!RUN_DIRS[@]}"; do
   run_dir=${RUN_DIRS[$idx]}
   script=${SCRIPTS[$idx]}
   gpu=${GPUS[$((i % NGPU))]}
-  if [[ "$script" == *antsoccer* ]]; then ant_xy="$ANTSOCCER_XY"; else ant_xy="$ANTMAZE_XY"; fi
   log="logs/emp_paths_$(echo "$run_dir" | tr '/' '_').log"
-  echo "[gpu $gpu] $script  $run_dir  ant_xy=$ant_xy -> $log"
-  CUDA_VISIBLE_DEVICES=$gpu python "$script" \
-    --run_dir "$run_dir" --video_steps "$STEPS" --video_ant_xy "$ant_xy" \
-    --no-skill_video --no-skill_map --skill_paths > "$log" 2>&1 &
+  if [[ "$script" == *antsoccer* ]]; then
+    ant_xy="$ANTSOCCER_XY"
+    echo "[gpu $gpu] $script  $run_dir  ant_xy=$ant_xy ball_xy=$ANTSOCCER_BALL_XY -> $log"
+    CUDA_VISIBLE_DEVICES=$gpu python "$script" \
+      --run_dir "$run_dir" --video_steps "$STEPS" --video_ant_xy "$ant_xy" --video_ball_xy "$ANTSOCCER_BALL_XY" \
+      --no-skill_video --no-skill_map --skill_paths > "$log" 2>&1 &
+  else
+    ant_xy="$ANTMAZE_XY"
+    echo "[gpu $gpu] $script  $run_dir  ant_xy=$ant_xy -> $log"
+    CUDA_VISIBLE_DEVICES=$gpu python "$script" \
+      --run_dir "$run_dir" --video_steps "$STEPS" --video_ant_xy "$ant_xy" \
+      --no-skill_video --no-skill_map --skill_paths > "$log" 2>&1 &
+  fi
   i=$((i + 1))
   (( i % NGPU == 0 )) && wait
 done

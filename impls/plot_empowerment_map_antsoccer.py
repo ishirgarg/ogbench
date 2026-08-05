@@ -358,12 +358,12 @@ def main():
                         help="Frame-skip cadence for captured frames (OGBench default = 3).")
     parser.add_argument("--video_fps", type=int, default=15,
                         help="Output mp4 fps.")
-    parser.add_argument("--video_ant_xy", type=str, default=None,
+    parser.add_argument("--video_ant_xy", type=str, default="14,14",
                         help="Fixed ant x,y for the skill grid (e.g. '8,8'). "
-                             "Defaults to the env's reset ant position.")
-    parser.add_argument("--video_ball_xy", type=str, default=None,
+                             "Defaults to '14,14'.")
+    parser.add_argument("--video_ball_xy", type=str, default="7,7",
                         help="Fixed ball x,y for the skill grid. "
-                             "Defaults to the env's reset ball position.")
+                             "Defaults to '7,7'.")
     parser.add_argument("--video_goal_xy", type=str, default=None,
                         help="Optional fixed goal x,y for the skill grid.")
     args = parser.parse_args()

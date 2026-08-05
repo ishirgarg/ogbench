@@ -844,6 +844,16 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         skills, skills_onehot = self._sample_skills(skills_rng, batch_size)
         info = {}
 
+        bc_loss, bc_info = self.bc_loss(batch, grad_params, skills_onehot)
+        info.update({f'bc/{k}': v for k, v in bc_info.items()})
+
+        # only_bc: skip the empowerment machinery entirely (Q/V/policy losses,
+        # empowerment MC estimate) and train the skill-conditioned policy with
+        # pure behavioral cloning.
+        if self.config.get('only_bc', False):
+            info['total_loss'] = bc_loss
+            return bc_loss, info
+
         q_loss, q_info = self.q_loss(batch, grad_params, skills_onehot, rng=q_act_rng)
         info.update({f'q/{k}': v for k, v in q_info.items()})
 
@@ -853,14 +863,6 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         pi_loss, pi_info = self.policy_loss(batch, grad_params, skills, skills_onehot,
                                             rng=policy_rng)
         info.update({f'policy/{k}': v for k, v in pi_info.items()})
-
-        bc_loss, bc_info = self.bc_loss(batch, grad_params, skills_onehot)
-        jax.lax.cond(
-            jnp.isnan(bc_loss),
-            lambda: jax.debug.print("⚠️ NaN in bc_loss: {x}", x=bc_loss, ordered=True),
-            lambda: None,
-        )
-        info.update({f'bc/{k}': v for k, v in bc_info.items()})
 
         # empowerment() is only consumed at log steps, so skip the MC estimate
         # otherwise. step is the iteration count during update (== 0 mod
@@ -894,14 +896,10 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         else:
             alpha = jnp.asarray(base_alpha, dtype=jnp.float32)
         info['bc/alpha'] = alpha
-        
+
         total = q_loss + v_loss + pi_loss + alpha * bc_loss
         info['total_loss'] = total
-        jax.lax.cond(
-            jnp.isnan(total),
-            lambda: jax.debug.print("⚠️ NaN in total_loss: {x}", x=total, ordered=True),
-            lambda: None,
-        )
+        
         return total, info
 
     @jax.jit
@@ -1127,6 +1125,7 @@ def get_config():
         obs_indices=ml_collections.config_dict.placeholder(tuple),
         bc_alpha=0.0,
         anneal_alpha=False,
+        only_bc=False,  # If True, skip the Q/V/policy/empowerment losses entirely and train the policy with pure BC.
         # ── Architecture flag ───────────────────────────────────────────────
         # False (default): V derived from Q via the policy (single network).
         # True:            independent Q and V networks with separate targets.
