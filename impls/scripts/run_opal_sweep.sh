@@ -50,7 +50,7 @@ if [ "$CONFIG" = "continuous" ]; then
 else
     AGENT_FLAGS=(
         --agent.latent_type=discrete
-        --agent.num_skills=10
+        --agent.num_skills=15
         --agent.chunk_size=10
         --agent.sequence_length=10
         --agent.cluster_steps=500000
