@@ -14,8 +14,8 @@ IDX=${SLURM_ARRAY_TASK_ID}
 # Sweep definitions
 # -----------------------------
 ENVS=(
-    antmaze-medium-stitch-v0
-    antsoccer-medium-stitch-v0
+    antmaze-medium-navigate-v0
+    antsoccer-arena-navigate-v0
 )
 
 ENV=${ENVS[$IDX]}
