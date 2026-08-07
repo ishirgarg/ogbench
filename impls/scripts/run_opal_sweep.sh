@@ -70,4 +70,5 @@ python main.py \
     --seed=$SEED \
     --train_steps=1000000 \
     --video_episodes=0 \
+    --save_interval=50000 \
     --save_dir=$SAVE_DIR
