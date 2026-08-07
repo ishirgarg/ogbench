@@ -6,10 +6,14 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
+#SBATCH --array=0-1
+
+IDX=${SLURM_ARRAY_TASK_ID}
 
 ENV=antsoccer-arena-navigate-v0
 NOISE=0.1
-BC_ALPHA=0.01
+BC_ALPHAS=(0.01 0.003)
+BC_ALPHA=${BC_ALPHAS[$IDX]}
 SKILLS=50
 
 SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
