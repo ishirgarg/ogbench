@@ -9,21 +9,19 @@
 #SBATCH --array=0-7
 
 # Continuation of scripts/run_opal_sweep.sh's 4 envs x 2 configs (continuous /
-# discrete) sweep, same IDX -> (ENV, CONFIG) mapping. Only two of the eight
-# runs have surviving checkpoints and are resumed in place; the other six
-# (which never got far enough to checkpoint, or were never launched) are
-# started fresh with the exact flags run_opal_sweep.sh would have used.
+# discrete) sweep, same IDX -> (ENV, CONFIG) mapping. All eight runs now have
+# surviving checkpoints and are resumed in place.
 #
 # Submit from impls/:  sbatch scripts/run_opal_sweep_resume.sh
 #
-#   IDX 0 : antmaze-medium-navigate-v0   continuous  -- fresh
+#   IDX 0 : antmaze-medium-navigate-v0   continuous  -- RESUME sd000_s_36462376.0.20260806_143857
 #   IDX 1 : antmaze-medium-navigate-v0   discrete    -- RESUME sd000_s_36392681.0.20260805_024210
-#   IDX 2 : antsoccer-arena-navigate-v0  continuous  -- fresh
+#   IDX 2 : antsoccer-arena-navigate-v0  continuous  -- RESUME sd000_s_36462406.0.20260806_143915
 #   IDX 3 : antsoccer-arena-navigate-v0  discrete    -- RESUME sd000_s_36392683.0.20260805_024216
-#   IDX 4 : antmaze-medium-stitch-v0     continuous  -- fresh
-#   IDX 5 : antmaze-medium-stitch-v0     discrete    -- fresh
-#   IDX 6 : antsoccer-arena-stitch-v0    continuous  -- fresh
-#   IDX 7 : antsoccer-arena-stitch-v0    discrete    -- fresh
+#   IDX 4 : antmaze-medium-stitch-v0     continuous  -- RESUME sd000_s_36462416.0.20260806_143923
+#   IDX 5 : antmaze-medium-stitch-v0     discrete    -- RESUME sd000_s_36462417.0.20260806_143926
+#   IDX 6 : antsoccer-arena-stitch-v0    continuous  -- RESUME sd000_s_36462419.0.20260806_143930
+#   IDX 7 : antsoccer-arena-stitch-v0    discrete    -- RESUME sd000_s_36462375.0.20260806_143932
 #
 # For resumed runs, main.py --resume_dir replays the run's own flags.json, so
 # the AGENT_FLAGS below are not restated — only the run folder matters.
@@ -52,14 +50,14 @@ SEED=0
 
 # Run folder to resume, keyed by IDX. Empty string means "start fresh".
 RESUME_RUNS=(
-    ""                                     # 0 -- antmaze-medium-navigate-v0   continuous
+    "sd000_s_36462376.0.20260806_143857"   # 0 -- antmaze-medium-navigate-v0   continuous
     "sd000_s_36392681.0.20260805_024210"   # 1 -- antmaze-medium-navigate-v0   discrete
-    ""                                     # 2 -- antsoccer-arena-navigate-v0  continuous
+    "sd000_s_36462406.0.20260806_143915"   # 2 -- antsoccer-arena-navigate-v0  continuous
     "sd000_s_36392683.0.20260805_024216"   # 3 -- antsoccer-arena-navigate-v0  discrete
-    ""                                     # 4 -- antmaze-medium-stitch-v0     continuous
-    ""                                     # 5 -- antmaze-medium-stitch-v0     discrete
-    ""                                     # 6 -- antsoccer-arena-stitch-v0    continuous
-    ""                                     # 7 -- antsoccer-arena-stitch-v0    discrete
+    "sd000_s_36462416.0.20260806_143923"   # 4 -- antmaze-medium-stitch-v0     continuous
+    "sd000_s_36462417.0.20260806_143926"   # 5 -- antmaze-medium-stitch-v0     discrete
+    "sd000_s_36462419.0.20260806_143930"   # 6 -- antsoccer-arena-stitch-v0    continuous
+    "sd000_s_36462375.0.20260806_143932"   # 7 -- antsoccer-arena-stitch-v0    discrete
 )
 
 if [ -z "$IDX" ] || [ "$IDX" -ge ${#RESUME_RUNS[@]} ]; then
