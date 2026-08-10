@@ -6,9 +6,9 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-12
+#SBATCH --array=0-3
 
-# Resume the 13 interrupted empowerment_skill runs from their latest
+# Resume the 4 interrupted empowerment_skill runs from their latest
 # checkpoint, in place. Submit from impls/:
 #   sbatch scripts/run_empowerment_skill_navigate_resume.sh
 #
@@ -35,19 +35,10 @@ AGENT_NAME=empowerment_skill
 # The enclosing <wandb project>/<run_group> path is globbed, so it does not
 # matter which sweep revision or project produced these.
 RUNS=(
-    "sd000_s_36524712.0.20260807_120226"  # antmaze-medium-navigate-v0
-    "sd000_s_36538661.0.20260807_101923"  # antmaze-medium-navigate-v0
-    "sd000_s_36524717.0.20260807_020729"  # antmaze-medium-navigate-v0
-    "sd000_s_36524718.0.20260807_020729"  # antmaze-medium-navigate-v0
-    "sd000_s_36524700.0.20260807_020714"  # antsoccer-arena-navigate-v0
-    "sd000_s_36524699.0.20260807_020714"  # antsoccer-arena-navigate-v0
-    "sd000_s_36234841.0.20260801_175758"  # antsoccer-arena-stitch-v0
-    "sd000_s_36234848.0.20260801_175758"  # antsoccer-arena-stitch-v0
-    "sd000_s_36524715.0.20260807_020729"  # antmaze-medium-stitch-v0
-    "sd000_s_36524716.0.20260807_020729"  # antmaze-medium-stitch-v0
-    "sd000_s_36524714.0.20260807_020729"  # antmaze-medium-stitch-v0
-    "sd000_s_36524713.0.20260807_020728"  # antmaze-medium-stitch-v0
-    "sd000_s_35675537.0.20260718_020718"  # antmaze-medium-stitch-v0
+    "sd000_s_36234845.0.20260801_175753"
+    "sd000_s_36234841.0.20260801_175758"
+    "sd000_s_36234847.0.20260801_175753"
+    "sd000_s_36234843.0.20260801_175753"
 )
 
 if [ -z "$IDX" ] || [ "$IDX" -ge ${#RUNS[@]} ]; then
