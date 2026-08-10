@@ -27,7 +27,9 @@
 # resume differs from an uninterrupted run. Everything the optimizer sees is
 # exact.
 
-IDX=${SLURM_ARRAY_TASK_ID}
+set -euo pipefail
+
+IDX=${SLURM_ARRAY_TASK_ID:-}
 
 BASE=/global/scratch/users/ishirgarg/ogbench
 AGENT_NAME=opal
@@ -36,14 +38,14 @@ AGENT_NAME=opal
 # The enclosing <wandb project>/<run_group> path is globbed, so it does not
 # matter which sweep revision or project produced these.
 RUNS=(
-    "sd000_s_36524708.0.20260807_020721"  # antsoccer-arena-navigate-v0, discrete, num_skills=15
-    "sd000_s_36524707.0.20260807_020721"  # antsoccer-arena-navigate-v0, continuous, skill_dim=10
-    "sd000_s_36524711.0.20260807_020721"  # antsoccer-arena-stitch-v0, continuous, skill_dim=10
-    "sd000_s_36524703.0.20260807_020721"  # antsoccer-arena-stitch-v0, discrete, num_skills=15
-    "sd000_s_36524709.0.20260807_020721"  # antmaze-medium-stitch-v0, continuous, skill_dim=10
-    "sd000_s_36524710.0.20260807_020721"  # antmaze-medium-stitch-v0, discrete, num_skills=15
-    "sd000_s_36524706.0.20260807_020721"  # antmaze-medium-navigate-v0, discrete, num_skills=15
-    "sd000_s_36524705.0.20260807_020720"  # antmaze-medium-navigate-v0, continuous, skill_dim=10
+    "sd000_s_36595180.0.20260807_234044"  # antsoccer-arena-stitch-v0
+    "sd000_s_36595201.0.20260807_234040"  # antsoccer-arena-stitch-v0
+    "sd000_s_36595199.0.20260807_234037"  # antmaze-medium-stitch-v0
+    "sd000_s_36595198.0.20260807_234034"  # antmaze-medium-stitch-v0
+    "sd000_s_36595197.0.20260807_234031"  # antsoccer-arena-navigate-v0
+    "sd000_s_36595196.0.20260807_234028"  # antsoccer-arena-navigate-v0
+    "sd000_s_36595195.0.20260807_234025"  # antmaze-medium-navigate-v0
+    "sd000_s_36595192.0.20260807_234023"  # antmaze-medium-navigate-v0
 )
 
 if [ -z "$IDX" ] || [ "$IDX" -ge ${#RUNS[@]} ]; then
@@ -80,6 +82,12 @@ ENV=$(python -c "import json,sys;print(json.load(open(sys.argv[1]+'/flags.json')
 
 echo "IDX=$IDX  AGENT=$AGENT_NAME  ENV=$ENV  RESUME_DIR=$RESUME_DIR"
 echo "checkpoints present: $(ls "$RESUME_DIR"/params_*.pkl 2>/dev/null | wc -l)"
+
+if [ -f "$RESUME_DIR/wandb_run_id.txt" ]; then
+    echo "wandb_run_id.txt found ($(cat "$RESUME_DIR/wandb_run_id.txt")) — will re-attach to the existing wandb run."
+else
+    echo "WARNING: no wandb_run_id.txt in $RESUME_DIR — main.py will start a NEW wandb run (training still resumes in place from step $(ls "$RESUME_DIR"/params_*.pkl | grep -o '[0-9]*' | sort -n | tail -1))."
+fi
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 export MUJOCO_GL=egl
