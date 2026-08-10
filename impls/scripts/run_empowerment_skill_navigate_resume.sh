@@ -6,9 +6,9 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-3
+#SBATCH --array=0-1
 
-# Resume the 4 interrupted empowerment_skill runs from their latest
+# Resume the 2 interrupted empowerment_skill runs from their latest
 # checkpoint, in place. Submit from impls/:
 #   sbatch scripts/run_empowerment_skill_navigate_resume.sh
 #
@@ -35,8 +35,6 @@ AGENT_NAME=empowerment_skill
 # The enclosing <wandb project>/<run_group> path is globbed, so it does not
 # matter which sweep revision or project produced these.
 RUNS=(
-    "sd000_s_36234845.0.20260801_175753"
-    "sd000_s_36234841.0.20260801_175758"
     "sd000_s_36234847.0.20260801_175753"
     "sd000_s_36234843.0.20260801_175753"
 )
