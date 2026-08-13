@@ -510,8 +510,19 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                  Q(s' | s, a, z) = (1-γ) + γ · Q(s' | s', π(s',z), z)
         """
         future = batch['value_goals']
+
+        actions = batch['actions']
+        if (self.config.get('stochastic_policy_actions', False)
+                and self.config.get('perturb_q_loss_actions', True)
+                and not self.config['discrete'] and rng is not None):
+            data_noise = (
+                jax.random.normal(jax.random.fold_in(rng, 7), actions.shape)
+                * self.config['action_noise_std']
+            )
+            actions = jnp.clip(actions + data_noise, -1.0, 1.0)
+
         log_q = self.compute_q_logits(
-            batch['observations'], batch['actions'],
+            batch['observations'], actions,
             skills_onehot, future, params=grad_params
         )
 
@@ -537,7 +548,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             # 2) Optional self loss: Q(s | s,a,z) = (1-γ) + γ · V(s | s', z)
             if self.config.get('use_self_q_loss', True):
                 log_q_current = self.compute_q_logits(
-                    batch['observations'], batch['actions'],
+                    batch['observations'], actions,
                     skills_onehot, batch['observations'], params=grad_params
                 )
                 log_v_next_current = self.compute_v_logits_target(
@@ -589,7 +600,7 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
         # 2) Optional self loss: Q(s' | s,a) = (1-γ) + γ · Q(s' | s', π(s',z), z)
         if self.config.get('use_self_q_loss', True):
             log_q_current = self.compute_q_logits(
-                batch['observations'], batch['actions'],
+                batch['observations'], actions,
                 skills_onehot, batch['next_observations'], params=grad_params
             )
             log_q_next_current = self.compute_q_logits_target(
@@ -1140,6 +1151,8 @@ def get_config():
         # When enabled, a = π(s,z) + η, ignored when discrete=True.
         stochastic_policy_actions=False,
         action_noise_std=0.1,
+        # Also perturb *dataset* actions fed into Q in q_loss with the same σ,
+        perturb_q_loss_actions=True,
         # Log gating
         log_interval=5000,            # Skip empowerment() inside total_loss except on steps that match this interval.
         # ───────────────────────────────────────────────────────────────────
