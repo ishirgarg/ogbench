@@ -15,7 +15,7 @@ IDX=${SLURM_ARRAY_TASK_ID}
 # -----------------------------
 ENV=antsoccer-arena-stitch-v0
 BC_ALPHAS=(0.0003 0.001 0.003 0.01)
-ACTION_NOISE_STD=(0.00003 0.0001)
+ACTION_NOISE_STD=(0.000003 0.00001)
 PERTURB_Q_LOSS_ACTIONS=(True False)
 SKILLS=15
 
