@@ -1,6 +1,7 @@
 from collections import defaultdict
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from tqdm import trange
 
@@ -129,3 +130,62 @@ def evaluate(
         stats[k] = np.mean(v)
 
     return stats, trajs, renders
+
+
+def evaluate_skill(
+    agent,
+    env,
+    skill,
+    task_id=None,
+    config=None,
+    num_eval_episodes=50,
+    eval_temperature=0,
+    eval_gaussian=None,
+    seed=None,
+):
+    """Evaluate a skill-conditioned agent under one *fixed* skill on one task.
+
+    Unlike `evaluate`, the skill is pinned for the whole episode and the goal is
+    never fed to the policy: these agents are goal-agnostic, and the goal enters
+    only through the env's task_id (which sets the init state and the success
+    criterion). Requires the agent to implement `sample_actions_with_skill`.
+
+    Args:
+        agent: Skill-conditioned agent.
+        env: Environment.
+        skill: Fixed skill vector, shape [skill_width].
+        task_id: Task ID to be passed to the environment.
+        config: Configuration dictionary.
+        num_eval_episodes: Number of episodes to evaluate the agent.
+        eval_temperature: Action sampling temperature.
+        eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
+        seed: Seed for the action-sampling RNG (None draws one at random).
+
+    Returns:
+        The episode statistics, averaged over episodes (`success` among them).
+    """
+    if not hasattr(agent, 'sample_actions_with_skill'):
+        raise TypeError(
+            f'{type(agent).__name__} does not expose `sample_actions_with_skill`, so it has no '
+            f'skill-conditioned policy to roll out under a fixed skill.'
+        )
+    rng_seed = np.random.randint(0, 2**32) if seed is None else seed
+    actor_fn = supply_rng(agent.sample_actions_with_skill, rng=jax.random.PRNGKey(rng_seed))
+    skill = jnp.asarray(skill)
+
+    stats = defaultdict(list)
+    for _ in trange(num_eval_episodes, leave=False):
+        observation, info = env.reset(options=dict(task_id=task_id, render_goal=False))
+        done = False
+        while not done:
+            action = np.array(actor_fn(observations=observation, skills=skill, temperature=eval_temperature))
+            if not config.get('discrete'):
+                if eval_gaussian is not None:
+                    action = np.random.normal(action, eval_gaussian)
+                action = np.clip(action, -1, 1)
+
+            observation, _, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+        add_to(stats, flatten(info))
+
+    return {k: np.mean(v) for k, v in stats.items()}

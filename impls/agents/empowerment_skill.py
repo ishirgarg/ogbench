@@ -981,6 +981,35 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             actions = actions[0]
         return actions
 
+    # ── Skill-conditioned evaluation hook (see eval_skill_policy.py) ──────────
+
+    def skill_set(self, seed=None, num_skills=None, observations=None):
+        """Candidate skills to sweep at eval time: the K one-hots. [K, K]."""
+        return jnp.eye(int(self.config['num_skills']))
+
+    @jax.jit
+    def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):
+        """Act under a *fixed* skill: a ~ π(a | s, z). Goal-agnostic by construction."""
+        if seed is None:
+            seed = self.rng
+
+        single_obs_ndim = 3 if self.config.get('encoder') is not None else 1
+        single_obs = observations.ndim == single_obs_ndim
+        if single_obs:
+            observations = observations[None, ...]
+
+        skills = skills[None, ...] if skills.ndim == 1 else skills
+        skills = jnp.broadcast_to(skills, (observations.shape[0], skills.shape[-1]))
+
+        dist = self.network.select('policy')(observations, skills, temperature=temperature)
+        actions = dist.sample(seed=seed)
+        if not self.config['discrete']:
+            actions = jnp.clip(actions, -1, 1)
+
+        if single_obs:
+            actions = actions[0]
+        return actions
+
     # ── Constructor ───────────────────────────────────────────────────────────
 
     @classmethod

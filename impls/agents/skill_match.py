@@ -152,6 +152,19 @@ class SkillMatchAgent(flax.struct.PyTreeNode):
             actions = actions[0]
         return actions
 
+    # ── Skill-conditioned evaluation hook (see eval_skill_policy.py) ─────────
+    #
+    # Delegates to the frozen low-level skill agent: sweeping skills here bypasses
+    # the high-level IQL actor entirely, which is exactly what the sweep wants.
+
+    def skill_set(self, seed=None, num_skills=None, observations=None):
+        return self.skill_agent.skill_set(seed=seed, num_skills=num_skills, observations=observations)
+
+    def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):
+        return self.skill_agent.sample_actions_with_skill(
+            observations, skills, seed=seed, temperature=self.config['low_temperature']
+        )
+
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         """Create a new agent.

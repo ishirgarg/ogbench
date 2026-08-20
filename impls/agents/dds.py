@@ -780,6 +780,30 @@ class DDSAgent(flax.struct.PyTreeNode):
         new_state = {'skill': new_skill.astype(jnp.int32), 'count': agent_state['count'] + 1}
         return actions, new_state
 
+    # ── Skill-conditioned evaluation hook (see eval_skill_policy.py) ──────────
+
+    def skill_set(self, seed=None, num_skills=None, observations=None):
+        """Candidate skills to sweep at eval time: the VQ codebook. [K, D_z]."""
+        return jnp.asarray(self._codebook_table())
+
+    @jax.jit
+    def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):
+        """Act under a *fixed* codebook skill: a ~ D(z, s), bypassing the high-level actor."""
+        if seed is None:
+            seed = self.rng
+
+        single_obs_ndim = 3 if self.config.get('encoder') is not None else 1
+        single_obs = observations.ndim == single_obs_ndim
+        obs_b = observations[None, ...] if single_obs else observations
+
+        skills = skills[None, ...] if skills.ndim == 1 else skills
+        skills = jnp.broadcast_to(skills, (obs_b.shape[0], skills.shape[-1]))
+
+        actions = self._decode(obs_b, skills, seed, temperature)
+        if single_obs:
+            actions = actions[0]
+        return actions
+
     # ── Constructor ───────────────────────────────────────────────────────────
 
     @classmethod

@@ -299,6 +299,15 @@ def main():
         default=384,
         help="Number of s+ samples used in empowerment Monte Carlo estimate.",
     )
+    parser.add_argument(
+        "--num_negatives",
+        type=int,
+        default=None,
+        help="Override the agent's num_negatives (contrastive/DV negatives per state). "
+             "Only the positive-side sample count is controlled by --num_splus_samples; "
+             "for DV the negative term is a log-mean-exp whose variance is set by THIS. "
+             "Default: leave the trained config's value untouched.",
+    )
     parser.add_argument("--x_min", type=float, default=0, help="Grid min x for ant position.")
     parser.add_argument("--x_max", type=float, default=20, help="Grid max x for ant position.")
     parser.add_argument("--y_min", type=float, default=0, help="Grid min y for ant position.")
@@ -390,6 +399,8 @@ def main():
     agent_cfg["num_splus_samples"] = int(args.num_splus_samples)
     if "est_num_joints" in agent_cfg:
         agent_cfg["est_num_joints"] = int(args.num_splus_samples)
+    if args.num_negatives is not None and "num_negatives" in agent_cfg:
+        agent_cfg["num_negatives"] = int(args.num_negatives)
     env_name = flags["env_name"]
 
     env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))

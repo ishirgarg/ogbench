@@ -532,6 +532,50 @@ class OPALAgent(flax.struct.PyTreeNode):
         new_state = {"skill": new_skill, "count": agent_state["count"] + 1}
         return actions, new_state
 
+    # ── Skill-conditioned evaluation hook (see eval_skill_policy.py) ────────────
+
+    def skill_set(self, seed=None, num_skills=None, observations=None):
+        """Candidate skills to sweep at eval time. [K, skill_width].
+
+        Discrete: the K one-hots, i.e. exactly the learned skill set. Continuous:
+        the latent is a state-conditioned Gaussian p(z|s_1) with no finite skill
+        set, so we draw `num_skills` samples once from the prior at a reference
+        observation and freeze them as the candidate set.
+        """
+        if self.config["latent_type"] == "discrete":
+            return jnp.eye(int(self.config["num_skills"]))
+
+        K = int(num_skills if num_skills is not None else self.config["num_skills"])
+        if observations is None:
+            raise ValueError(
+                "OPAL with latent_type='continuous' needs a reference observation to draw "
+                "candidate skills from its state-conditioned prior p(z|s_1)."
+            )
+        obs = observations[None] if observations.ndim == 1 else observations
+        obs = jnp.broadcast_to(obs[:1], (K, obs.shape[-1]))
+        seed = self.rng if seed is None else seed
+        return self.network.select("prior")(obs, 1.0).sample(seed=seed)
+
+    @jax.jit
+    def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):
+        """Act under a *fixed* skill: a ~ pi(a | s, z) from the VAE decoder."""
+        if seed is None:
+            seed = self.rng
+
+        single_obs = observations.ndim == 1
+        obs = observations[None] if single_obs else observations
+
+        skills = skills[None, ...] if skills.ndim == 1 else skills
+        skills = jnp.broadcast_to(skills, (obs.shape[0], skills.shape[-1]))
+
+        szs = jnp.concatenate([obs, skills], axis=-1)
+        actions = self.network.select("decoder")(szs, temperature).sample(seed=seed)
+        actions = jnp.clip(actions, -1.0, 1.0)
+
+        if single_obs:
+            actions = actions[0]
+        return actions
+
     # ── Constructor ────────────────────────────────────────────────────────────
 
     @classmethod

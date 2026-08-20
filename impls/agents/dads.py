@@ -638,6 +638,31 @@ class DADSAgent(flax.struct.PyTreeNode):
             actions = actions[0]
         return actions
 
+    # ── Skill-conditioned evaluation hook (see eval_skill_policy.py) ─────────
+
+    def skill_set(self, seed=None, num_skills=None, observations=None):
+        """Candidate skills to sweep at eval time: the K one-hots. [K, K]."""
+        return jnp.eye(int(self.config['num_skills']))
+
+    @jax.jit
+    def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):
+        """Act under a *fixed* skill: a ~ pi(a | s, z). Goal-agnostic by construction."""
+        if seed is None:
+            seed = self.rng
+
+        single_obs = observations.ndim == 1
+        if single_obs:
+            observations = observations[None, :]
+
+        skills = skills[None, ...] if skills.ndim == 1 else skills
+        skills = jnp.broadcast_to(skills, (observations.shape[0], skills.shape[-1]))
+
+        dist = self.network.select('actor')(observations, skills, temperature=temperature)
+        actions = jnp.clip(dist.sample(seed=seed), -1.0, 1.0)
+        if single_obs:
+            actions = actions[0]
+        return actions
+
     # ── Constructor ──────────────────────────────────────────────────────────
 
     @classmethod
