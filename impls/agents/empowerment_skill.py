@@ -981,11 +981,45 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             actions = actions[0]
         return actions
 
-    # ── Skill-conditioned evaluation hook (see eval_skill_policy.py) ──────────
+    # ── Skill-conditioned evaluation hooks ────────────────────────────────────
+    # `skill_set` / `sample_actions_with_skill` drive eval_skill_policy.py;
+    # `skill_values` additionally drives eval_skill_value_policy.py.
 
     def skill_set(self, seed=None, num_skills=None, observations=None):
         """Candidate skills to sweep at eval time: the K one-hots. [K, K]."""
         return jnp.eye(int(self.config['num_skills']))
+
+    @jax.jit
+    def skill_values(self, observations, goals):
+        """log V^z(g | s) for every candidate skill  ->  [..., K].
+
+        Entry k is the value of the k-th skill of `skill_set()` -- that same
+        array is what is scored here, so the alignment a value-greedy selector
+        relies on is structural rather than conventional. V is the learned
+        contrastive value: the V head in separate_qv mode, otherwise
+        Q(s, pi(s, z), z, .). The goal is fed through `_extract_future`, exactly
+        as s+ is in training. Note that in the combined mode no rng is threaded
+        in, so Q is evaluated at the noiseless mode action even when
+        `stochastic_policy_actions` perturbed it during training.
+
+        `observations` and `goals` must be batched the same way: either one of
+        each (returning [K]) or a matching batch of each (returning [batch, K]).
+        """
+        single_obs_ndim = 3 if self.config.get('encoder') is not None else 1
+        single_obs = observations.ndim == single_obs_ndim
+        if single_obs:
+            observations = observations[None, ...]
+        if goals.ndim == single_obs_ndim:
+            goals = goals[None, ...]
+
+        batch_size = observations.shape[0]
+
+        def value_for_skill(skill):
+            skills_onehot = jnp.broadcast_to(skill, (batch_size, skill.shape[-1]))
+            return self.compute_v_logits(observations, skills_onehot, goals)
+
+        values = jnp.moveaxis(jax.vmap(value_for_skill)(self.skill_set()), 0, -1)  # [batch, K]
+        return values[0] if single_obs else values
 
     @jax.jit
     def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):
