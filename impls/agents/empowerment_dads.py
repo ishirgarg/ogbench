@@ -34,9 +34,12 @@ SequenceDataset, no masking:
 
 No BA routine is needed: the max over labelings/usage that BA supplies for a
 fixed channel is built into the training objective, and at the optimum the
-assignment tends toward the capacity-achieving structure. Collapse (all mass
-on one label) is not a fixed point worth reaching under this objective -- it
-drives the bracket to zero -- so no auxiliary entropy terms are added.
+assignment tends toward the capacity-achieving structure. Full collapse (all
+mass on one label) drives the bracket to zero, but partial collapse (dead
+skills that never receive gradient) is a stable local optimum; `kl_coef` > 0
+adds KL(Unif[k] || batch skill usage) to the loss (gradient into the encoder),
+the Lagrangian form of DADS's fixed uniform skill prior, to keep all k skills
+in use. It does not enter the reported bound.
 
 Note on interpretation: because the labels are optimized to maximize the very
 bound being reported, `mi_estimate` is a prescriptive quantity ("the most
@@ -121,11 +124,17 @@ class EmpowermentDADSAgent(flax.struct.PyTreeNode):
         clf_loss = -(alpha_sg * logm).sum(-1).mean()
         info['clf_loss'] = clf_loss
 
-        loss = bracket_loss + clf_loss
+        # KL(Unif[k] || batch usage): pushes the labeling toward uniform skill usage.
+        k = self.config['num_skills']
+        usage = alpha.mean(0)  # [k]
+        kl_usage = -jnp.log(k) - jnp.log(usage + 1e-8).mean()
+        info['kl_usage'] = kl_usage
+
+        loss = bracket_loss + clf_loss + self.config.get('kl_coef', 0.0) * kl_usage
 
         # Diagnostics.
         info['mi_estimate'] = -jax.lax.stop_gradient(bracket_loss)
-        usage = alpha_sg.mean(0)  # [k]
+        usage = jax.lax.stop_gradient(usage)
         info['usage_min'] = usage.min()
         info['usage_max'] = usage.max()
         return loss, info
@@ -225,6 +234,7 @@ def get_config():
         enc_hidden_dims=(512, 512, 512),
         layer_norm=True,
         est_num_joints=16,       # M draws per state in empowerment()
+        kl_coef=0.0,             # weight on KL(Unif[k] || skill usage); 0 disables
         # main.py / GCDataset wiring. `value_goals` IS the channel target s+:
         # geometric future state from the same trajectory, so p_trajgoal=1.0
         # and geom_sample=True are load-bearing, not defaults. The actor_ keys
