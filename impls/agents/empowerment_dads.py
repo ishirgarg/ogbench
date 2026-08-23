@@ -1,10 +1,9 @@
 """Offline skill-level empowerment agent (DADS/DIAYN-style, MI-maximizing labels).
 
-Companion to agents/empowerment_opal_dads.py with the EM machinery removed:
-instead of discovering skills by likelihood EM under a step-dynamics model and
-then measuring the MI of that fixed labeling (with Blahut-Arimoto as a
-separate capacity routine), this agent chooses the labels themselves to
-maximize the Barber-Agakov bracket directly:
+Instead of discovering skills by likelihood EM under a step-dynamics model and
+then measuring the MI of that fixed labeling (the DADS/OPAL-Appendix-F
+recipe; see empowerment/run_dads.py), this agent chooses the labels themselves
+to maximize the Barber-Agakov bracket directly:
 
     max_{alpha, q}  E_{s0,s+} E_{z ~ alpha(.|s0,s+)} [ log q(s+|s0,z)
                         - logsumexp_z'(log m(z'|s0) + log q(s+|s0,z')) ]
@@ -44,7 +43,7 @@ in use. It does not enter the reported bound.
 Note on interpretation: because the labels are optimized to maximize the very
 bound being reported, `mi_estimate` is a prescriptive quantity ("the most
 information-carrying way to carve this data into k modes"), upper-tilted
-relative to the likelihood-EM estimate of empowerment_opal_dads.
+relative to a likelihood-EM estimate (empowerment/run_dads.py).
 
 This agent has no actor; sample_actions returns uniform random actions.
 """
@@ -222,9 +221,9 @@ class EmpowermentDADSAgent(flax.struct.PyTreeNode):
 def get_config():
     return ml_collections.ConfigDict(dict(
         agent_name='empowerment_dads',
-        # Matched to agents/empowerment_opal_dads.py for a like-for-like
+        # Matched to the other empowerment agents for a like-for-like
         # comparison (same lr, batch size, MDN/classifier trunks, skill count,
-        # window length, discount).
+        # discount).
         lr=3e-4,
         batch_size=1024,
         num_skills=15,           # k

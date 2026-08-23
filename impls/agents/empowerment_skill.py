@@ -380,6 +380,31 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         return jax.vmap(phi_for_skill)(skills_onehot, act_rngs)   # [K, batch, d]
 
+    def _psi_module_key(self, use_target: bool):
+        """Name of the module whose scope holds the ψ tower's parameters.
+
+        In separate_qv mode ψ is one shared instance handed to both the Q and the V
+        network, so flax stores its parameters under whichever bound it first.
+        """
+        suffix = 'target_' if use_target else ''
+        for key in (f'{suffix}v', f'{suffix}q'):
+            params = self.network.params.get(f'modules_{key}')
+            if params is not None and ('shared_psi' in params or 'psi_net' in params):
+                return key
+        raise KeyError(
+            f'no module among {suffix}v / {suffix}q owns a ψ tower; the value network '
+            f'layout changed and `_v_psi` needs updating.'
+        )
+
+    def _v_psi(self, future_states, *, use_target: bool):
+        """ψ_V embedding of the goal side  →  [batch, d]."""
+        key = self._psi_module_key(use_target)
+        net = self.network.model_def.modules[key]
+        vars_ = jax.lax.stop_gradient(
+            {'params': self.network.params[f'modules_{key}']}
+        )
+        return net.apply(vars_, self._extract_future(future_states), method=net.psi)
+
     def _q_phi(self, observations, actions, skills_onehot, *, use_target: bool):
         """φ_Q embedding  →  [batch, d].
 
@@ -1020,6 +1045,47 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
 
         values = jnp.moveaxis(jax.vmap(value_for_skill)(self.skill_set()), 0, -1)  # [batch, K]
         return values[0] if single_obs else values
+
+    @jax.jit
+    def value_goal_embeddings(self, goals):
+        """psi(g) for the value head  ->  [G, d].
+
+        The cacheable half of `skill_values_cross`: a planner scoring a fixed set of
+        candidate goals embeds them once and then only pays for phi at each new state.
+        """
+        return self._v_psi(goals, use_target=False)
+
+    @jax.jit
+    def skill_values_from_goal_embeddings(self, observations, goal_embeddings):
+        """log V^z(g | s) from precomputed psi(g)  ->  [B, G, K].
+
+        The value head is bilinear -- log V = -||phi(s, z) - psi(g)||^2 / d -- so
+        pairing is a squared-distance expansion. Entry [b, g, k] is the value of
+        `skill_set()[k]`, matching `skill_values`. Unlike `skill_values`, both
+        arguments must be batched.
+        """
+        d = self.config['value_latent_dim']
+        phi = self._v_phi_all_skills(observations, use_target=False)  # [K, B, d]
+        psi = goal_embeddings                                         # [G, d]
+        # Without precision='highest' this lowers to TF32 on Ampere GPUs while the
+        # `jnp.sum` terms stay f32, mixing precisions exactly where they cancel.
+        sq = (
+            jnp.sum(phi ** 2, axis=-1)[..., None]
+            + jnp.sum(psi ** 2, axis=-1)[None, None, :]
+            - 2.0 * jnp.einsum('kbd,gd->kbg', phi, psi, precision='highest')
+        )
+        return jnp.moveaxis(-sq / d, 0, -1)  # [B, G, K]
+
+    @jax.jit
+    def skill_values_cross(self, observations, goals):
+        """log V^z(g | s) for every (observation, goal, skill) triple  ->  [B, G, K].
+
+        The outer-product form of `skill_values`, identical to it entry for entry:
+        `skill_values_cross(obs, goals)[b, g] == skill_values(obs[b], goals[g])`.
+        """
+        return self.skill_values_from_goal_embeddings(
+            observations, self.value_goal_embeddings(goals)
+        )
 
     @jax.jit
     def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):

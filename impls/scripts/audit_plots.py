@@ -31,7 +31,7 @@ CKPT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ckpt
 # Agents that expose skill-conditioned policies usable by the path plots.
 SKILL_AGENTS = {
     "empowerment_skill", "empowerment_dads", "empowerment_dv",
-    "empowerment_opal_dads", "dads", "opal",
+    "dads", "opal",
 }
 # Agents with a state-empowerment head but no skill policy.
 MAP_ONLY_AGENTS = {"empowerment_crl", "empowerment_crl_flowbc"}
