@@ -2,7 +2,7 @@
 #SBATCH --job-name=opal_discrete_50skills_resume
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --qos=rail_gpu4_low
 #SBATCH --requeue
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
