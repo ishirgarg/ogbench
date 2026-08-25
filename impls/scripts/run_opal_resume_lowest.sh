@@ -1,16 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=opal_resume
+#SBATCH --job-name=opal_resume_lowest
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_lowest
 #SBATCH --requeue
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-7
+#SBATCH --array=0-3
 
-# Resume the 8 interrupted opal runs from their latest checkpoint, in place.
-# Submit from impls/:  sbatch scripts/run_opal_resume.sh
+# Resume the 4 interrupted opal runs below from their latest checkpoint, in
+# place, on the LOWEST-priority queue. Sibling of scripts/run_opal_resume.sh,
+# which is identical except for the run list and qos=rail_gpu4_normal.
+# Submit from impls/:  sbatch scripts/run_opal_resume_lowest.sh
 #
 # Each run continues in ITS OWN existing folder: the same params_*.pkl series,
 # the same train.csv / eval.csv (appended, not truncated), and the same wandb
@@ -39,14 +41,10 @@ AGENT_NAME=opal
 # The enclosing <wandb project>/<run_group> path is globbed, so it does not
 # matter which sweep revision or project produced these.
 RUNS=(
-    "sd000_s_36595180.0.20260807_234044"  # antsoccer-arena-stitch-v0
-    "sd000_s_36595201.0.20260807_234040"  # antsoccer-arena-stitch-v0
-    "sd000_s_36595199.0.20260807_234037"  # antmaze-medium-stitch-v0
-    "sd000_s_36595198.0.20260807_234034"  # antmaze-medium-stitch-v0
-    "sd000_s_36595197.0.20260807_234031"  # antsoccer-arena-navigate-v0
-    "sd000_s_36595196.0.20260807_234028"  # antsoccer-arena-navigate-v0
-    "sd000_s_36595195.0.20260807_234025"  # antmaze-medium-navigate-v0
-    "sd000_s_36595192.0.20260807_234023"  # antmaze-medium-navigate-v0
+    "sd000_s_37946048.0.20260822_175727"
+    "sd000_s_37946055.0.20260822_175727"
+    "sd000_s_37946054.0.20260822_175727"
+    "sd000_s_37946049.0.20260822_175713"
 )
 
 if [ -z "$IDX" ] || [ "$IDX" -ge ${#RUNS[@]} ]; then
