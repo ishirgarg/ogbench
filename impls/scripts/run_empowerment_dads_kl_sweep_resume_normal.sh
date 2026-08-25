@@ -3,6 +3,7 @@
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
 #SBATCH --qos=rail_gpu4_normal
+#SBATCH --requeue
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
