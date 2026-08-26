@@ -2,7 +2,7 @@
 #SBATCH --job-name=opal_discrete_50skills
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --qos=rail_gpu4_low
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
@@ -61,5 +61,5 @@ python main.py \
     --seed=$SEED \
     --train_steps=1000000 \
     --video_episodes=0 \
-    --save_interval=50000 \
+    --save_interval=25000 \
     --save_dir=$SAVE_DIR
