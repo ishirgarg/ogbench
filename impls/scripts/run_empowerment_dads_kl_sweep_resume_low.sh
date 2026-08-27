@@ -2,7 +2,7 @@
 #SBATCH --job-name=emp_dads_kl_sweep_resume_low
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --qos=rail_gpu4_low
 #SBATCH --requeue
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
@@ -11,7 +11,7 @@
 
 # Resume all 8 empowerment_dads KL-sweep runs launched by
 # scripts/run_empowerment_dads_kl_sweep.sh (2026-08-22, rail_gpu4_lowest) from
-# their latest checkpoint, in place, on the lowest-priority queue again.
+# their latest checkpoint, in place, on the low-priority queue.
 #
 # Submit from impls/:  sbatch scripts/run_empowerment_dads_kl_sweep_resume_low.sh
 #
