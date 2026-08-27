@@ -423,6 +423,13 @@ class SequenceDataset(GCDataset):
       - ``actions_seq``:      ``[B, T, *act_shape]`` — actions over the same window.
       - ``seq_mask``:         ``[B, T]`` float — 1.0 for in-trajectory steps, 0.0 for
         steps padded past the terminal. Agents MUST mask padded steps in losses.
+      - ``timesteps_seq``:    ``[B, T]`` int — timestep of each window step WITHIN its
+        own trajectory (0 at the reset state), for absolute-timestep embeddings.
+        Padded steps repeat the terminal's timestep.
+      - ``skill_hist_seq``:   ``[B, T, num_skills]`` float — the future-skill histogram
+        ``Z_t = normalize(sum_{t'=t}^{T} one_hot(z_{t'}))`` to the TRAJECTORY end
+        (Skill-DT, Sec. 4.1). Present ONLY after ``relabel_skill_histograms`` has
+        been called at least once; absent otherwise.
 
     For semi-MDP / option-style agents (e.g. DDS) it also emits the per-window
     goal-conditioned reward signal and the macro-step bootstrap state — all
@@ -447,7 +454,58 @@ class SequenceDataset(GCDataset):
 
     Reads one config key:
       - ``sequence_length``: window length ``T``.
+    (and ``num_skills``, but only if ``relabel_skill_histograms`` is used.)
     """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Timestep of every state within its own trajectory (0 at the reset state).
+        all_idxs = np.arange(self.size)
+        self.traj_timesteps = (
+            all_idxs - self.initial_locs[np.searchsorted(self.initial_locs, all_idxs, side='right') - 1]
+        ).astype(np.int32)
+        # Forward-cumulative skill counts, filled in by `relabel_skill_histograms`.
+        # None until the first re-labelling pass, in which case `skill_hist_seq` is
+        # simply absent from the sampled batch.
+        self.skill_cumcounts = None
+
+    def relabel_skill_histograms(self, agent, chunk_bytes=64 * 1024 * 1024):
+        """Hindsight skill re-labelling (Skill-DT, paper Sec. 4.1.1 and Alg. 1).
+
+        Re-encodes EVERY state in the dataset with the agent's CURRENT skill
+        encoder and rebuilds the trajectory-end skill histograms ``Z_t``. Called
+        from ``main.py`` every ``relabel_interval`` gradient steps, so ``Z_t`` is
+        at most ``relabel_interval - 1`` steps stale, exactly as in Alg. 1.
+
+        Rather than materializing ``Z_t`` for every state (a ``[size, num_skills]``
+        float array), this stores the forward cumulative counts
+        ``C[i] = sum_{j < i} one_hot(z_j)`` with a leading zero row, from which the
+        counts over any trajectory suffix ``[t, T]`` are ``C[T + 1] - C[t]``.
+        ``sample`` normalizes those for the sampled window only.
+
+        Args:
+            agent: agent exposing ``encode_skill_indices(observations) -> [B] int``.
+            chunk_bytes: observation bytes pushed through the encoder at a time.
+        """
+        num_skills = int(self.config['num_skills'])
+
+        # Chunk by BYTES, not by count: image datasets would otherwise ship
+        # gigabytes to the device per chunk.
+        leaves = jax.tree_util.tree_leaves(self.dataset['observations'])
+        item_bytes = sum(int(np.prod(leaf.shape[1:])) * leaf.dtype.itemsize for leaf in leaves)
+        if self.config['frame_stack'] is not None and not self.preprocess_frame_stack:
+            item_bytes *= int(self.config['frame_stack'])
+        chunk_size = int(np.clip(chunk_bytes // max(item_bytes, 1), 1024, 100000))
+
+        if self.skill_cumcounts is None or self.skill_cumcounts.shape[1] != num_skills:
+            self.skill_cumcounts = np.zeros((self.size + 1, num_skills), dtype=np.int32)
+        counts = self.skill_cumcounts[1:]  # view; row i is one-hot(z_i) before the cumsum
+        counts.fill(0)
+        for start in range(0, self.size, chunk_size):
+            idxs = np.arange(start, min(start + chunk_size, self.size))
+            skills = np.asarray(jax.device_get(agent.encode_skill_indices(self.get_observations(idxs))))
+            counts[idxs, skills] = 1
+        np.cumsum(counts, axis=0, out=counts)
 
     def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:
@@ -475,6 +533,18 @@ class SequenceDataset(GCDataset):
             lambda arr: arr.reshape((batch_size, T) + arr.shape[1:]), act_flat
         )
         batch['seq_mask'] = seq_mask
+        batch['timesteps_seq'] = self.traj_timesteps[seq_idxs]
+
+        # Future-skill histogram to the trajectory end, from the last re-labelling
+        # pass. Padded steps are clamped onto the terminal, so their histogram is
+        # the terminal's own one-hot; agents mask them out regardless.
+        if self.skill_cumcounts is not None:
+            suffix_counts = (
+                self.skill_cumcounts[final_state_idxs[:, None] + 1] - self.skill_cumcounts[seq_idxs]
+            ).astype(np.float32)
+            batch['skill_hist_seq'] = suffix_counts / np.maximum(
+                suffix_counts.sum(axis=-1, keepdims=True), 1.0
+            )
 
         # Per-window goal-conditioned reward/mask w.r.t. the SAME value goal (matches GCDataset).
         successes_seq = (seq_idxs == value_goal_idxs[:, None]).astype(np.float32)  # [B, T]

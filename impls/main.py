@@ -238,6 +238,18 @@ def main(_):
     elif FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
+    # Hindsight skill re-labelling (Skill-DT, paper Sec. 4.1.1 / Alg. 1). Every
+    # `relabel_interval` gradient steps the whole dataset is re-encoded with the
+    # current skill encoder and the trajectory-end histograms Z_t are rebuilt.
+    relabel_interval = int(config['relabel_interval']) if 'relabel_interval' in config else 0
+    relabel_datasets = []
+    if relabel_interval > 0 and hasattr(agent, 'encode_skill_indices'):
+        assert hasattr(train_dataset, 'relabel_skill_histograms'), (
+            f'relabel_interval={relabel_interval} > 0 needs a dataset that supports hindsight skill '
+            f"re-labelling; set dataset_class='SequenceDataset' (got {config['dataset_class']})."
+        )
+        relabel_datasets = [d for d in (train_dataset, val_dataset) if d is not None]
+
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
@@ -245,6 +257,12 @@ def main(_):
     last_time = time.time()
     start_step = (resume_epoch + 1) if resume_epoch is not None else 1
     for i in tqdm.tqdm(range(start_step, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        # Re-label the skill histograms (Alg. 1's outer loop), before the batch
+        # that the next `relabel_interval` gradient steps are drawn from.
+        if relabel_datasets and (i - start_step) % relabel_interval == 0:
+            for relabel_dataset in relabel_datasets:
+                relabel_dataset.relabel_skill_histograms(agent)
+
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
         agent, update_info = agent.update(batch)
