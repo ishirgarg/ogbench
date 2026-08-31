@@ -2,14 +2,14 @@
 #SBATCH --job-name=skill_dt_sweep
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_lowest
+#SBATCH --qos=rail_gpu4_low
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
 #SBATCH --array=0-7
 
 # Skill Decision Transformer (agents/skill_dt.py, arXiv:2301.13573) on the four
-# antmaze/antsoccer datasets at 15 and 50 skills. Lowest-priority queue.
+# antmaze/antsoccer datasets at 15 and 50 skills. Low-priority queue.
 #
 #   4 envs x 2 codebook sizes, seed 0.  ENV = IDX / 2, SKILLS = IDX % 2, envs
 #   ordered navigate first, so IDX 0-3 are navigate and IDX 4-7 are stitch.
@@ -97,5 +97,5 @@ python main.py \
     --video_episodes=0 \
     --eval_episodes=5 \
     --eval_on_cpu=0 \
-    --save_interval=50000 \
+    --save_interval=25000 \
     --save_dir=$SAVE_DIR
