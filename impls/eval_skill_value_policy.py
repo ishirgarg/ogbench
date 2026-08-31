@@ -44,7 +44,7 @@ import numpy as np
 
 from agents import agents as agent_registry
 from eval_skill_policy import eval_horizon, latest_epoch, load_agent, load_flags
-from utils.evaluation import evaluate_value_selected_skill
+from utils.evaluation import evaluate_value_selected_skill, raise_time_limit
 
 
 def main():
@@ -59,6 +59,9 @@ def main():
     p.add_argument('--eval_temperature', type=float, default=0.0, help='Actor temperature for evaluation.')
     p.add_argument('--eval_gaussian', type=float, default=None, help='Action Gaussian noise for evaluation.')
     p.add_argument('--eval_on_cpu', type=int, default=1, help='Whether to evaluate on CPU.')
+    p.add_argument('--horizon', type=int, default=None,
+                   help='Override the env episode horizon (max steps before truncation). Only ever '
+                        'lengthens it (default: the env\'s registered horizon).')
     p.add_argument('--skills', type=str, default=None,
                    help='Comma-separated skill indices the selector may choose from (default: all).')
     p.add_argument('--seed', type=int, default=0,
@@ -66,7 +69,7 @@ def main():
     p.add_argument('--dataset_path', type=str, default=None,
                    help='Override the dataset path recorded in flags.json (only affects agent construction).')
     p.add_argument('--output', type=str, default=None,
-                   help='Output JSON path (default: <run_dir>/skill_value_eval_e<epoch>_h<horizon>.json).')
+                   help='Output JSON path (default: <run_dir>/skill_value_eval_e<epoch>_h<skill_horizon>.json).')
     args = p.parse_args()
 
     run_dir = args.run_dir.rstrip('/')
@@ -89,7 +92,10 @@ def main():
             f'agents/{agent_name}.py (see agents/empowerment_skill.py).'
         )
 
-    agent, env, config = load_agent(run_dir, epoch, saved, dataset_path=args.dataset_path)
+    agent, env, config, _ = load_agent(run_dir, epoch, saved, dataset_path=args.dataset_path)
+
+    if args.horizon is not None:
+        raise_time_limit(env, args.horizon)
 
     if args.eval_on_cpu:
         agent = jax.device_put(agent, device=jax.devices('cpu')[0])

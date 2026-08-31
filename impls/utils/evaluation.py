@@ -1,3 +1,4 @@
+import inspect
 from collections import defaultdict
 
 import jax
@@ -27,6 +28,56 @@ def flatten(d, parent_key='', sep='.'):
         else:
             items.append((new_key, v))
     return dict(items)
+
+
+def env_horizon(env):
+    """The env's registered episode horizon (`max_episode_steps`), or None.
+
+    OGBench registers a different horizon per environment (from 50 up to
+    humanoidmaze-giant's 4000), applied by gymnasium's TimeLimit wrapper.
+    """
+    spec = getattr(env, 'spec', None) or getattr(env.unwrapped, 'spec', None)
+    return None if spec is None else spec.max_episode_steps
+
+
+def raise_time_limit(env, min_steps):
+    """Lift the env's TimeLimit so rollouts can run up to `min_steps` steps.
+
+    OGBench envs wrap a gymnasium TimeLimit with a fixed `max_episode_steps`, so a
+    rollout truncates there no matter how many steps the caller asks for. Walk the
+    wrapper chain and bump every `_max_episode_steps` (and the spec) that is lower
+    than the target; anything already >= it is left alone, so this only ever
+    lengthens an episode, never shortens one. TimeLimit truncates once
+    `_elapsed_steps >= _max_episode_steps`, so setting it to exactly `min_steps`
+    (no +1) gives callers a `while not done` loop exactly `min_steps` usable steps.
+    """
+    target = int(min_steps)
+    e = env
+    while e is not None:
+        if getattr(e, '_max_episode_steps', None) is not None and e._max_episode_steps < target:
+            e._max_episode_steps = target
+        e = getattr(e, 'env', None)
+    spec = getattr(env, 'spec', None)
+    if spec is not None and getattr(spec, 'max_episode_steps', None) is not None \
+            and spec.max_episode_steps < target:
+        spec.max_episode_steps = target
+
+
+def init_eval_state(agent, env, skill=None):
+    """Build an agent's per-episode eval state, handing it the env horizon if it takes one.
+
+    Skill-DT's rollout statistic is defined over the whole episode horizon
+    (arXiv:2301.13573 Sec. A.5), which is per-env, so its `init_eval_state`
+    accepts a `max_steps`. Agents whose hook has no such parameter (DDS, OPAL)
+    are called exactly as before.
+    """
+    fn = agent.init_eval_state if skill is None else agent.init_eval_state_with_skill
+    kwargs = {}
+    if 'max_steps' in inspect.signature(fn).parameters:
+        horizon = env_horizon(env)
+        if horizon is not None:
+            kwargs['max_steps'] = horizon
+    return fn(**kwargs) if skill is None else fn(skill, **kwargs)
 
 
 def add_to(dict_of_lists, single_dict):
@@ -85,7 +136,7 @@ def evaluate(
         done = False
         step = 0
         render = []
-        agent_state = agent.init_eval_state() if use_eval_state else None
+        agent_state = init_eval_state(agent, env) if use_eval_state else None
         while not done:
             if use_eval_state:
                 action, agent_state = actor_fn(
@@ -148,7 +199,10 @@ def evaluate_skill(
     Unlike `evaluate`, the skill is pinned for the whole episode and the goal is
     never fed to the policy: these agents are goal-agnostic, and the goal enters
     only through the env's task_id (which sets the init state and the success
-    criterion). Requires the agent to implement `sample_actions_with_skill`.
+    criterion). Requires the agent to implement `sample_actions_with_skill`, or —
+    for agents whose policy needs per-episode history, e.g. Skill-DT's length-K
+    Transformer context — `init_eval_state_with_skill` + `sample_actions_with_skill_state`,
+    which thread a small per-episode state through the loop exactly as `evaluate` does.
 
     Args:
         agent: Skill-conditioned agent.
@@ -164,21 +218,36 @@ def evaluate_skill(
     Returns:
         The episode statistics, averaged over episodes (`success` among them).
     """
-    if not hasattr(agent, 'sample_actions_with_skill'):
+    use_eval_state = hasattr(agent, 'init_eval_state_with_skill') and hasattr(
+        agent, 'sample_actions_with_skill_state'
+    )
+    if not use_eval_state and not hasattr(agent, 'sample_actions_with_skill'):
         raise TypeError(
-            f'{type(agent).__name__} does not expose `sample_actions_with_skill`, so it has no '
+            f'{type(agent).__name__} does not expose `sample_actions_with_skill` (or the stateful '
+            f'`init_eval_state_with_skill` / `sample_actions_with_skill_state` pair), so it has no '
             f'skill-conditioned policy to roll out under a fixed skill.'
         )
     rng_seed = np.random.randint(0, 2**32) if seed is None else seed
-    actor_fn = supply_rng(agent.sample_actions_with_skill, rng=jax.random.PRNGKey(rng_seed))
+    actor_fn = supply_rng(
+        agent.sample_actions_with_skill_state if use_eval_state else agent.sample_actions_with_skill,
+        rng=jax.random.PRNGKey(rng_seed),
+    )
     skill = jnp.asarray(skill)
 
     stats = defaultdict(list)
     for _ in trange(num_eval_episodes, leave=False):
         observation, info = env.reset(options=dict(task_id=task_id, render_goal=False))
         done = False
+        agent_state = init_eval_state(agent, env, skill) if use_eval_state else None
         while not done:
-            action = np.array(actor_fn(observations=observation, skills=skill, temperature=eval_temperature))
+            if use_eval_state:
+                action, agent_state = actor_fn(
+                    observations=observation, skills=skill, agent_state=agent_state,
+                    temperature=eval_temperature,
+                )
+                action = np.array(action)
+            else:
+                action = np.array(actor_fn(observations=observation, skills=skill, temperature=eval_temperature))
             if not config.get('discrete'):
                 if eval_gaussian is not None:
                     action = np.random.normal(action, eval_gaussian)
@@ -189,6 +258,136 @@ def evaluate_skill(
         add_to(stats, flatten(info))
 
     return {k: np.mean(v) for k, v in stats.items()}
+
+
+def evaluate_planned_skill(
+    agent,
+    env,
+    skills,
+    planner,
+    task_id=None,
+    config=None,
+    num_eval_episodes=50,
+    skill_horizon=10,
+    eval_temperature=0,
+    eval_gaussian=None,
+    seed=None,
+):
+    """Evaluate a skill-conditioned agent under a subgoal-graph high-level controller.
+
+    Same execution loop as `evaluate_value_selected_skill` -- reselect every
+    `skill_horizon` env steps, then run pi(.|., z*) -- but the selector is a
+    `utils.skill_graph.SkillGraphPlanner` rather than a greedy argmax against the
+    task goal.
+
+    Args:
+        agent: Skill-conditioned agent.
+        env: Environment.
+        skills: Skill set, shape [K, skill_width], in the order the planner scores.
+        planner: Object with `select(observation, goal) -> (skill_index, info)`, where
+            `info` carries `direct`, `fallback` and `in_range`.
+        task_id: Task ID to be passed to the environment.
+        config: Configuration dictionary.
+        num_eval_episodes: Number of episodes to evaluate the agent.
+        skill_horizon: Env steps a selected skill is held for.
+        eval_temperature: Action sampling temperature.
+        eval_gaussian: Standard deviation of the Gaussian noise to add to the actions.
+        seed: Seed for the action-sampling and env RNGs (None means 0).
+
+    Returns:
+        The episode statistics, plus `skill_selection_counts`, `episode_length`,
+        `skill_switches` and the `plan_direct_frac` / `plan_fallback_frac` /
+        `plan_in_range_frac` planner diagnostics. The `plan_*` statistics are fixed
+        constants for a selector without a graph, so they are not comparable across
+        selectors.
+    """
+    if config is None:
+        raise ValueError('config is required; the action post-processing reads config["discrete"].')
+    if skill_horizon < 1:
+        raise ValueError(f'skill_horizon must be >= 1, got {skill_horizon}.')
+    if num_eval_episodes < 1:
+        raise ValueError(f'num_eval_episodes must be >= 1, got {num_eval_episodes}.')
+    rng_seed = 0 if seed is None else int(seed)
+    actor_fn = supply_rng(agent.sample_actions_with_skill, rng=jax.random.PRNGKey(rng_seed))
+    skills = jnp.asarray(skills)
+
+    env.action_space.seed(int(rng_seed) % (2**31))
+
+    probe_obs, probe_info = env.reset(options=dict(task_id=task_id, render_goal=False))
+    if probe_info.get('goal') is None:
+        raise ValueError(
+            f'env.reset(task_id={task_id}) returned no `goal` in info; the graph planner '
+            f'needs the goal observation to plan towards.'
+        )
+    num_values = np.asarray(
+        agent.skill_values(observations=jnp.asarray(probe_obs), goals=jnp.asarray(probe_info['goal']))
+    ).shape[-1]
+    if num_values != len(skills):
+        raise ValueError(
+            f'agent.skill_values returned {num_values} values but {len(skills)} skills were '
+            f'passed in; they must be the same set, in the same order.'
+        )
+
+    stats = defaultdict(list)
+    selection_counts = np.zeros(len(skills), dtype=np.int64)
+    for episode in trange(num_eval_episodes, leave=False):
+        reset_kwargs = dict(options=dict(task_id=task_id, render_goal=False))
+        if episode == 0:
+            reset_kwargs['seed'] = int(rng_seed) % (2**31)
+        observation, info = env.reset(**reset_kwargs)
+        goal = np.asarray(info['goal'])
+        if hasattr(planner, 'reset'):
+            planner.reset()
+
+        done = False
+        step = 0
+        switches = 0
+        decisions = 0
+        direct = 0
+        fallback = 0
+        in_range = 0
+        zi = None
+        while not done:
+            if step % skill_horizon == 0:
+                new_zi, sel = planner.select(observation, goal)
+                switches += int(zi is not None and new_zi != zi)
+                zi = new_zi
+                selection_counts[zi] += 1
+                decisions += 1
+                direct += int(sel['direct'])
+                fallback += int(sel.get('fallback', False))
+                in_range += int(sel['in_range'])
+
+            action = np.array(
+                actor_fn(observations=observation, skills=skills[zi], temperature=eval_temperature)
+            )
+            if not config.get('discrete'):
+                if eval_gaussian is not None:
+                    action = np.random.normal(action, eval_gaussian)
+                action = np.clip(action, -1, 1)
+
+            observation, _, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            step += 1
+
+        info_stats = flatten(info)
+        if episode == 0:
+            for key in ('episode_length', 'skill_switches', 'plan_direct_frac',
+                        'plan_fallback_frac', 'plan_in_range_frac'):
+                if key in info_stats:
+                    raise ValueError(
+                        f'env info already reports `{key}`; it would collide with the planner stat.'
+                    )
+        add_to(stats, info_stats)
+        stats['episode_length'].append(step)
+        stats['skill_switches'].append(switches)
+        stats['plan_direct_frac'].append(direct / decisions)
+        stats['plan_fallback_frac'].append(fallback / decisions)
+        stats['plan_in_range_frac'].append(in_range / decisions)
+
+    out = {k: np.mean(v) for k, v in stats.items()}
+    out['skill_selection_counts'] = selection_counts.tolist()
+    return out
 
 
 def evaluate_value_selected_skill(
@@ -246,6 +445,8 @@ def evaluate_value_selected_skill(
                 f'{type(agent).__name__} does not expose `{hook}`, so its skills cannot be '
                 f'selected by value. See agents/empowerment_skill.py for the reference hooks.'
             )
+    if config is None:
+        raise ValueError('config is required; the action post-processing reads config["discrete"].')
     if skill_horizon < 1:
         raise ValueError(f'skill_horizon must be at least 1, got {skill_horizon}.')
     if num_eval_episodes < 1:

@@ -28,6 +28,13 @@ An agent supports this script by implementing two hooks (see
 
     skill_set(seed=None, num_skills=None, observations=None) -> [K, skill_width]
     sample_actions_with_skill(observations, skills, seed=None, temperature=1.0)
+
+Agents whose policy needs per-episode history (Skill-DT's length-K Transformer
+context) may replace the second hook with the stateful pair
+
+    init_eval_state_with_skill(skill) -> agent_state
+    sample_actions_with_skill_state(observations, skills, agent_state=None, seed=None,
+                                    temperature=1.0) -> (action, agent_state)
 """
 
 import os
@@ -45,7 +52,7 @@ import numpy as np
 
 from agents import agents as agent_registry
 from utils.env_utils import make_env_and_datasets
-from utils.evaluation import evaluate_skill
+from utils.evaluation import env_horizon, evaluate_skill, raise_time_limit
 from utils.flax_utils import restore_agent
 
 
@@ -71,14 +78,18 @@ def eval_horizon(env):
 
     The env is built by the exact same `make_env_and_datasets` call that training
     used, so this is the standard per-env horizon (1000 for antmaze/antsoccer),
-    applied by gymnasium's TimeLimit wrapper. Reported so it is verifiable.
+    applied by gymnasium's TimeLimit wrapper. Reported so it is verifiable, and
+    shared with `utils.evaluation`, which hands it to agents that roll out over
+    the whole horizon.
     """
-    spec = getattr(env, 'spec', None) or getattr(env.unwrapped, 'spec', None)
-    return None if spec is None else spec.max_episode_steps
+    return env_horizon(env)
 
 
 def load_agent(run_dir, epoch, saved, dataset_path=None):
-    """Rebuild the agent from the run's own flags.json and load its checkpoint."""
+    """Rebuild the agent from the run's own flags.json and load its checkpoint.
+
+    Returns `(agent, env, config, train_dataset)`.
+    """
     config = saved['agent']
     env_name = saved['env_name']
 
@@ -100,7 +111,7 @@ def load_agent(run_dir, epoch, saved, dataset_path=None):
         config=config,
     )
     agent = restore_agent(agent, run_dir, epoch)
-    return agent, env, config
+    return agent, env, config, train_dataset
 
 
 def main():
@@ -113,6 +124,9 @@ def main():
     p.add_argument('--eval_temperature', type=float, default=0.0, help='Actor temperature for evaluation.')
     p.add_argument('--eval_gaussian', type=float, default=None, help='Action Gaussian noise for evaluation.')
     p.add_argument('--eval_on_cpu', type=int, default=1, help='Whether to evaluate on CPU.')
+    p.add_argument('--horizon', type=int, default=None,
+                   help='Override the env episode horizon (max steps before truncation). Only ever '
+                        'lengthens it (default: the env\'s registered horizon).')
     p.add_argument('--num_skills', type=int, default=None,
                    help='Number of skills to sweep. Only used by agents whose skill set is not finite '
                         '(e.g. OPAL with latent_type="continuous"); discrete skill sets ignore it.')
@@ -144,14 +158,22 @@ def main():
     # Checked up front: building the env and loading the offline dataset takes minutes,
     # and a non-skill-conditioned agent can never be evaluated here.
     agent_class = agent_registry[agent_name]
-    if not hasattr(agent_class, 'skill_set') or not hasattr(agent_class, 'sample_actions_with_skill'):
+    has_actor = hasattr(agent_class, 'sample_actions_with_skill') or (
+        hasattr(agent_class, 'init_eval_state_with_skill')
+        and hasattr(agent_class, 'sample_actions_with_skill_state')
+    )
+    if not hasattr(agent_class, 'skill_set') or not has_actor:
         raise SystemExit(
             f'Agent "{agent_name}" is not skill-conditioned: it does not implement `skill_set` / '
-            f'`sample_actions_with_skill`. Add those two hooks to agents/{agent_name}.py to evaluate it '
-            f'here (see agents/empowerment_skill.py).'
+            f'`sample_actions_with_skill` (or the stateful `init_eval_state_with_skill` / '
+            f'`sample_actions_with_skill_state` pair). Add those hooks to agents/{agent_name}.py to '
+            f'evaluate it here (see agents/empowerment_skill.py).'
         )
 
-    agent, env, config = load_agent(run_dir, epoch, saved, dataset_path=args.dataset_path)
+    agent, env, config, _ = load_agent(run_dir, epoch, saved, dataset_path=args.dataset_path)
+
+    if args.horizon is not None:
+        raise_time_limit(env, args.horizon)
 
     if args.eval_on_cpu:
         agent = jax.device_put(agent, device=jax.devices('cpu')[0])

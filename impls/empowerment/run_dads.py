@@ -11,7 +11,7 @@ per-state KL is reported.
 Artifacts (posteriors, p(z), all net params, normalization stats) are saved to
 impls/empowerment/runs/<name>/ and can be restored with --restore.
 
-Standalone full-fidelity runner (exact EM, validations, BA). For the main.py agent interface see agents/empowerment_opal_dads.py.
+Standalone full-fidelity runner (exact EM, validations, BA).
 
 Example:
     CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
