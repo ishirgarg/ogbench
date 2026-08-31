@@ -238,46 +238,30 @@ def main(_):
     elif FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
+    # Hindsight skill re-labelling (Skill-DT, paper Sec. 4.1.1 / Alg. 1). Every
+    # `relabel_interval` gradient steps the whole dataset is re-encoded with the
+    # current skill encoder and the trajectory-end histograms Z_t are rebuilt.
+    relabel_interval = int(config['relabel_interval']) if 'relabel_interval' in config else 0
+    relabel_datasets = []
+    if relabel_interval > 0 and hasattr(agent, 'encode_skill_indices'):
+        assert hasattr(train_dataset, 'relabel_skill_histograms'), (
+            f'relabel_interval={relabel_interval} > 0 needs a dataset that supports hindsight skill '
+            f"re-labelling; set dataset_class='SequenceDataset' (got {config['dataset_class']})."
+        )
+        relabel_datasets = [d for d in (train_dataset, val_dataset) if d is not None]
+
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
     first_time = time.time()
     last_time = time.time()
     start_step = (resume_epoch + 1) if resume_epoch is not None else 1
-
-    # Hindsight re-labelling hook. Agents that condition on a statistic of their own
-    # (continually changing) encoder — Skill-DT's future-skill histogram, arXiv:2301.13573
-    # Sec. 4.1.1 / Alg. 1 — recompute that statistic over the whole dataset every
-    # `relabel_interval` gradient steps. Agents/datasets without the hooks are unaffected.
-    relabel_interval = int(config['relabel_interval']) if 'relabel_interval' in config else 0
-    relabel_fn = None
-    if relabel_interval > 0:
-        if not hasattr(agent, 'encode_skill_indices'):
-            raise AttributeError(
-                f'Agent "{config["agent_name"]}" sets relabel_interval={relabel_interval} but does not '
-                f'implement `encode_skill_indices`.'
-            )
-        for d in (train_dataset, val_dataset):
-            if d is not None and not hasattr(d, 'relabel_skill_histograms'):
-                raise TypeError(
-                    f'relabel_interval={relabel_interval} needs a dataset with '
-                    f'`relabel_skill_histograms`; got {type(d).__name__}. Set '
-                    f"dataset_class='SequenceDataset'."
-                )
-
-        def relabel_fn(dataset):
-            """Rebuild `dataset`'s future-skill histograms from the live encoder. Returns seconds."""
-            relabel_start = time.time()
-            dataset.relabel_skill_histograms(agent.encode_skill_indices, config['num_skills'])
-            return time.time() - relabel_start
-
-    relabel_time = 0.0
     for i in tqdm.tqdm(range(start_step, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
-        # Re-label on the very first step too (including after --resume): the
-        # histograms live in the dataset object, not the checkpoint, and the
-        # agent's loss requires them.
-        if relabel_fn is not None and (i - start_step) % relabel_interval == 0:
-            relabel_time = relabel_fn(train_dataset)
+        # Re-label the skill histograms (Alg. 1's outer loop), before the batch
+        # that the next `relabel_interval` gradient steps are drawn from.
+        if relabel_datasets and (i - start_step) % relabel_interval == 0:
+            for relabel_dataset in relabel_datasets:
+                relabel_dataset.relabel_skill_histograms(agent)
 
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
@@ -287,15 +271,9 @@ def main(_):
         if i % FLAGS.log_interval == 0:
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
-                # Re-label the val set only here, where it is actually sampled --
-                # once per log_interval, not once per relabel_interval.
-                if relabel_fn is not None:
-                    relabel_fn(val_dataset)
                 val_batch = val_dataset.sample(config['batch_size'])
                 _, val_info = agent.total_loss(val_batch, grad_params=None)
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
-            if relabel_fn is not None:
-                train_metrics['time/relabel_time'] = relabel_time
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
             last_time = time.time()

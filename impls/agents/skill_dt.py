@@ -1000,13 +1000,16 @@ def get_config():
         warmup_steps=10000,
         # Hindsight skill re-labelling (Sec. 4.1.1, Alg. 1). Every this many
         # gradient steps the whole dataset is re-encoded and the trajectory-end
-        # histograms Z_t are rebuilt; 50 is Alg. 1's J, i.e. Table 5's "updates
-        # between rollouts". Measured on an idle A6000, antmaze-medium-navigate-v0
-        # (1.0M states, 32 skills): 119 ms per re-label against a 23 ms training
-        # step, i.e. ~10% overhead at 50 (~0.7 h over a 1M-step run); device peak
-        # stays under 0.7 GB even at 64 skills. Raise it to trade histogram
-        # freshness for speed; 0 disables re-labelling entirely and
-        # falls back to a window-bounded histogram (NOT the paper's statistic).
+        # histograms Z_t are rebuilt by `SequenceDataset.relabel_skill_histograms`,
+        # which main.py drives; 50 is Alg. 1's J, i.e. Table 5's "updates between
+        # rollouts". Each pass costs one encoder forward over every state plus an
+        # O(dataset_size * num_skills) cumulative-count rebuild, and keeps a
+        # [dataset_size + 1, num_skills] int32 count index resident (128 MB at 1M
+        # states / 32 skills, 256 MB at 64). The host-side rebuild alone is ~0.2 s
+        # at 1M states, so at 50 it is tens of percent on top of a ~20 ms training
+        # step. Raise it to trade histogram freshness for speed; 0 disables
+        # re-labelling entirely and falls back to a window-bounded histogram (NOT
+        # the paper's statistic).
         relabel_interval=50,
         # VQ-VAE skill codebook.
         num_skills=32,            # paper Table 1: 10 / 32 / 64 depending on env.
