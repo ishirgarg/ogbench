@@ -53,6 +53,15 @@ for root in roots:
         agent_cfg = flags.get("agent", {})
         agent_name = agent_cfg.get("agent_name")
 
+        # These roots are globbed recursively, so runs of agents that merely live
+        # *inside* an empowerment run dir (e.g. skill_value_controller checkpoints
+        # saved under <run>/controller/) land here too. The map plotters call
+        # agent.empowerment(...), which only the empowerment_* agents have, so
+        # dispatching those would just burn a GPU on an AttributeError.
+        if not (agent_name or "").startswith("empowerment"):
+            print(f"SKIP\t{run_dir}\tagent_name={agent_name}", file=sys.stderr)
+            continue
+
         has_map = bool(glob.glob(os.path.join(run_dir, "empowerment*.png")))
         has_paths = bool(glob.glob(os.path.join(run_dir, "skill_*paths*.png")))
 

@@ -8,10 +8,10 @@
 #SBATCH --time=144:00:00
 #SBATCH --array=0-3
 
-# Resume 4 of the 8 empowerment_dads runs launched by
-# scripts/run_empowerment_dads_kl_sweep.sh (2026-08-22) from their latest
-# checkpoint, in place, on the normal-priority queue (rail_gpu4_normal) instead
-# of whatever queue they were originally launched on.
+# Resume 4 empowerment_dads runs -- three from the 2026-08-22
+# scripts/run_empowerment_dads_kl_sweep.sh batch plus one launched 2026-08-30 --
+# from their latest checkpoint, in place, on the normal-priority queue
+# (rail_gpu4_normal) instead of whatever queue they were originally launched on.
 #
 # Submit from impls/:  sbatch scripts/run_empowerment_dads_resume_normal.sh
 #
@@ -42,8 +42,8 @@ AGENT_NAME=empowerment_dads
 RUNS=(
     "sd000_s_37936155.0.20260822_053629"
     "sd000_s_37936188.0.20260822_053601"
-    "sd000_s_37936189.0.20260822_053607"
     "sd000_s_37936190.0.20260822_053606"
+    "sd000_s_38344773.0.20260830_182107"
 )
 
 if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -ge ${#RUNS[@]} ]; then
@@ -72,8 +72,8 @@ if ! ls "$RESUME_DIR"/params_*.pkl >/dev/null 2>&1; then
 fi
 
 # Read the run's identity out of flags.json in one pass. KL_COEF is echoed
-# because each of the 4 envs appears twice in run_empowerment_dads_kl_sweep.sh
-# (kl_coef 0.1 and 1.0), so ENV alone does not identify the run.
+# because an env can appear more than once across the launches these runs came
+# from (kl_coef 0.1 and 1.0), so ENV alone does not identify the run.
 if ! INFO=$(python -c "import json,sys;f=json.load(open(sys.argv[1]+'/flags.json'));print(f['agent']['agent_name'],f['env_name'],f['agent'].get('kl_coef'))" "$RESUME_DIR"); then
     echo "ERROR: could not read $RESUME_DIR/flags.json — the run folder is incomplete or corrupt." >&2
     exit 1

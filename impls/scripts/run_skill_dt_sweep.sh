@@ -6,14 +6,14 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-7
+#SBATCH --array=0-5
 
-# Skill Decision Transformer (agents/skill_dt.py, arXiv:2301.13573) on the four
+# Skill Decision Transformer (agents/skill_dt.py, arXiv:2301.13573) on three
 # antmaze/antsoccer datasets at 15 and 50 skills. Low-priority queue.
 #
-#   4 envs x 2 codebook sizes, seed 0.  ENV = IDX / 2, SKILLS = IDX % 2, envs
-#   ordered navigate first, so IDX 0-3 are navigate and IDX 4-7 are stitch.
-#   Submit --array=0-3 then --array=4-7 to run them in separate batches.
+#   3 envs x 2 codebook sizes, seed 0.  ENV = IDX / 2, SKILLS = IDX % 2, envs
+#   ordered navigate first, so IDX 0-3 are navigate and IDX 4-5 are stitch.
+#   Submit --array=0-3 then --array=4-5 to run them in separate batches.
 #
 #     IDX 0 : antmaze-medium-navigate-v0    15 skills
 #     IDX 1 : antmaze-medium-navigate-v0    50 skills
@@ -21,8 +21,6 @@
 #     IDX 3 : antsoccer-arena-navigate-v0   50 skills
 #     IDX 4 : antmaze-medium-stitch-v0      15 skills
 #     IDX 5 : antmaze-medium-stitch-v0      50 skills
-#     IDX 6 : antsoccer-arena-stitch-v0     15 skills
-#     IDX 7 : antsoccer-arena-stitch-v0     50 skills
 #
 # Submit from impls/:  sbatch scripts/run_skill_dt_sweep.sh
 #
@@ -45,7 +43,6 @@ ENVS=(
     antsoccer-arena-navigate-v0
     # ... then stitch
     antmaze-medium-stitch-v0
-    antsoccer-arena-stitch-v0
 )
 SKILLS=(15 50)
 SEED=0
