@@ -16,9 +16,7 @@
 # normal-priority queue rather than as part of the lowest-priority array.
 #
 # This is a fresh run, NOT a resume: it starts at step 0 in a new run folder
-# and opens a new wandb run. The companion
-# scripts/run_empowerment_dads_resume_normal.sh continues the four earlier
-# empowerment_dads runs in place instead.
+# and opens a new wandb run.
 #
 # Submit from impls/:  sbatch scripts/run_empowerment_dads_antsoccer_navigate_kl1.sh
 
