@@ -223,3 +223,63 @@ def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None):
     env.reset()
 
     return env, train_dataset, val_dataset
+
+
+def make_env_only(dataset_name, frame_stack=None):
+    """Make the OGBench environment without loading (or downloading) any offline data.
+
+    Same env as `make_env_and_datasets` returns -- the `-colored-` and
+    `-slice<K>-` tokens are handled identically (the slice token never affects
+    the env, and `colored` still applies `ColoredObsWrapper`) -- but nothing
+    touches `~/.ogbench/data`. Use this for scripts that only need the env and
+    the observation/action shapes, e.g. the empowerment map plots, which pull
+    a dataset batch solely to hand `agent_class.create` an example shape. It is
+    the only way to run those on a dataset that isn't downloaded locally and
+    can't be fetched (offline compute nodes).
+
+    Args:
+        dataset_name: Name of the dataset (the env is derived from it).
+        frame_stack: Number of frames to stack.
+
+    Returns:
+        The environment.
+    """
+    splits = dataset_name.split('-')
+    is_colored = 'colored' in splits
+    underlying_name = '-'.join(t for t in splits if t != 'colored') if is_colored else dataset_name
+
+    # The slice token only ever selects a different `.npz`; the env is unchanged.
+    underlying_name, _ = parse_slice_token(underlying_name)
+
+    env = ogbench.make_env_and_datasets(underlying_name, env_only=True)
+
+    if is_colored:
+        env = ColoredObsWrapper(env)
+
+    if frame_stack is not None:
+        env = FrameStackWrapper(env, frame_stack)
+
+    env.reset()
+
+    return env
+
+
+def make_example_batch(env, dataset_name):
+    """Build the shape/dtype-only example batch that `agent_class.create` needs.
+
+    `agent_class.create` uses `ex_observations` / `ex_actions` purely to shape
+    the network params, so the env's observation/action spaces carry every bit
+    of information a real `dataset.sample(1)` would. The wrappers above keep
+    `observation_space` in sync (colored appends 2 dims, frame-stack multiplies),
+    so this matches the dataset batch exactly. dtypes mirror OGBench's own
+    loader rule rather than the space dtype, which is float64 for locomaze.
+
+    Returns:
+        A dict with 'observations' and 'actions', each with a leading batch dim of 1.
+    """
+    ob_dtype = np.uint8 if ('visual' in dataset_name or 'powderworld' in dataset_name) else np.float32
+    action_dtype = np.int32 if 'powderworld' in dataset_name else np.float32
+    return dict(
+        observations=np.zeros((1, *env.observation_space.shape), dtype=ob_dtype),
+        actions=np.zeros((1, *env.action_space.shape), dtype=action_dtype),
+    )

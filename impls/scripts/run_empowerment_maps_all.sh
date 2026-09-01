@@ -27,7 +27,8 @@ export JAX_COMPILATION_CACHE_DIR="$(pwd)/.jax_cache"
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
 
-CKPT_ROOTS=("ckpts/empowerment" "ckpts/empowerment_crl")
+# Override with e.g. CKPT_ROOTS="ckpts/empowerment_final" to target one tree.
+read -r -a CKPT_ROOTS <<< "${CKPT_ROOTS:-ckpts/empowerment ckpts/empowerment_crl}"
 
 RUN_DIRS=()
 SCRIPTS=()
@@ -69,7 +70,7 @@ wait
 for idx in "${!RUN_DIRS[@]}"; do
   run_dir=${RUN_DIRS[$idx]}
   log="logs/emp_map_$(echo "$run_dir" | tr '/' '_').log"
-  grep -q "^Saved image:" "$log" || { echo "FAILED: $run_dir (see $log)"; fail=1; }
+  grep -qE "^Saved (3x3 )?image:" "$log" || { echo "FAILED: $run_dir (see $log)"; fail=1; }
 done
 
 echo "ALL DONE (empowerment maps, fail=$fail)."

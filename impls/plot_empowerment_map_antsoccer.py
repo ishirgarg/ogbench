@@ -16,7 +16,7 @@ from matplotlib.patches import Rectangle
 from PIL import Image, ImageEnhance
 
 from agents import agents as agent_registry
-from utils.env_utils import make_env_and_datasets
+from utils.env_utils import make_env_and_datasets, make_env_only, make_example_batch
 from utils.flax_utils import restore_agent
 from utils.log_utils import reshape_video
 
@@ -375,6 +375,16 @@ def main():
                              "Defaults to '7,7'.")
     parser.add_argument("--video_goal_xy", type=str, default=None,
                         help="Optional fixed goal x,y for the skill grid.")
+    parser.add_argument(
+        "--example_batch_from",
+        choices=["env", "dataset"],
+        default="env",
+        help="Where the example batch that shapes the agent's params comes from. "
+             "These scripts never read the offline data -- they only need obs/action "
+             "shapes -- so 'env' (default) reads them off the env spaces and skips "
+             "loading (or downloading) the .npz entirely. Pass 'dataset' to restore "
+             "the old behavior of shaping from a real dataset sample.",
+    )
     args = parser.parse_args()
 
     # Force a fresh np.random global seed on every invocation, so the env's
@@ -403,8 +413,13 @@ def main():
         agent_cfg["num_negatives"] = int(args.num_negatives)
     env_name = flags["env_name"]
 
-    env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
-    example_batch = train_dataset.sample(1)
+    if args.example_batch_from == "dataset":
+        env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
+        example_batch = train_dataset.sample(1)
+    else:
+        # No offline data is needed here, so don't load (or try to download) it.
+        env = make_env_only(env_name, frame_stack=agent_cfg.get("frame_stack"))
+        example_batch = make_example_batch(env, env_name)
     if agent_cfg.get("discrete"):
         example_batch["actions"] = np.full_like(example_batch["actions"], env.action_space.n - 1)
 

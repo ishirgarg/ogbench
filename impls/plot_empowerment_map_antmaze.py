@@ -17,7 +17,7 @@ from PIL import Image, ImageEnhance
 from matplotlib.patches import Rectangle
 
 from agents import agents as agent_registry
-from utils.env_utils import make_env_and_datasets
+from utils.env_utils import make_env_and_datasets, make_env_only, make_example_batch
 from utils.flax_utils import restore_agent
 from utils.log_utils import reshape_video
 
@@ -300,6 +300,16 @@ def main():
     parser.add_argument("--video_ant_xy", type=str, default=None,
                         help="Fixed ant x,y for the skill rollouts (e.g. '8,8'). "
                              "Defaults to a random valid (non-wall) cell.")
+    parser.add_argument(
+        "--example_batch_from",
+        choices=["env", "dataset"],
+        default="env",
+        help="Where the example batch that shapes the agent's params comes from. "
+             "These scripts never read the offline data -- they only need obs/action "
+             "shapes -- so 'env' (default) reads them off the env spaces and skips "
+             "loading (or downloading) the .npz entirely. Pass 'dataset' to restore "
+             "the old behavior of shaping from a real dataset sample.",
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)
@@ -321,8 +331,13 @@ def main():
     env_name = flags["env_name"]
 
     # Build AntMaze env/dataset and agent
-    env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
-    example_batch = train_dataset.sample(1)
+    if args.example_batch_from == "dataset":
+        env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
+        example_batch = train_dataset.sample(1)
+    else:
+        # No offline data is needed here, so don't load (or try to download) it.
+        env = make_env_only(env_name, frame_stack=agent_cfg.get("frame_stack"))
+        example_batch = make_example_batch(env, env_name)
     if agent_cfg.get("discrete"):
         example_batch["actions"] = np.full_like(example_batch["actions"], env.action_space.n - 1)
 

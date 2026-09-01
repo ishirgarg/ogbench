@@ -24,12 +24,20 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.3}
 ANTMAZE_XY=${ANTMAZE_XY:-8,8}
 ANTSOCCER_XY=${ANTSOCCER_XY:-14,14}
 ANTSOCCER_BALL_XY=${ANTSOCCER_BALL_XY:-7,7}
+# antsoccer-medium is a maze (the same layout as antmaze-medium), not the open
+# arena, so the arena start doesn't apply. (8,8) is the central free cell and
+# (12,8) its neighbour along the central y=8 corridor.
+ANTSOCCER_MEDIUM_XY=${ANTSOCCER_MEDIUM_XY:-8,8}
+ANTSOCCER_MEDIUM_BALL_XY=${ANTSOCCER_MEDIUM_BALL_XY:-12,8}
 
 # Covers every env dir under ckpts/empowerment (navigate, stitch, -slice50),
 # picking the plot script by env family.
 RUN_DIRS=()
 SCRIPTS=()
-for run_dir in ckpts/empowerment/*/*/; do
+# Override with e.g. CKPT_ROOTS="ckpts/empowerment_final" to target one tree.
+read -r -a CKPT_ROOTS <<< "${CKPT_ROOTS:-ckpts/empowerment}"
+for root in "${CKPT_ROOTS[@]}"; do
+for run_dir in "$root"/*/*/; do
   [ -d "$run_dir" ] || continue
   ls "$run_dir"params_*.pkl >/dev/null 2>&1 || { echo "SKIP (no params): $run_dir"; continue; }
   case "$run_dir" in
@@ -39,6 +47,7 @@ for run_dir in ckpts/empowerment/*/*/; do
   esac
   RUN_DIRS+=("$run_dir")
   SCRIPTS+=("$script")
+done
 done
 
 mkdir -p logs
@@ -51,10 +60,13 @@ for idx in "${!RUN_DIRS[@]}"; do
   gpu=${GPUS[$((i % NGPU))]}
   log="logs/emp_paths_$(echo "$run_dir" | tr '/' '_').log"
   if [[ "$script" == *antsoccer* ]]; then
-    ant_xy="$ANTSOCCER_XY"
-    echo "[gpu $gpu] $script  $run_dir  ant_xy=$ant_xy ball_xy=$ANTSOCCER_BALL_XY -> $log"
+    case "$run_dir" in
+      *antsoccer-medium*) ant_xy="$ANTSOCCER_MEDIUM_XY"; ball_xy="$ANTSOCCER_MEDIUM_BALL_XY" ;;
+      *)                  ant_xy="$ANTSOCCER_XY";        ball_xy="$ANTSOCCER_BALL_XY" ;;
+    esac
+    echo "[gpu $gpu] $script  $run_dir  ant_xy=$ant_xy ball_xy=$ball_xy -> $log"
     CUDA_VISIBLE_DEVICES=$gpu python "$script" \
-      --run_dir "$run_dir" --video_steps "$STEPS" --video_ant_xy "$ant_xy" --video_ball_xy "$ANTSOCCER_BALL_XY" \
+      --run_dir "$run_dir" --video_steps "$STEPS" --video_ant_xy "$ant_xy" --video_ball_xy "$ball_xy" \
       --no-skill_video --no-skill_map --skill_paths > "$log" 2>&1 &
   else
     ant_xy="$ANTMAZE_XY"
