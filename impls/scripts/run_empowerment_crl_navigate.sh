@@ -11,10 +11,9 @@
 # Fresh (from-scratch, not resumed) empowerment_crl runs on the two navigate
 # envs, high priority. Submit from impls/:  sbatch scripts/run_empowerment_crl_navigate.sh
 #
-# This does NOT touch the existing checkpoints under
-# scripts/run_empowerment_crl_resume.sh's RUNS list — it starts new run
-# folders from step 0 (e.g. if the prior distillation phase overfit and a
-# clean restart is wanted instead of a resume).
+# This does NOT touch any existing checkpoint — it starts new run folders
+# from step 0 (e.g. if the prior distillation phase overfit and a clean
+# restart is wanted instead of a resume).
 #
 #   IDX 0 : antmaze-medium-navigate-v0
 #   IDX 1 : antsoccer-arena-navigate-v0
