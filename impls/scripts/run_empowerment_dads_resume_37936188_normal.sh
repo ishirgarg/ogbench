@@ -6,22 +6,24 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
+#SBATCH --array=0-1
 
-# Resume the single empowerment_dads run sd000_s_37936188.0.20260822_053601
-# from its latest checkpoint, in place, on the normal-priority queue
-# (rail_gpu4_normal). This is the one-run version of
-# scripts/run_empowerment_dads_resume_normal.sh (where it is array index 1).
+# Resume these 2 empowerment_dads runs from their latest checkpoint, in place,
+# on the normal-priority queue (rail_gpu4_normal). Both also appear in
+# scripts/run_empowerment_dads_resume_normal.sh (array indices 1 and 3); this
+# script exists to resume just the two of them without the other two runs in
+# that array.
 #
 # Submit from impls/:  sbatch scripts/run_empowerment_dads_resume_37936188_normal.sh
 #
-# The run continues in ITS OWN existing folder: the same params_*.pkl series,
+# Each run continues in ITS OWN existing folder: the same params_*.pkl series,
 # the same train.csv / eval.csv (appended, not truncated), and the same wandb
 # run id (from wandb_run_id.txt), so the dashboard curves extend rather than a
 # new run appearing.
 #
 # main.py --resume_dir replays the run's own flags.json, so nothing about the
 # original launch (env, seed, kl_coef, num_skills, train_steps, ...) is
-# restated here — only the run folder below. Training restarts at the
+# restated here — only the run folders below. Training restarts at the
 # checkpointed step with the exact params, Adam state and TrainState.step.
 #
 # NOTE: only the data-sampling RNG is not checkpointed, so batch order after a
@@ -30,9 +32,24 @@
 
 set -euo pipefail
 
+IDX=${SLURM_ARRAY_TASK_ID:-}
+
 BASE=/global/scratch/users/ishirgarg/ogbench
 AGENT_NAME=empowerment_dads
-RUN=sd000_s_37936188.0.20260822_053601
+
+# Run folder names (globally unique: sd<seed>_s_<jobid>.<procid>.<timestamp>).
+# The enclosing <wandb project>/<run_group> path is globbed, so it does not
+# matter which sweep revision or project produced these.
+RUNS=(
+    "sd000_s_37936188.0.20260822_053601"
+    "sd000_s_38344773.0.20260830_182107"
+)
+
+if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -ge ${#RUNS[@]} ]; then
+    echo "ERROR: SLURM_ARRAY_TASK_ID='$IDX' out of range for ${#RUNS[@]} runs; use --array=0-$((${#RUNS[@]} - 1))." >&2
+    exit 1
+fi
+RUN=${RUNS[$IDX]}
 
 # Resolve the run folder under its <wandb project>/<run_group> parents. main.py
 # saves to <save_dir>/<project>/<run_group>/<exp_name> (main.py:190), so two
@@ -53,7 +70,9 @@ if ! ls "$RESUME_DIR"/params_*.pkl >/dev/null 2>&1; then
     exit 1
 fi
 
-# Read the run's identity out of flags.json in one pass, for the log line.
+# Read the run's identity out of flags.json in one pass. KL_COEF is echoed
+# because an env can appear more than once across the launches these runs came
+# from (kl_coef 0.1 and 1.0), so ENV alone does not identify the run.
 if ! INFO=$(python -c "import json,sys;f=json.load(open(sys.argv[1]+'/flags.json'));print(f['agent']['agent_name'],f['env_name'],f['agent'].get('kl_coef'))" "$RESUME_DIR"); then
     echo "ERROR: could not read $RESUME_DIR/flags.json — the run folder is incomplete or corrupt." >&2
     exit 1
@@ -67,7 +86,7 @@ if [ "$FOUND_AGENT" != "$AGENT_NAME" ]; then
     exit 1
 fi
 
-echo "AGENT=$AGENT_NAME  ENV=$ENV  KL_COEF=$KL  RESUME_DIR=$RESUME_DIR"
+echo "IDX=$IDX  AGENT=$AGENT_NAME  ENV=$ENV  KL_COEF=$KL  RESUME_DIR=$RESUME_DIR"
 echo "checkpoints present: $(ls "$RESUME_DIR"/params_*.pkl 2>/dev/null | wc -l)"
 
 if [ -f "$RESUME_DIR/wandb_run_id.txt" ]; then
