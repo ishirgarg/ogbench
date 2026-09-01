@@ -238,6 +238,13 @@ def main(_):
     elif FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
+    # One-time dataset preparation for agents that consume a pre-labelled dataset
+    # (skill_bc_relabel_controller relabels every window with the skill that best
+    # explains it). Unlike the hindsight re-labelling below, the labelling model is
+    # frozen, so this runs once and its output is never stale.
+    if hasattr(agent, 'prepare_datasets'):
+        agent.prepare_datasets([d for d in (train_dataset, val_dataset) if d is not None])
+
     # Hindsight skill re-labelling (Skill-DT, paper Sec. 4.1.1 / Alg. 1). Every
     # `relabel_interval` gradient steps the whole dataset is re-encoded with the
     # current skill encoder and the trajectory-end histograms Z_t are rebuilt.

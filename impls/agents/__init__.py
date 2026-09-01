@@ -16,6 +16,7 @@ from agents.opal import OPALAgent
 from agents.qrl import QRLAgent
 from agents.quest import QueSTAgent
 from agents.sac import SACAgent
+from agents.skill_bc_relabel_controller import SkillBCRelabelControllerAgent
 from agents.skill_dt import SkillDTAgent
 from agents.skill_match import SkillMatchAgent
 from agents.skill_value_controller import SkillValueControllerAgent
@@ -40,6 +41,7 @@ agents = dict(
     qrl=QRLAgent,
     quest=QueSTAgent,
     sac=SACAgent,
+    skill_bc_relabel_controller=SkillBCRelabelControllerAgent,
     skill_dt=SkillDTAgent,
     skill_match=SkillMatchAgent,
     skill_value_controller=SkillValueControllerAgent,
