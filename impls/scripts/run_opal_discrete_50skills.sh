@@ -13,7 +13,7 @@
 # run_empowerment_skill_extra_envs_priority.sh (cube-* dropped) plus
 # antmaze-medium-{navigate,stitch}, identical to the discrete branch of
 # run_opal_sweep.sh except num_skills=50 instead of 15 (chunk/sequence length
-# 10, cluster_steps 500k, 1M train steps, seed 0). High-priority
+# 10, cluster_steps 500k, 1M train steps, log_interval 8000, seed 0). High-priority
 # (rail_gpu4_high) queue. The high-level skill policy is excluded, so goal
 # success is low by design; watch training/mutual_information and
 # training/num_active_skills instead.
@@ -70,6 +70,7 @@ python main.py \
     "${AGENT_FLAGS[@]}" \
     --seed=$SEED \
     --train_steps=1000000 \
+    --log_interval=8000 \
     --batch_size=128 \
     --video_episodes=0 \
     --save_interval=25000 \

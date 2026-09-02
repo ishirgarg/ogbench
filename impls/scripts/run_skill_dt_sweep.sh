@@ -10,7 +10,8 @@
 
 # Skill Decision Transformer (agents/skill_dt.py, arXiv:2301.13573) on the
 # six locomotion datasets of run_empowerment_skill_extra_envs_priority.sh
-# (cube-* dropped) plus antmaze-medium-{navigate,stitch}, at 15 and 50 skills.
+# (cube-* dropped) plus antmaze-medium-{navigate,stitch}, at 15 and 50 skills,
+# log_interval 8000 to match that script.
 # High-priority (rail_gpu4_high) queue.
 #
 #   6 envs x 2 codebook sizes, seed 0.  ENV = IDX / 2, SKILLS = IDX % 2.
@@ -103,6 +104,7 @@ python main.py \
     "${AGENT_FLAGS[@]}" \
     --seed=$SEED \
     --train_steps=1000000 \
+    --log_interval=8000 \
     --video_episodes=0 \
     --eval_episodes=5 \
     --eval_on_cpu=0 \
