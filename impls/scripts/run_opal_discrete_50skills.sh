@@ -71,7 +71,6 @@ python main.py \
     --seed=$SEED \
     --train_steps=1000000 \
     --log_interval=8000 \
-    --batch_size=128 \
     --video_episodes=0 \
     --save_interval=25000 \
     --save_dir=$SAVE_DIR
