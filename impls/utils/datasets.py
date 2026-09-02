@@ -432,8 +432,11 @@ class SequenceDataset(GCDataset):
         been called at least once; absent otherwise.
       - ``chunk_skills``:     ``[B]`` int32 — the single skill that best explains the
         WHOLE window under a frozen skill-conditioned policy,
-        ``argmax_z sum_{i<T} log pi(a_{t+i} | s_{t+i}, z)`` (`skill_bc_relabel_controller`).
-        Present ONLY after ``relabel_chunk_skills`` has been called; absent otherwise.
+        ``argmax_z sum_{i<T} log pi(a_{t+i} | s_{t+i}, z)`` (`skill_bc_relabel_controller`),
+        or — after ``relabel_chunk_skills_from_windows`` — the label a window-level
+        labeller assigned to it: an int32 ``[B]`` index or a float32 ``[B, D]`` latent
+        (`opal_controller`, from OPAL's posterior). Present ONLY after one of the two
+        relabelling passes has been called; absent otherwise.
         Unlike ``skill_hist_seq`` this is a property of the window, not of each step.
 
     For semi-MDP / option-style agents (e.g. DDS) it also emits the per-window
@@ -610,6 +613,84 @@ class SequenceDataset(GCDataset):
             'label_coverage': float((counts > 0).mean()),
             'label_max_frac': float(probs.max()),
             'label_counts': counts.astype(np.int64),
+        }
+
+    def relabel_chunk_skills_from_windows(self, agent, seed=0, num_skills=None, chunk_bytes=64 * 1024 * 1024):
+        """Label every start index with a skill drawn from a WINDOW-level labeller.
+
+        The counterpart of ``relabel_chunk_skills`` for labellers that are not a sum of
+        per-step terms and so need the whole window at once: OPAL's posteriors, i.e.
+        the BiGRU encoder ``q(z|tau)`` on the continuous path and the Bayes-rule
+        ``p(z|tau)`` over the trajectory mixture on the discrete one. Each start index
+        ``t`` gets exactly the length-``T`` window ``sample`` would build for it
+        (clamped to ``t``'s trajectory, ``seq_mask`` marking the padded steps), and
+
+            agent.label_chunk_skills(observations_seq, actions_seq, seq_mask, seed)
+
+        returns one label per window: an int32 ``[B]`` skill index or a float32
+        ``[B, D]`` latent. Labels are stored on the dataset so ``sample`` emits them as
+        ``chunk_skills`` (a ``[B]`` or ``[B, D]`` slice of the stored array). The
+        labeller is frozen, so one pass is exact and never repeated.
+
+        Args:
+            agent: agent exposing ``label_chunk_skills`` as above.
+            seed: PRNG seed for labellers that sample their label.
+            num_skills: K for the per-skill counts of index labels (None -> max label + 1).
+            chunk_bytes: window bytes pushed through the labeller at a time.
+
+        Returns:
+            dict of label statistics: for index labels the same keys as
+            ``relabel_chunk_skills``; for latent labels their mean norm and per-dim std.
+        """
+        T = int(self.config['sequence_length'])
+
+        # Chunk by BYTES as in `relabel_chunk_skills`; a window is T observations.
+        leaves = jax.tree_util.tree_leaves(self.dataset['observations'])
+        item_bytes = sum(int(np.prod(leaf.shape[1:])) * leaf.dtype.itemsize for leaf in leaves)
+        if self.config['frame_stack'] is not None and not self.preprocess_frame_stack:
+            item_bytes *= int(self.config['frame_stack'])
+        block_size = int(np.clip(chunk_bytes // max(item_bytes * T, 1), 256, 100000))
+
+        all_idxs = np.arange(self.size)
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, all_idxs)]
+        steps = np.arange(T)
+
+        rng = jax.random.PRNGKey(seed)
+        blocks = []
+        for start in range(0, self.size, block_size):
+            idxs = np.arange(start, min(start + block_size, self.size))
+            raw_idxs = idxs[:, None] + steps[None, :]                          # [B, T]
+            seq_idxs = np.minimum(raw_idxs, final_state_idxs[idxs][:, None])   # clamp to terminal
+            seq_mask = (raw_idxs <= final_state_idxs[idxs][:, None]).astype(np.float32)
+
+            flat = seq_idxs.reshape(-1)
+            obs_flat = self.get_observations(flat)
+            obs_seq = obs_flat.reshape((len(idxs), T) + obs_flat.shape[1:])
+            act_seq = jax.tree_util.tree_map(
+                lambda arr: arr[flat].reshape((len(idxs), T) + arr.shape[1:]), self.dataset['actions']
+            )
+            rng, block_rng = jax.random.split(rng)
+            blocks.append(
+                np.asarray(jax.device_get(agent.label_chunk_skills(obs_seq, act_seq, seq_mask, block_rng)))
+            )
+        labels = np.concatenate(blocks, axis=0)
+        self.chunk_skills = labels
+
+        if labels.ndim == 1:
+            minlength = int(labels.max()) + 1 if num_skills is None else int(num_skills)
+            counts = np.bincount(labels, minlength=minlength).astype(np.float64)
+            probs = counts / max(counts.sum(), 1.0)
+            nonzero = probs[probs > 0]
+            return {
+                'label_entropy': float(-(nonzero * np.log(nonzero)).sum()),
+                'label_coverage': float((counts > 0).mean()),
+                'label_max_frac': float(probs.max()),
+                'label_counts': counts.astype(np.int64),
+            }
+        return {
+            'label_mean_norm': float(np.linalg.norm(labels, axis=-1).mean()),
+            'label_std': float(labels.std(axis=0).mean()),
+            'label_abs_max': float(np.abs(labels).max()),
         }
 
     def sample(self, batch_size, idxs=None, evaluation=False):

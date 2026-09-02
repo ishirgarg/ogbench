@@ -44,6 +44,11 @@ convention named).
       AWR 500k as SEPARATE runs. We honor the 500k skill phase, then train the
       whole high level for OGBench's remaining single-run budget (default 500k).
       This is a compute-budget choice, not a method change.
+  B5. Codebook init. The paper says "standard vector quantization (Van Den Oord
+      et al. 2017)" and nothing more; we use that paper's init, uniform in
+      [-1/K, 1/K]. (Runs before 2026-09-01 used a unit-normal init and, together
+      with a mean- rather than sum-reduced reconstruction loss, collapsed to a
+      single active code within 5k steps; see `VQCodebook` and `skill_loss`.)
 ================================================================================
 
 Faithful OGBench re-implementation of
@@ -241,7 +246,18 @@ class VQCodebook(nn.Module):
 
     @nn.compact
     def __call__(self, e):
-        codebook = self.param('codebook', nn.initializers.normal(stddev=1.0), (self.num_codes, self.code_dim))
+        # Standard VQ-VAE init (van den Oord et al. 2017): codes uniform in [-1/K, 1/K],
+        # i.e. all near the origin. A unit-normal init in D_z=128 dims gave codes of
+        # norm ~11 that were far apart; the untrained encoder mapped nearly every window
+        # onto the one code most aligned with its output, and the codes that received
+        # no assignment at step 0 never got a gradient (codebook loss reaches only the
+        # assigned code), so every pretraining run collapsed to a single active code.
+        bound = 1.0 / self.num_codes
+
+        def codebook_init(key, shape, dtype=jnp.float32):
+            return jax.random.uniform(key, shape, dtype, -bound, bound)
+
+        codebook = self.param('codebook', codebook_init, (self.num_codes, self.code_dim))
         # Nearest-neighbour assignment:  k = argmin_j ||E(tau) - z_j||  (Eq. 10/11).
         dists = jnp.sum((e[:, None, :] - codebook[None, :, :]) ** 2, axis=-1)  # [B, K]
         indices = jnp.argmin(dists, axis=-1)                                   # [B]
@@ -449,12 +465,20 @@ class DDSAgent(flax.struct.PyTreeNode):
         # decoder is conditioned on the per-step state s_i and the shared skill z.
         obs_flat = obs_seq.reshape((b * t_len,) + obs_seq.shape[2:])
         mask_flat = seq_mask.reshape(b * t_len)
-        denom = jnp.maximum(mask_flat.sum(), 1.0)
+        # Eq. 13 reduction: the reconstruction error is a SUM over the H window steps
+        # (and, inside ||.||^2, over action dims) per training example, then averaged
+        # over the batch like the VQ terms. Averaging over steps and action dims instead
+        # left the reconstruction gradient ~H*|A| (80x on ant) weaker than the paper's
+        # relative to the codebook/commitment sums over the D_z=128 latent dims, so the
+        # encoder was pulled onto its assigned code far harder than it was pushed to
+        # encode anything, which drove codebook collapse.
+        denom = jnp.asarray(b, jnp.float32)
         # Broadcast the shared skill across the window: [b, D_z] -> [b*T, D_z].
         skills_flat = jnp.broadcast_to(z_q_st[:, None, :], (b, t_len, z_q_st.shape[-1])).reshape(b * t_len, -1)
 
         if self.config['discrete']:
-            # Categorical reconstruction of each action: -log p(a_i | s_i, z).
+            # Categorical reconstruction of each action: -log p(a_i | s_i, z), summed
+            # over the window steps per example (the discrete analogue of Eq. 13).
             act_flat = act_seq.reshape(b * t_len)
             dist = self.network.select('decoder')(obs_flat, skills_flat, params=grad_params)
             nll = -dist.log_prob(act_flat)                       # [b*T]
@@ -473,7 +497,7 @@ class DDSAgent(flax.struct.PyTreeNode):
             x_t = jnp.sqrt(ab) * act_flat + jnp.sqrt(1.0 - ab) * noise
             times = tt.astype(jnp.float32) / T
             pred_noise = self.network.select('decoder')(x_t, times, obs_flat, skills_flat, params=grad_params)
-            per_step = jnp.mean((pred_noise - noise) ** 2, axis=-1)  # [b*T]
+            per_step = jnp.sum((pred_noise - noise) ** 2, axis=-1)  # [b*T]  ||eps - eps_psi||^2 (Eq. 5/14)
             recon_loss = (per_step * mask_flat).sum() / denom
 
         codebook_loss = codebook_loss.mean()

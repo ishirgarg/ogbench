@@ -2,25 +2,31 @@
 #SBATCH --job-name=skill_dt_sweep
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_low
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-5
+#SBATCH --array=0-11
 
-# Skill Decision Transformer (agents/skill_dt.py, arXiv:2301.13573) on three
-# antmaze/antsoccer datasets at 15 and 50 skills. Low-priority queue.
+# Skill Decision Transformer (agents/skill_dt.py, arXiv:2301.13573) on the
+# six locomotion datasets of run_empowerment_skill_extra_envs_priority.sh
+# (cube-* dropped) plus antmaze-medium-{navigate,stitch}, at 15 and 50 skills.
+# High-priority (rail_gpu4_high) queue.
 #
-#   3 envs x 2 codebook sizes, seed 0.  ENV = IDX / 2, SKILLS = IDX % 2, envs
-#   ordered navigate first, so IDX 0-3 are navigate and IDX 4-5 are stitch.
-#   Submit --array=0-3 then --array=4-5 to run them in separate batches.
+#   6 envs x 2 codebook sizes, seed 0.  ENV = IDX / 2, SKILLS = IDX % 2.
 #
-#     IDX 0 : antmaze-medium-navigate-v0    15 skills
-#     IDX 1 : antmaze-medium-navigate-v0    50 skills
-#     IDX 2 : antsoccer-arena-navigate-v0   15 skills
-#     IDX 3 : antsoccer-arena-navigate-v0   50 skills
-#     IDX 4 : antmaze-medium-stitch-v0      15 skills
-#     IDX 5 : antmaze-medium-stitch-v0      50 skills
+#     IDX 0  : antsoccer-arena-navigate-v0     15 skills
+#     IDX 1  : antsoccer-arena-navigate-v0     50 skills
+#     IDX 2  : antsoccer-arena-stitch-v0       15 skills
+#     IDX 3  : antsoccer-arena-stitch-v0       50 skills
+#     IDX 4  : pointmaze-teleport-navigate-v0  15 skills
+#     IDX 5  : pointmaze-teleport-navigate-v0  50 skills
+#     IDX 6  : pointmaze-teleport-stitch-v0    15 skills
+#     IDX 7  : pointmaze-teleport-stitch-v0    50 skills
+#     IDX 8  : antmaze-medium-navigate-v0      15 skills
+#     IDX 9  : antmaze-medium-navigate-v0      50 skills
+#     IDX 10 : antmaze-medium-stitch-v0        15 skills
+#     IDX 11 : antmaze-medium-stitch-v0        50 skills
 #
 # Submit from impls/:  sbatch scripts/run_skill_dt_sweep.sh
 #
@@ -38,15 +44,20 @@
 IDX=${SLURM_ARRAY_TASK_ID}
 
 ENVS=(
-    # navigate first ...
-    antmaze-medium-navigate-v0
-    antsoccer-arena-navigate-v0
-    # ... then stitch
-    antmaze-medium-stitch-v0
+    antsoccer-arena-navigate-v0     # IDX 0-1
+    antsoccer-arena-stitch-v0       # IDX 2-3
+    pointmaze-teleport-navigate-v0  # IDX 4-5
+    pointmaze-teleport-stitch-v0    # IDX 6-7
+    antmaze-medium-navigate-v0      # IDX 8-9
+    antmaze-medium-stitch-v0        # IDX 10-11
 )
 SKILLS=(15 50)
 SEED=0
 
+if [ -z "$IDX" ] || [ "$IDX" -ge $((${#ENVS[@]} * ${#SKILLS[@]})) ]; then
+    echo "ERROR: SLURM_ARRAY_TASK_ID='$IDX' out of range for $((${#ENVS[@]} * ${#SKILLS[@]})) runs; use --array=0-$((${#ENVS[@]} * ${#SKILLS[@]} - 1))." >&2
+    exit 1
+fi
 ENV=${ENVS[$((IDX / 2))]}
 NUM_SKILLS=${SKILLS[$((IDX % 2))]}
 
@@ -55,8 +66,9 @@ NUM_SKILLS=${SKILLS[$((IDX % 2))]}
 # EPISODE at rollout time (paper Sec. A.5). Those coincide on -navigate, whose
 # trajectories are 1001 steps against a 1000-step horizon, so the default (None
 # -> follow the env) is right there. They do NOT coincide on -stitch, whose
-# trajectories are 201 steps: leaving it at 1000 would feed the policy a
-# statistic it never saw in training. Pin it to the trajectory length instead.
+# trajectories are 201 steps (antmaze, antsoccer-arena and pointmaze alike):
+# leaving it at 1000 would feed the policy a statistic it never saw in
+# training. Pin it to the trajectory length instead.
 case "$ENV" in
     *-stitch-*) EVAL_MAX_STEPS_FLAG=(--agent.eval_max_steps=201) ;;
     *)          EVAL_MAX_STEPS_FLAG=() ;;

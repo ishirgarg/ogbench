@@ -3,6 +3,7 @@ from agents.crl import CRLAgent
 from agents.dads import DADSAgent
 from agents.ddpgbc import DDPGBCAgent
 from agents.dds import DDSAgent
+from agents.dds_controller import DDSControllerAgent
 from agents.empowerment_crl import EmpowermentCRLAgent
 from agents.empowerment_crl_flowbc import EmpowermentCRLFlowBCAgent
 from agents.empowerment_dads import EmpowermentDADSAgent
@@ -13,6 +14,7 @@ from agents.gciql import GCIQLAgent
 from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
 from agents.opal import OPALAgent
+from agents.opal_controller import OPALControllerAgent
 from agents.qrl import QRLAgent
 from agents.quest import QueSTAgent
 from agents.sac import SACAgent
@@ -28,6 +30,7 @@ agents = dict(
     dads=DADSAgent,
     ddpgbc=DDPGBCAgent,
     dds=DDSAgent,
+    dds_controller=DDSControllerAgent,
     empowerment_crl=EmpowermentCRLAgent,
     empowerment_crl_flowbc=EmpowermentCRLFlowBCAgent,
     empowerment_dads=EmpowermentDADSAgent,
@@ -38,6 +41,7 @@ agents = dict(
     gcivl=GCIVLAgent,
     hiql=HIQLAgent,
     opal=OPALAgent,
+    opal_controller=OPALControllerAgent,
     qrl=QRLAgent,
     quest=QueSTAgent,
     sac=SACAgent,

@@ -19,6 +19,9 @@ The high-level components of SUPE/OPAL are intentionally EXCLUDED:
   * the IQL high-level skill policy (`OPAL.iql`, `update_iql`) — "reward labeling",
   * online exploration / RND reward bonuses.
 These are the "exploration and reward labeling stuff" that we were asked to skip.
+The paper's offline task-policy stage (Sec. 4.2 / App. F: label windows with the
+posterior, train pi_psi(z|s) on D^r_hi) lives in `agents/opal_controller.py`, which
+loads a finished run directory of this agent and keeps it frozen.
 
 ================================================================================
 THE OPAL VAE (Sec. "VAE pre-training"; source `VAE` in opal.py)
@@ -686,7 +689,7 @@ def get_config():
             # ── Agent ───────────────────────────────────────────────────────
             agent_name="opal",
             lr=3e-4,                     # source opal_config.lr
-            batch_size=256,              # source run_opal.py batch_size
+            batch_size=128,              # source run_opal.py batch_size
             latent_type="continuous",    # "continuous" (VAE) | "discrete" (Appendix F)
             skill_dim=8,                 # source opal_config.skill_dim (latent z dim)
             kl_coef=0.1,                 # source opal_config.kl_coef (antmaze/antsoccer/pointmaze)
