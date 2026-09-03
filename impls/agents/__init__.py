@@ -13,6 +13,8 @@ from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
 from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
+from agents.online_crl import OnlineCRLAgent
+from agents.online_crl_skill_controller import OnlineCRLSkillControllerAgent
 from agents.opal import OPALAgent
 from agents.opal_controller import OPALControllerAgent
 from agents.qrl import QRLAgent
@@ -40,6 +42,8 @@ agents = dict(
     gciql=GCIQLAgent,
     gcivl=GCIVLAgent,
     hiql=HIQLAgent,
+    online_crl=OnlineCRLAgent,
+    online_crl_skill_controller=OnlineCRLSkillControllerAgent,
     opal=OPALAgent,
     opal_controller=OPALControllerAgent,
     qrl=QRLAgent,

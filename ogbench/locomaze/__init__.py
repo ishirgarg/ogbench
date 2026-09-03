@@ -1,4 +1,8 @@
+import functools
+
 from gymnasium.envs.registration import register
+
+from ogbench.locomaze.maze import center_to_free_cells_tasks
 
 visual_dict = dict(
     ob_type='pixels',
@@ -242,6 +246,40 @@ register(
         loco_env_type='ant',
         maze_env_type='ball',
         maze_type='medium',
+    ),
+)
+
+# Environments for online goal-conditioned RL (deterministic custom task sets; no init/goal noise).
+# Pass them to `make_env_and_datasets` / `make_env_only` as e.g. `antsoccer-arena-center-online-v0`
+# (the dataset-type token is stripped like `navigate`/`stitch`).
+online_dict = dict(
+    add_noise_to_init=False,
+    add_noise_to_goal=False,
+)
+register(
+    # Ant at the arena center (10, 10), ball 2 units to its right, goal another 2 units right.
+    id='antsoccer-arena-center-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='ball',
+        maze_type='arena',
+        tasks=[dict(agent_init_xy=(10.0, 10.0), ball_init_xy=(12.0, 10.0), goal_xy=(14.0, 10.0))],
+        **online_dict,
+    ),
+)
+register(
+    # Ant at cell (3, 4) = xy (12, 8); goal = the center of every other free cell (22 tasks).
+    id='antmaze-medium-center-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='maze',
+        maze_type='medium',
+        tasks=functools.partial(center_to_free_cells_tasks, start_ij=(3, 4)),
+        **online_dict,
     ),
 )
 

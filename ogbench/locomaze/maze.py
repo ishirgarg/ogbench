@@ -10,6 +10,23 @@ from ogbench.locomaze.humanoid import HumanoidEnv
 from ogbench.locomaze.point import PointEnv
 
 
+def center_to_free_cells_tasks(env, start_ij):
+    """Task set: start at `start_ij`, goal at the center of every other free cell.
+
+    Used via the `tasks` kwarg of `MazeEnv` (it receives the env so it can read
+    the maze map). Goals are exact cell centers; pair with
+    `add_noise_to_init=False, add_noise_to_goal=False` for deterministic tasks.
+    """
+    start_ij = tuple(start_ij)
+    assert env.maze_map[start_ij] == 0, f'start cell {start_ij} is a wall'
+    tasks = []
+    for i in range(env.maze_map.shape[0]):
+        for j in range(env.maze_map.shape[1]):
+            if env.maze_map[i, j] == 0 and (i, j) != start_ij:
+                tasks.append(dict(init_xy=env.ij_to_xy(start_ij), goal_xy=env.ij_to_xy((i, j))))
+    return tasks
+
+
 def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
     """Factory function for creating a maze environment.
 
@@ -43,8 +60,10 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             success_timing='post',
             ob_type='states',
             add_noise_to_goal=True,
+            add_noise_to_init=True,
             reward_task_id=None,
             use_oracle_rep=False,
+            tasks=None,
             *args,
             **kwargs,
         ):
@@ -59,10 +78,15 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                     taking the action) or 'post' (after taking the action).
                 ob_type: Observation type. Either 'states' or 'pixels'.
                 add_noise_to_goal: Whether to add noise to the goal position.
+                add_noise_to_init: Whether to add noise to the initial agent (and ball) position.
                 reward_task_id: Task ID for single-task RL. If this is not None, the environment operates in a
                     single-task mode with the specified task ID. The task ID must be either a valid task ID or 0, where
                     0 means using the default task.
                 use_oracle_rep: Whether to use oracle goal representations.
+                tasks: Optional custom task set replacing the built-in per-maze tasks. Either a list of task dicts
+                    with xy positions (`init_xy`, `goal_xy`; for BallEnv `agent_init_xy`, `ball_init_xy`, `goal_xy`)
+                    or a callable `tasks(env) -> list` evaluated once the maze map exists (see
+                    `center_to_free_cells_tasks`). The corresponding `*_ij` fields are filled in via `xy_to_ij`.
                 *args: Additional arguments to pass to the parent locomotion environment.
                 **kwargs: Additional keyword arguments to pass to the parent locomotion environment.
             """
@@ -73,8 +97,10 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             self._success_timing = success_timing
             self._ob_type = ob_type
             self._add_noise_to_goal = add_noise_to_goal
+            self._add_noise_to_init = add_noise_to_init
             self._reward_task_id = reward_task_id
             self._use_oracle_rep = use_oracle_rep
+            self._tasks = tasks
 
             assert ob_type in ['states', 'pixels']
             assert success_timing in ['pre', 'post']
@@ -305,7 +331,33 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                     conaffinity='0',
                 )
 
+        def custom_tasks(self):
+            """Resolve the `tasks` kwarg (list or callable) into a list of xy task dicts, or None."""
+            if self._tasks is None:
+                return None
+            tasks = self._tasks(self) if callable(self._tasks) else self._tasks
+            assert len(tasks) > 0, 'custom task set is empty'
+            return [dict(task) for task in tasks]
+
         def set_tasks(self):
+            custom = self.custom_tasks()
+            if custom is not None:
+                self.task_infos = []
+                for i, task in enumerate(custom):
+                    init_xy, goal_xy = tuple(task['init_xy']), tuple(task['goal_xy'])
+                    self.task_infos.append(
+                        dict(
+                            task_name=task.get('task_name', f'task{i + 1}'),
+                            init_ij=self.xy_to_ij(init_xy),
+                            init_xy=init_xy,
+                            goal_ij=self.xy_to_ij(goal_xy),
+                            goal_xy=goal_xy,
+                        )
+                    )
+                if self._reward_task_id == 0:
+                    self._reward_task_id = 1  # Default task.
+                return
+
             # `tasks` is a list of tasks, where each task is a list of two tuples: (init_ij, goal_ij).
             if self._maze_type == 'arena':
                 tasks = [
@@ -398,9 +450,11 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             if 'render_goal' in options:
                 render_goal = options['render_goal']
 
-            # Get initial and goal positions with noise.
-            init_xy = self.add_noise(self.ij_to_xy(self.cur_task_info['init_ij']))
-            goal_xy = self.ij_to_xy(self.cur_task_info['goal_ij'])
+            # Get initial and goal positions (with noise unless disabled).
+            init_xy = tuple(self.cur_task_info['init_xy'])
+            if self._add_noise_to_init:
+                init_xy = self.add_noise(init_xy)
+            goal_xy = tuple(self.cur_task_info['goal_xy'])
             if self._add_noise_to_goal:
                 goal_xy = self.add_noise(goal_xy)
 
@@ -587,6 +641,28 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             ET.SubElement(ball, 'light', name='ball_light', pos='0 0 4', mode='trackcom')
 
         def set_tasks(self):
+            custom = self.custom_tasks()
+            if custom is not None:
+                self.task_infos = []
+                for i, task in enumerate(custom):
+                    agent_init_xy = tuple(task['agent_init_xy'])
+                    ball_init_xy = tuple(task['ball_init_xy'])
+                    goal_xy = tuple(task['goal_xy'])
+                    self.task_infos.append(
+                        dict(
+                            task_name=task.get('task_name', f'task{i + 1}'),
+                            agent_init_ij=self.xy_to_ij(agent_init_xy),
+                            agent_init_xy=agent_init_xy,
+                            ball_init_ij=self.xy_to_ij(ball_init_xy),
+                            ball_init_xy=ball_init_xy,
+                            goal_ij=self.xy_to_ij(goal_xy),
+                            goal_xy=goal_xy,
+                        )
+                    )
+                if self._reward_task_id == 0:
+                    self._reward_task_id = 1  # Default task.
+                return
+
             # `tasks` is a list of tasks, where each task is a list of three tuples: (agent_init_ij, ball_init_ij,
             # goal_ij).
             if self._maze_type == 'arena':
@@ -653,10 +729,13 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             if 'render_goal' in options:
                 render_goal = options['render_goal']
 
-            # Get initial and goal positions with noise.
-            agent_init_xy = self.add_noise(self.ij_to_xy(self.cur_task_info['agent_init_ij']))
-            ball_init_xy = self.add_noise(self.ij_to_xy(self.cur_task_info['ball_init_ij']))
-            goal_xy = self.ij_to_xy(self.cur_task_info['goal_ij'])
+            # Get initial and goal positions (with noise unless disabled).
+            agent_init_xy = tuple(self.cur_task_info['agent_init_xy'])
+            ball_init_xy = tuple(self.cur_task_info['ball_init_xy'])
+            if self._add_noise_to_init:
+                agent_init_xy = self.add_noise(agent_init_xy)
+                ball_init_xy = self.add_noise(ball_init_xy)
+            goal_xy = tuple(self.cur_task_info['goal_xy'])
             if self._add_noise_to_goal:
                 goal_xy = self.add_noise(goal_xy)
 

@@ -264,6 +264,31 @@ def make_env_only(dataset_name, frame_stack=None):
     return env
 
 
+def load_offline_dataset(dataset_name, dataset_path=None):
+    """Load only the compact *training* dataset for `dataset_name` (no env is built).
+
+    Same name handling as `make_env_and_datasets` (`-colored-` augments the
+    observations, `-slice<K>-` selects the sliced file), returning the raw dict
+    (`observations`, `actions`, `terminals`, `valids`) that `Dataset.create` takes.
+    Used by the RLPD path of `main_online.py`, whose env is a separately registered
+    online task set with no dataset of its own.
+    """
+    splits = dataset_name.split('-')
+    is_colored = 'colored' in splits
+    underlying_name = '-'.join(t for t in splits if t != 'colored') if is_colored else dataset_name
+
+    underlying_name, slice_length = parse_slice_token(underlying_name)
+    if slice_length is not None and dataset_path is None:
+        dataset_path = make_sliced_datasets(underlying_name, slice_length)
+
+    train_dataset, _ = ogbench.make_env_and_datasets(
+        underlying_name, compact_dataset=True, dataset_path=dataset_path, dataset_only=True
+    )
+    if is_colored:
+        train_dataset['observations'] = colored_obs_augment(train_dataset['observations'])
+    return train_dataset
+
+
 def make_example_batch(env, dataset_name):
     """Build the shape/dtype-only example batch that `agent_class.create` needs.
 
