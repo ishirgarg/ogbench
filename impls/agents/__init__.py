@@ -22,6 +22,7 @@ from agents.quest import QueSTAgent
 from agents.sac import SACAgent
 from agents.skill_bc_relabel_controller import SkillBCRelabelControllerAgent
 from agents.skill_dt import SkillDTAgent
+from agents.skill_dt_controller import SkillDTControllerAgent
 from agents.skill_match import SkillMatchAgent
 from agents.skill_value_controller import SkillValueControllerAgent
 from agents.vq_bet import VQBeTAgent
@@ -51,6 +52,7 @@ agents = dict(
     sac=SACAgent,
     skill_bc_relabel_controller=SkillBCRelabelControllerAgent,
     skill_dt=SkillDTAgent,
+    skill_dt_controller=SkillDTControllerAgent,
     skill_match=SkillMatchAgent,
     skill_value_controller=SkillValueControllerAgent,
     vq_bet=VQBeTAgent,

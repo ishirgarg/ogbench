@@ -10,19 +10,26 @@ from ogbench.locomaze.humanoid import HumanoidEnv
 from ogbench.locomaze.point import PointEnv
 
 
-def center_to_free_cells_tasks(env, start_ij):
+def center_to_free_cells_tasks(env, start_ij, exclude_ijs=()):
     """Task set: start at `start_ij`, goal at the center of every other free cell.
 
     Used via the `tasks` kwarg of `MazeEnv` (it receives the env so it can read
     the maze map). Goals are exact cell centers; pair with
     `add_noise_to_init=False, add_noise_to_goal=False` for deterministic tasks.
+
+    `exclude_ijs` drops free cells that would make degenerate tasks. On the
+    `teleport` maze that is the two teleport-in cells (an agent slower than the
+    1.5-unit teleport trigger can never settle inside the goal tolerance there)
+    and the walled-off (1, 7) pocket, which is reachable only by a lucky
+    teleport and traps the agent once entered.
     """
     start_ij = tuple(start_ij)
+    exclude_ijs = {tuple(ij) for ij in exclude_ijs}
     assert env.maze_map[start_ij] == 0, f'start cell {start_ij} is a wall'
     tasks = []
     for i in range(env.maze_map.shape[0]):
         for j in range(env.maze_map.shape[1]):
-            if env.maze_map[i, j] == 0 and (i, j) != start_ij:
+            if env.maze_map[i, j] == 0 and (i, j) != start_ij and (i, j) not in exclude_ijs:
                 tasks.append(dict(init_xy=env.ij_to_xy(start_ij), goal_xy=env.ij_to_xy((i, j))))
     return tasks
 

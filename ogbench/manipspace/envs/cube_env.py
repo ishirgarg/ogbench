@@ -609,9 +609,11 @@ class CubeEnv(ManipSpaceEnv):
                 self._data.mocap_quat[self._cube_target_mocap_ids[i]] = lie.SO3.identity().wxyz.tolist()
             mujoco.mj_forward(self._model, self._data)
 
-            # Do a few random steps to make the scene stable.
+            # Do a few steps to make the scene stable (random unless the env is
+            # configured for deterministic episodes, in which case a zero action --
+            # no effector delta -- settles it just as well).
             for _ in range(2):
-                self.step(self.action_space.sample())
+                self.step(self.action_space.sample() if self._add_noise_to_init else np.zeros(self.action_space.shape))
 
             # Save the goal observation.
             self._cur_goal_ob = (
@@ -627,11 +629,14 @@ class CubeEnv(ManipSpaceEnv):
             self._data.qvel[:] = saved_qvel
             self.initialize_arm()
             for i in range(self._num_cubes):
-                # Randomize the position and orientation of the cube slightly.
+                # Randomize the position and orientation of the cube slightly
+                # (skipped when `add_noise_to_init=False`, i.e. the deterministic
+                # `*-center-v0` online-RL variants).
                 obj_pos = init_xyzs[i].copy()
-                obj_pos[:2] += self.np_random.uniform(-0.01, 0.01, size=2)
+                if self._add_noise_to_init:
+                    obj_pos[:2] += self.np_random.uniform(-0.01, 0.01, size=2)
                 self._data.joint(f'object_joint_{i}').qpos[:3] = obj_pos
-                yaw = self.np_random.uniform(0, 2 * np.pi)
+                yaw = self.np_random.uniform(0, 2 * np.pi) if self._add_noise_to_init else 0.0
                 obj_ori = lie.SO3.from_z_radians(yaw).wxyz.tolist()
                 self._data.joint(f'object_joint_{i}').qpos[3:] = obj_ori
                 self._data.mocap_pos[self._cube_target_mocap_ids[i]] = goal_xyzs[i]

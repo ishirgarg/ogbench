@@ -282,6 +282,25 @@ register(
         **online_dict,
     ),
 )
+register(
+    # Point at cell (3, 6) = xy (20, 8), the most central free non-teleport cell of the
+    # 9x12 teleport maze; goal = the center of every other free cell, minus the two
+    # teleport-in cells and the (1, 7) pocket (see `center_to_free_cells_tasks`), for 41
+    # tasks. Point moves <= 0.2/step and the longest shortest path is ~15 cells x 4
+    # units, so keep the registered 1000-step horizon.
+    id='pointmaze-teleport-center-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='point',
+        maze_env_type='maze',
+        maze_type='teleport',
+        tasks=functools.partial(
+            center_to_free_cells_tasks, start_ij=(3, 6), exclude_ijs=((4, 6), (5, 1), (1, 7))
+        ),
+        **online_dict,
+    ),
+)
 
 # Environments for reward-based single-task offline RL.
 for task_id in [None, 1, 2, 3, 4, 5]:

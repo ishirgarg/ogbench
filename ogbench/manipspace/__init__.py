@@ -96,6 +96,51 @@ register(
     ),
 )
 
+# Environments for online goal-conditioned RL (a single deterministic task; no init noise).
+# Pass them to `make_env_and_datasets` / `make_env_only` as e.g. `cube-single-center-online-v0`
+# (the dataset-type token is stripped like `play`/`noisy`). The locomaze siblings are
+# `antmaze-medium-center-v0` / `antsoccer-arena-center-v0` / `pointmaze-teleport-center-v0`.
+cube_online_dict = dict(
+    permute_blocks=False,
+    add_noise_to_init=False,
+)
+register(
+    # One cube, one task: move it 0.2 m across the table (the `task1_horizontal` pair of
+    # cube-single-v0), from a fixed start with a fixed arm pose.
+    id='cube-single-center-v0',
+    entry_point='ogbench.manipspace.envs.cube_env:CubeEnv',
+    max_episode_steps=200,
+    kwargs=dict(
+        env_type='single',
+        tasks=[
+            dict(
+                task_name='center',
+                init_xyzs=[[0.425, 0.1, 0.02]],
+                goal_xyzs=[[0.425, -0.1, 0.02]],
+            )
+        ],
+        **cube_online_dict,
+    ),
+)
+register(
+    # Two cubes, one task: the `task1_single_pnp` pair of cube-double-v0 -- the first cube
+    # stays put and the second moves 0.2 m, so success needs exactly one pick-and-place.
+    id='cube-double-center-v0',
+    entry_point='ogbench.manipspace.envs.cube_env:CubeEnv',
+    max_episode_steps=500,
+    kwargs=dict(
+        env_type='double',
+        tasks=[
+            dict(
+                task_name='center',
+                init_xyzs=[[0.425, 0.0, 0.02], [0.425, -0.1, 0.02]],
+                goal_xyzs=[[0.425, 0.0, 0.02], [0.425, 0.1, 0.02]],
+            )
+        ],
+        **cube_online_dict,
+    ),
+)
+
 register(
     id='scene-v0',
     entry_point='ogbench.manipspace.envs.scene_env:SceneEnv',

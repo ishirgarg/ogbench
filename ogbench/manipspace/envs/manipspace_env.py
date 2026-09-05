@@ -32,6 +32,8 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         pixel_transparent_arm=True,
         reward_task_id=None,
         use_oracle_rep=False,
+        tasks=None,
+        add_noise_to_init=True,
         **kwargs,
     ):
         """Initialize the ManipSpace environment.
@@ -98,6 +100,8 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         self._pixel_transparent_arm = pixel_transparent_arm
         self._reward_task_id = reward_task_id
         self._use_oracle_rep = use_oracle_rep
+        self._tasks = tasks
+        self._add_noise_to_init = add_noise_to_init
 
         assert ob_type in ['states', 'pixels']
         assert success_timing in ['pre', 'post']
@@ -120,7 +124,11 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
             self.task_infos = []
             self.cur_task_id = None
             self.cur_task_info = None
-            self.set_tasks()
+            custom = self.custom_tasks()
+            if custom is None:
+                self.set_tasks()
+            else:
+                self.task_infos = custom
             self.num_tasks = len(self.task_infos)
 
             self._cur_goal_ob = None
@@ -340,11 +348,40 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
         return ob, reward, terminated, truncated, info
 
+    def custom_tasks(self):
+        """Resolve the `tasks` kwarg (list or callable) into a list of task dicts, or None.
+
+        Mirrors `ogbench.locomaze.maze.MazeEnv.custom_tasks`: a registration may pass an
+        explicit task set instead of the hard-coded `set_tasks()` one, which is how the
+        deterministic `*-center-v0` online-RL variants are defined. Each dict needs the
+        same fields the env's own `set_tasks` produces (for the cube envs: `task_name`,
+        `init_xyzs`, `goal_xyzs`), and the xyz arrays are coerced to float arrays so a
+        registration can write plain nested lists.
+        """
+        if self._tasks is None:
+            return None
+        tasks = self._tasks(self) if callable(self._tasks) else self._tasks
+        assert len(tasks) > 0, 'custom task set is empty'
+        resolved = []
+        for task in tasks:
+            task = dict(task)
+            for key in ('init_xyzs', 'goal_xyzs'):
+                if key in task:
+                    task[key] = np.asarray(task[key], dtype=np.float64)
+            resolved.append(task)
+        return resolved
+
     def initialize_arm(self):
-        # Sample initial effector position and orientation.
-        eff_pos = self.np_random.uniform(*self._arm_sampling_bounds)
+        # Sample initial effector position and orientation. With `add_noise_to_init=False`
+        # the arm starts at the center of its sampling box with zero yaw instead, so an
+        # episode of a fixed task is fully deterministic.
+        if self._add_noise_to_init:
+            eff_pos = self.np_random.uniform(*self._arm_sampling_bounds)
+            yaw = self.np_random.uniform(-np.pi, np.pi)
+        else:
+            eff_pos = np.asarray(self._arm_sampling_bounds).mean(axis=0)
+            yaw = 0.0
         cur_ori = self._effector_down_rotation
-        yaw = self.np_random.uniform(-np.pi, np.pi)
         rotz = lie.SO3.from_z_radians(yaw)
         eff_ori = rotz @ cur_ori
 

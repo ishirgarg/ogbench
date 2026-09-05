@@ -435,8 +435,10 @@ class SequenceDataset(GCDataset):
         ``argmax_z sum_{i<T} log pi(a_{t+i} | s_{t+i}, z)`` (`skill_bc_relabel_controller`),
         or — after ``relabel_chunk_skills_from_windows`` — the label a window-level
         labeller assigned to it: an int32 ``[B]`` index or a float32 ``[B, D]`` latent
-        (`opal_controller`, from OPAL's posterior). Present ONLY after one of the two
-        relabelling passes has been called; absent otherwise.
+        (`opal_controller`, from OPAL's posterior), or — after ``set_chunk_skills`` —
+        labels the agent computed itself (`skill_dt_controller`, from the per-state
+        skill counts). Present ONLY after one of those passes has been called; absent
+        otherwise.
         Unlike ``skill_hist_seq`` this is a property of the window, not of each step.
 
     For semi-MDP / option-style agents (e.g. DDS) it also emits the per-window
@@ -480,7 +482,7 @@ class SequenceDataset(GCDataset):
         # pass runs, in which case `chunk_skills` is simply absent from the batch.
         self.chunk_skills = None
 
-    def relabel_skill_histograms(self, agent, chunk_bytes=64 * 1024 * 1024):
+    def relabel_skill_histograms(self, agent, chunk_bytes=64 * 1024 * 1024, num_skills=None):
         """Hindsight skill re-labelling (Skill-DT, paper Sec. 4.1.1 and Alg. 1).
 
         Re-encodes EVERY state in the dataset with the agent's CURRENT skill
@@ -497,8 +499,12 @@ class SequenceDataset(GCDataset):
         Args:
             agent: agent exposing ``encode_skill_indices(observations) -> [B] int``.
             chunk_bytes: observation bytes pushed through the encoder at a time.
+            num_skills: codebook size (None -> ``config['num_skills']``). Controllers
+                built on a frozen Skill-DT pass it explicitly, because the dataset holds
+                the live agent config whose ``num_skills`` is still the placeholder the
+                controller later fills in from its checkpoint.
         """
-        num_skills = int(self.config['num_skills'])
+        num_skills = int(self.config['num_skills'] if num_skills is None else num_skills)
 
         # Chunk by BYTES, not by count: image datasets would otherwise ship
         # gigabytes to the device per chunk.
@@ -615,6 +621,45 @@ class SequenceDataset(GCDataset):
             'label_counts': counts.astype(np.int64),
         }
 
+    def set_chunk_skills(self, labels, num_skills=None):
+        """Store precomputed per-start-index skill labels so ``sample`` emits ``chunk_skills``.
+
+        For labellers that are neither a sum of per-step terms (``relabel_chunk_skills``)
+        nor a function of the window alone (``relabel_chunk_skills_from_windows``) -- e.g.
+        `skill_dt_controller`, whose labels are read off the per-state skill counts that
+        ``relabel_skill_histograms`` already stores, so no second pass over the data is
+        needed. ``labels`` must be an int32 ``[size]`` index array (or a float32
+        ``[size, D]`` latent array).
+
+        Returns:
+            the same label statistics as ``relabel_chunk_skills_from_windows``.
+        """
+        labels = np.asarray(labels)
+        if labels.shape[0] != self.size:
+            raise ValueError(f'labels must have one entry per dataset index ({self.size}), got {labels.shape}.')
+        self.chunk_skills = labels
+        return self._chunk_skill_stats(labels, num_skills)
+
+    @staticmethod
+    def _chunk_skill_stats(labels, num_skills=None):
+        """Label statistics shared by the chunk-labelling passes."""
+        if labels.ndim == 1:
+            minlength = int(labels.max()) + 1 if num_skills is None else int(num_skills)
+            counts = np.bincount(labels, minlength=minlength).astype(np.float64)
+            probs = counts / max(counts.sum(), 1.0)
+            nonzero = probs[probs > 0]
+            return {
+                'label_entropy': float(-(nonzero * np.log(nonzero)).sum()),
+                'label_coverage': float((counts > 0).mean()),
+                'label_max_frac': float(probs.max()),
+                'label_counts': counts.astype(np.int64),
+            }
+        return {
+            'label_mean_norm': float(np.linalg.norm(labels, axis=-1).mean()),
+            'label_std': float(labels.std(axis=0).mean()),
+            'label_abs_max': float(np.abs(labels).max()),
+        }
+
     def relabel_chunk_skills_from_windows(self, agent, seed=0, num_skills=None, chunk_bytes=64 * 1024 * 1024):
         """Label every start index with a skill drawn from a WINDOW-level labeller.
 
@@ -675,23 +720,7 @@ class SequenceDataset(GCDataset):
             )
         labels = np.concatenate(blocks, axis=0)
         self.chunk_skills = labels
-
-        if labels.ndim == 1:
-            minlength = int(labels.max()) + 1 if num_skills is None else int(num_skills)
-            counts = np.bincount(labels, minlength=minlength).astype(np.float64)
-            probs = counts / max(counts.sum(), 1.0)
-            nonzero = probs[probs > 0]
-            return {
-                'label_entropy': float(-(nonzero * np.log(nonzero)).sum()),
-                'label_coverage': float((counts > 0).mean()),
-                'label_max_frac': float(probs.max()),
-                'label_counts': counts.astype(np.int64),
-            }
-        return {
-            'label_mean_norm': float(np.linalg.norm(labels, axis=-1).mean()),
-            'label_std': float(labels.std(axis=0).mean()),
-            'label_abs_max': float(np.abs(labels).max()),
-        }
+        return self._chunk_skill_stats(labels, num_skills)
 
     def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:
