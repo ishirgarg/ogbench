@@ -272,6 +272,12 @@ def load_offline_dataset(dataset_name, dataset_path=None):
     (`observations`, `actions`, `terminals`, `valids`) that `Dataset.create` takes.
     Used by the RLPD path of `main_online.py`, whose env is a separately registered
     online task set with no dataset of its own.
+
+    Honors `OGBENCH_DATASET_DIR` if set, instead of ogbench's default `~/.ogbench/data`.
+    `~` resolves per-machine, which breaks on Slurm: a job's $HOME is the compute
+    node's own (unsynced, likely dataset-less) home directory, not the login node's,
+    so a cache miss there triggers a download that can time out on a node with no
+    internet egress. Point OGBENCH_DATASET_DIR at a NAS-resident cache to avoid both.
     """
     splits = dataset_name.split('-')
     is_colored = 'colored' in splits
@@ -281,8 +287,12 @@ def load_offline_dataset(dataset_name, dataset_path=None):
     if slice_length is not None and dataset_path is None:
         dataset_path = make_sliced_datasets(underlying_name, slice_length)
 
+    dataset_dir_kwargs = {}
+    if os.environ.get('OGBENCH_DATASET_DIR'):
+        dataset_dir_kwargs['dataset_dir'] = os.environ['OGBENCH_DATASET_DIR']
+
     train_dataset, _ = ogbench.make_env_and_datasets(
-        underlying_name, compact_dataset=True, dataset_path=dataset_path, dataset_only=True
+        underlying_name, compact_dataset=True, dataset_path=dataset_path, dataset_only=True, **dataset_dir_kwargs
     )
     if is_colored:
         train_dataset['observations'] = colored_obs_augment(train_dataset['observations'])

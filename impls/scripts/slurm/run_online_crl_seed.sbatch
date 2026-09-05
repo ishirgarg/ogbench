@@ -69,6 +69,13 @@ export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
 # cluster's A4000/A6000/A100 mix, so a fixed preallocation fraction sized for
 # one card could be wrong for another.
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# OGBench's dataset cache defaults to ~/.ogbench/data, which resolves per-machine.
+# A Slurm job's $HOME is the *compute node's own* (unsynced) home directory, not
+# rnn's, so a cache miss there triggers a download -- and a compute node may have
+# no internet egress, which is exactly what timed out here. Point at a
+# NAS-resident cache instead so every job shares it and none of them need network
+# access. Keep this in sync with the datasets actually pre-downloaded there.
+export OGBENCH_DATASET_DIR=/nas/ucb/ishirgarg/.ogbench/data
 
 cd "$IMPLS_DIR"
 
