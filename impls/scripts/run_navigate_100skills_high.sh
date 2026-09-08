@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=navigate_100skills_normal
+#SBATCH --job-name=navigate_100skills
 #SBATCH --account=co_rail
 #SBATCH --partition=savio4_gpu
-#SBATCH --qos=rail_gpu4_normal
+#SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
 #SBATCH --array=0-3
 
-# Normal-priority (rail_gpu4_normal) 100-skill runs of empowerment_skill and
+# High-priority (rail_gpu4_high) 100-skill runs of empowerment_skill and
 # DDS (agents/dds.py) on the two navigate datasets:
 # antsoccer-arena-navigate-v0 and pointmaze-teleport-navigate-v0.
 #
@@ -31,7 +31,7 @@
 #   IDX 3 : dds                pointmaze-teleport-navigate-v0  K=100
 #
 #   IDX = SLURM_ARRAY_TASK_ID   (0..3)
-# Submit from impls/:  sbatch scripts/run_navigate_100skills_normal.sh
+# Submit from impls/:  sbatch scripts/run_navigate_100skills_high.sh
 
 IDX=${SLURM_ARRAY_TASK_ID}
 
