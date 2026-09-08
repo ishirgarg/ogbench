@@ -17,25 +17,33 @@
 #   3  pointmaze-teleport-navigate-v0
 #   4  pointmaze-teleport-stitch-v0
 #
-# Scheduling: 5 runs dealt round-robin over GPUS (default "0 1" -- 2 GPUs max),
-# with at most PER_GPU concurrent runs on a card. With the defaults that is
-# GPU 0 <- runs 0,2,4 and GPU 1 <- runs 1,3, all live at once.
-# XLA_PYTHON_CLIENT_MEM_FRACTION is derived from PER_GPU so the stacked
-# processes fit on one A6000 (48 GB); override it if you change PER_GPU.
+# Scheduling: runs are dealt round-robin over GPUS, with at most PER_GPU=2
+# concurrent runs on a card.
+#
+# SIZE THIS AGAINST WHAT IS ACTUALLY FREE. This box is shared, and other users'
+# jobs come and go on every card, so the default GPU list is only a starting
+# point -- check first with
+#   nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader
+# One run needs ~17 GB (measured 2026-09-04: peak is the prepare_datasets
+# relabelling pass, not training), so PER_GPU=2 needs ~34 GB free on that card.
+# XLA_PYTHON_CLIENT_MEM_FRACTION defaults to 0.9/PER_GPU of the card's TOTAL
+# memory (0.45 = ~22 GB on a 48 GB A6000); set it explicitly when you are
+# sharing a card, e.g. XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 for ~17 GB.
 #
 # Checkpoints go to <SKILL_CKPT>/controller/OGBench/Debug/sd000_<ts>/, so the
 # pretrained params_*.pkl in each SKILL_CKPT is never touched.
 #
-# Run from impls/:  bash scripts/run_dds_controller_final5_local.sh
-#   GPUS="4 5" PER_GPU=2 RUN_IDS="0 1"   to override the GPU set / cap / subset.
+# Run from impls/, detached so it survives an ssh disconnect:
+#   setsid nohup bash scripts/run_dds_controller_final5_local.sh > logs/... 2>&1 &
+#   GPUS="0 1" PER_GPU=3 RUN_IDS="0 1"   to override the GPU set / cap / subset.
 set -euo pipefail
 cd "$(dirname "$0")/.."   # -> impls/
 
 PYTHON=${PYTHON:-/nas/ucb/ishirgarg/miniconda3/envs/ogbench/bin/python}
 DDS_ROOT=${DDS_ROOT:-ckpts/final/dds}
 
-read -r -a GPUS <<< "${GPUS:-0 1}"
-PER_GPU=${PER_GPU:-3}
+read -r -a GPUS <<< "${GPUS:-4 5}"
+PER_GPU=${PER_GPU:-2}
 NGPU=${#GPUS[@]}
 
 # ── The 5 runs (one per final DDS checkpoint) ────────────────────────────────

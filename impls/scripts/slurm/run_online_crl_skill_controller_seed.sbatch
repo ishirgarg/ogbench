@@ -17,11 +17,16 @@
 # scripts/slurm/submit_online_crl_skill_controller_rlpd_seeds.sh):
 #   sbatch --job-name=<name> --output=<log> \
 #       scripts/slurm/run_online_crl_skill_controller_seed.sbatch \
-#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET]
+#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH]
 #
 # OFFLINE_DATASET is optional; omit (or pass "") to use SKILL_CKPT's own
 # dataset (its flags.json env_name), matching the local script's default.
 # Pass "none" to disable RLPD.
+# EPISODE_LENGTH is optional; omit to use the env's registered horizon.
+# antsoccer-arena-center-online-v0 is registered at 1000 but every online run in
+# this repo uses 500 for it (scripts/run_online_crl.sh's per-env table), so the
+# submit scripts pass it explicitly. main_online.py requires
+# episode_horizon % skill_commitment_k == 0, which holds for 1000 and 500 at K=10.
 #SBATCH --job-name=online_crl_skill_controller
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16gb
@@ -30,10 +35,12 @@
 #SBATCH --qos=default
 set -euo pipefail
 
-SKILL_CKPT=${1:?usage: run_online_crl_skill_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET]}
-ENV_NAME=${2:?usage: run_online_crl_skill_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET]}
-SEED=${3:?usage: run_online_crl_skill_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET]}
+USAGE="usage: run_online_crl_skill_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]"
+SKILL_CKPT=${1:?$USAGE}
+ENV_NAME=${2:?$USAGE}
+SEED=${3:?$USAGE}
 OFFLINE_DATASET=${4:-}
+EPISODE_LENGTH=${5:-}
 
 REPO_DIR=/nas/ucb/ishirgarg/ogbench
 IMPLS_DIR="$REPO_DIR/impls"
@@ -51,6 +58,13 @@ mkdir -p "$TMPDIR"
 export JAX_COMPILATION_CACHE_DIR="$REPO_DIR/impls/.jax_cache"
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
+# The per-fusion AUTOTUNE sub-cache that XLA puts *inside* the compilation cache dir is
+# NOT safe for concurrent writers: with many seeds sharing the NAS cache, a job can read a
+# temp .textproto another job has already renamed away and die with
+# `JaxRuntimeError: NOT_FOUND: .../xla_gpu_per_fusion_autotune_cache_dir/tmp/...`.
+# (Observed on jobs 1194122 / 1194127, 2026-09-04.) Give each job its own autotune dir; the
+# module cache above stays shared, which is where the real cold-start saving is.
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_per_fusion_autotune_cache_dir=$TMPDIR/autotune_${SLURM_JOB_ID:-$$}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # See run_online_crl_seed.sbatch: avoids a per-compute-node $HOME cache miss
 # triggering a download that can time out with no internet egress.
@@ -68,10 +82,12 @@ if [[ -z "$OFFLINE_DATASET" ]]; then OFFLINE_DATASET="$SKILL_DATASET"; fi
 TAG=rlpd
 RLPD_FLAG=(--offline_dataset="$OFFLINE_DATASET")
 if [[ "$OFFLINE_DATASET" == "none" ]]; then TAG=norlpd; RLPD_FLAG=(); fi
+EP_FLAG=()
+if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
 SAVE_DIR="$SKILL_CKPT/online_controller/$TAG"
 mkdir -p "$SAVE_DIR"
 
-echo "[run_online_crl_skill_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_online_crl_skill_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -83,6 +99,7 @@ srun "$PYTHON" -u main_online.py \
     --agent.skill_commitment_k=10 \
     --agent.target_entropy_multiplier=0.5 \
     --total_env_steps=1000000 \
+    "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \
     --log_interval=5000 \
     --eval_interval=20000 \

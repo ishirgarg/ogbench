@@ -59,6 +59,13 @@ mkdir -p "$TMPDIR"
 export JAX_COMPILATION_CACHE_DIR="$REPO_DIR/impls/.jax_cache"
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
+# The per-fusion AUTOTUNE sub-cache that XLA puts *inside* the compilation cache dir is
+# NOT safe for concurrent writers: with many seeds sharing the NAS cache, a job can read a
+# temp .textproto another job has already renamed away and die with
+# `JaxRuntimeError: NOT_FOUND: .../xla_gpu_per_fusion_autotune_cache_dir/tmp/...`.
+# (Observed on jobs 1194122 / 1194127, 2026-09-04.) Give each job its own autotune dir; the
+# module cache above stays shared, which is where the real cold-start saving is.
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_per_fusion_autotune_cache_dir=$TMPDIR/autotune_${SLURM_JOB_ID:-$$}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # See run_online_crl_seed.sbatch: avoids a per-compute-node $HOME cache miss
 # triggering a download that can time out with no internet egress.
