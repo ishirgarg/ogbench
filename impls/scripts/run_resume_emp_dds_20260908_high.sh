@@ -6,18 +6,19 @@
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=144:00:00
-#SBATCH --array=0-3
+#SBATCH --array=0-1
 
-# Resume the four runs launched together on 2026-09-08 01:49 from their latest
-# checkpoints, in place, on the high-priority RAIL queue:
+# Resume the first two of the four runs launched together on 2026-09-08 01:49
+# from their latest checkpoints, in place, on the high-priority RAIL queue:
 #
 #   array 0  sd000_s_38624851  empowerment_skill
 #   array 1  sd000_s_38624850  empowerment_skill
-#   array 2  sd000_s_38624849  dds
-#   array 3  sd000_s_38624852  dds
+#
+# The two dds runs from that launch (sd000_s_38624849, sd000_s_38624852) are
+# deliberately NOT resumed here.
 #
 # Submit from impls/:  sbatch scripts/run_resume_emp_dds_20260908_high.sh
-# One run only:        sbatch --array=2 scripts/run_resume_emp_dds_20260908_high.sh
+# One run only:        sbatch --array=1 scripts/run_resume_emp_dds_20260908_high.sh
 #
 # Each run continues in ITS OWN existing folder: the same params_*.pkl series,
 # the same train.csv / eval.csv (appended, not truncated), and the same wandb
@@ -45,14 +46,10 @@ BASE=/global/scratch/users/ishirgarg/ogbench
 RUNS=(
     "sd000_s_38624851.0.20260908_014900"
     "sd000_s_38624850.0.20260908_014900"
-    "sd000_s_38624849.0.20260908_014900"
-    "sd000_s_38624852.0.20260908_014900"
 )
 AGENTS=(
     empowerment_skill
     empowerment_skill
-    dds
-    dds
 )
 
 IDX=${SLURM_ARRAY_TASK_ID:-0}
