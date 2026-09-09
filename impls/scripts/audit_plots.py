@@ -14,8 +14,10 @@ On antsoccer every path job emits two figures -- ant paths and ball paths --
 from the same rollout, so a missing ball plot is reported separately but is
 fixed by re-running the same paths command (the launcher dedupes).
 
-Envs outside the antmaze / antsoccer families have no skill-rollout support
-here, so they are reported as N/A rather than missing.
+Supported env families: antmaze, antsoccer and pointmaze-teleport. PointMaze
+has no ball and its figures carry their own names (skill_point_paths_*.png,
+empowerment_pointmaze_teleport_*.png). Anything else has no skill-rollout
+support here, so it is reported as N/A rather than missing.
 
 Run with --print-cmds to emit the python command line for each missing plot.
 """
@@ -41,6 +43,10 @@ DDS_AGENTS = {"dds"}
 # Fixed antsoccer rollout start: ant at (6, 6), ball at (3, 3).
 ANTSOCCER_ANT_XY = os.environ.get("ANTSOCCER_ANT_XY", "6,6")
 ANTSOCCER_BALL_XY = os.environ.get("ANTSOCCER_BALL_XY", "3,3")
+# Fixed pointmaze-teleport rollout start: a free, central, non-teleporter cell.
+POINTMAZE_XY = os.environ.get("POINTMAZE_XY", "12,12")
+# pointmaze-teleport is 36x24 in world coords, not the 20x20 the ant mazes use.
+POINTMAZE_EXTENT = "--x_min 0 --x_max 36 --y_min 0 --y_max 24"
 
 
 def latest_epoch(run_dir):
@@ -57,12 +63,15 @@ def family(env_name):
         return "antsoccer"
     if "antmaze" in env_name:
         return "antmaze"
+    if "pointmaze" in env_name:
+        return "pointmaze"
     return None
 
 
-def audit():
+def audit(root=None):
     rows = []
-    for flags_path in sorted(glob.glob(os.path.join(CKPT_ROOT, "**", "flags.json"), recursive=True)):
+    scan_root = os.path.join(CKPT_ROOT, root) if root else CKPT_ROOT
+    for flags_path in sorted(glob.glob(os.path.join(scan_root, "**", "flags.json"), recursive=True)):
         run_dir = os.path.dirname(flags_path)
         rel = os.path.relpath(run_dir, CKPT_ROOT)
         epoch = latest_epoch(run_dir)
@@ -80,8 +89,11 @@ def audit():
             for k in ("map", "paths", "ball"):
                 items.append((k, None, False, f"env family unsupported ({env})"))
         else:
-            map_png = "empowerment_map_e%d.png" % epoch if fam == "antsoccer" \
-                else "empowerment_antmaze_e%d.png" % epoch
+            map_png = {
+                "antsoccer": "empowerment_map_e%d.png" % epoch,
+                "antmaze": "empowerment_antmaze_e%d.png" % epoch,
+                "pointmaze": "empowerment_pointmaze_teleport_e%d.png" % epoch,
+            }[fam]
             # The ball figure only exists on antsoccer, and only where a paths
             # job runs at all.
             def with_ball(ant_png, ball_png):
@@ -100,7 +112,12 @@ def audit():
                 items.append(("ball", None, False, "%s has no skill policy" % agent))
             elif agent in SKILL_AGENTS:
                 items.append(("map", os.path.join(run_dir, map_png), True, ""))
-                with_ball("skill_ant_paths_e%d.png" % epoch, "skill_ball_paths_e%d.png" % epoch)
+                # PointMaze paths are drawn by the pointmaze script under its
+                # own name; ant families share skill_ant_paths_*.
+                if fam == "pointmaze":
+                    with_ball("skill_point_paths_e%d.png" % epoch, None)
+                else:
+                    with_ball("skill_ant_paths_e%d.png" % epoch, "skill_ball_paths_e%d.png" % epoch)
             else:
                 for k in ("map", "paths", "ball"):
                     items.append((k, None, False, "unknown agent %s" % agent))
@@ -113,13 +130,27 @@ def audit():
 def cmd_for(row, kind):
     """python command line that produces the missing plot for this run."""
     rd = os.path.relpath(row["run_dir"], os.path.join(CKPT_ROOT, ".."))
-    script = "plot_empowerment_map_antsoccer.py" if row["fam"] == "antsoccer" \
-        else "plot_empowerment_map_antmaze.py"
+    script = {
+        "antsoccer": "plot_empowerment_map_antsoccer.py",
+        "antmaze": "plot_empowerment_map_antmaze.py",
+        "pointmaze": "plot_empowerment_map_pointmaze_teleport.py",
+    }[row["fam"]]
     soccer = row["fam"] == "antsoccer"
-    ant_xy = ANTSOCCER_ANT_XY if soccer else "8,8"
+    point = row["fam"] == "pointmaze"
+    ant_xy = POINTMAZE_XY if point else (ANTSOCCER_ANT_XY if soccer else "8,8")
     if row["agent"] in DDS_AGENTS:
         cmd = "plot_dds_skill_paths.py --run_dir %s/ --steps 3000 --ant_xy %s" % (rd, ant_xy)
+        if point:
+            return cmd + " " + POINTMAZE_EXTENT
         return cmd + (" --ball_xy %s" % ANTSOCCER_BALL_XY if soccer else "")
+    if point:
+        # The pointmaze script has no video branch and names its flags
+        # --path_steps / --point_xy.
+        if kind == "map":
+            return ("%s --run_dir %s/ --grid_res 200 --batch_size 48 --no-skill_paths"
+                    % (script, rd))
+        return ("%s --run_dir %s/ --path_steps 3000 --point_xy %s --no-skill_map"
+                % (script, rd, ant_xy))
     if kind == "map":
         return "%s --run_dir %s/ --grid_res 200 --batch_size 48 --no-skill_video --no-skill_paths" % (script, rd)
     # "paths" and "ball" come out of one rollout job.
@@ -130,6 +161,9 @@ def cmd_for(row, kind):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=None,
+                    help="Restrict the audit to this subtree of impls/ckpts "
+                         "(e.g. --root final).")
     ap.add_argument("--print-cmds", action="store_true",
                     help="Print one python command per missing plot (for a launcher).")
     ap.add_argument("--force-soccer-paths", action="store_true",
@@ -138,7 +172,7 @@ def main():
                          "the start positions or figure style change).")
     args = ap.parse_args()
 
-    rows = audit()
+    rows = audit(args.root)
     missing = []
     if not args.print_cmds:
         print("%-64s %-18s %-8s %-8s %-8s" % ("run", "agent", "map", "paths", "ball"))
