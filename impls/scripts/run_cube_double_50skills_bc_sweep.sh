@@ -1,0 +1,63 @@
+#!/bin/bash
+#SBATCH --job-name=cube_double_50skills_bc_sweep
+#SBATCH --account=co_rail
+#SBATCH --partition=savio4_gpu
+#SBATCH --qos=rail_gpu4_high
+#SBATCH --gres=gpu:A5000:1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=144:00:00
+#SBATCH --array=0-2
+
+# empowerment_skill on cube-double-play-v0, num_skills=50, same flags as
+# scripts/run_empowerment_skill_extra_envs_priority.sh (noise=0.01,
+# stochastic_policy_actions, perturb_q_loss_actions, log_interval=8000,
+# train_steps=1e6, video_episodes=0), but restricted to a BC-alpha sweep over
+# [0.01, 0.1, 1] on high priority (rail_gpu4_high).
+#
+#   IDX 0 : bc_alpha=0.01
+#   IDX 1 : bc_alpha=0.1
+#   IDX 2 : bc_alpha=1
+#
+#   IDX = SLURM_ARRAY_TASK_ID   (0..2)
+# Submit from impls/:  sbatch scripts/run_cube_double_50skills_bc_sweep.sh
+
+IDX=${SLURM_ARRAY_TASK_ID}
+
+RUN_BC_ALPHAS=(
+    0.01  # 0
+    0.1   # 1
+    1     # 2
+)
+
+ENV=cube-double-play-v0
+SKILLS=50
+NOISE=0.01
+
+if [ -z "$IDX" ] || [ "$IDX" -ge ${#RUN_BC_ALPHAS[@]} ]; then
+    echo "ERROR: SLURM_ARRAY_TASK_ID='$IDX' out of range for ${#RUN_BC_ALPHAS[@]} runs; use --array=0-$((${#RUN_BC_ALPHAS[@]} - 1))." >&2
+    exit 1
+fi
+BC_ALPHA=${RUN_BC_ALPHAS[$IDX]}
+
+SAVE_DIR=/global/scratch/users/ishirgarg/ogbench
+
+echo "IDX=$IDX  ENV=$ENV  SKILLS=$SKILLS  NOISE=$NOISE  BC_ALPHA=$BC_ALPHA"
+
+# -----------------------------
+# Run
+# -----------------------------
+export MUJOCO_GL=egl
+
+python main.py \
+    --env_name=$ENV \
+    --save_dir=$SAVE_DIR \
+    --agent=agents/empowerment_skill.py \
+    --agent.num_skills=$SKILLS \
+    --agent.bc_alpha=$BC_ALPHA \
+    --agent.stochastic_policy_actions=True \
+    --agent.action_noise_std=$NOISE \
+    --agent.perturb_q_loss_actions=True \
+    --agent.log_interval=8000 \
+    --log_interval=8000 \
+    --train_steps=1000000 \
+    --video_episodes=0
