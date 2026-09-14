@@ -27,7 +27,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Circle, Rectangle
 
 from agents import agents as agent_registry
 from utils.env_utils import make_env_and_datasets
@@ -151,7 +151,8 @@ def rollout_dds_skill(env, agent, skill_vec, is_antsoccer, ant_xy, ball_xy,
 
 
 def plot_skill_paths(xy_per_skill, ant_start_xy, overlay_maze, extent,
-                     output_path, title=None, ball_xy=None, show_intervals=True):
+                     output_path, title=None, ball_xy=None, show_intervals=True,
+                     agent_label="Ant"):
     fig, ax = plt.subplots(1, 1, figsize=(7, 7))
     overlay_maze(ax)
     K = len(xy_per_skill)
@@ -160,7 +161,8 @@ def plot_skill_paths(xy_per_skill, ant_start_xy, overlay_maze, extent,
         ax.plot(xy[:, 0], xy[:, 1], color=cmap(z / max(K, 1)),
                 linewidth=0.6, alpha=0.9, label=f"skill {z}")
     ax.scatter([ant_start_xy[0]], [ant_start_xy[1]], c='black', s=40, marker='o',
-               edgecolors='white', linewidths=0.8, zorder=5, label='Ant start')
+               edgecolors='white', linewidths=0.8, zorder=5,
+               label=f'{agent_label} start')
     if ball_xy is not None:
         ax.scatter([ball_xy[0]], [ball_xy[1]], c='red', s=70, marker='o',
                    edgecolors='white', linewidths=0.8, zorder=5, label='Ball')
@@ -168,8 +170,8 @@ def plot_skill_paths(xy_per_skill, ant_start_xy, overlay_maze, extent,
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
     ax.set_aspect('equal')
-    ax.set_xlabel('Ant x')
-    ax.set_ylabel('Ant y')
+    ax.set_xlabel(f'{agent_label} x')
+    ax.set_ylabel(f'{agent_label} y')
     if title is not None:
         ax.set_title(title)
     interval_handles = _draw_interval_dots(ax, xy_per_skill) if show_intervals else None
@@ -242,6 +244,8 @@ def main():
     agent_cfg = flags["agent"]
     env_name = flags["env_name"]
     is_antsoccer = "antsoccer" in env_name
+    # pointmaze drives a point mass, every other supported env drives an ant.
+    agent_label = "Point" if "pointmaze" in env_name else "Ant"
 
     env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
     example_batch = train_dataset.sample(1)
@@ -269,19 +273,29 @@ def main():
     offy = getattr(base_env, "_offset_y", 4.0)
     maze_map = getattr(base_env, "maze_map", None)
     half = float(unit) / 2.0
+    # pointmaze-teleport carries teleporter pads; every other maze has none.
+    teleport_info = getattr(base_env, "_teleport_info", None)
 
     def overlay_maze(ax):
-        if maze_map is None:
+        if maze_map is not None:
+            rows, cols = maze_map.shape
+            for i in range(rows):
+                for j in range(cols):
+                    if maze_map[i, j] == 1:
+                        cx = j * unit - offx
+                        cy = i * unit - offy
+                        ax.add_patch(Rectangle((cx - half, cy - half), unit, unit,
+                                               facecolor="black", edgecolor="black",
+                                               linewidth=0.3, alpha=0.2))
+        if teleport_info is None:
             return
-        rows, cols = maze_map.shape
-        for i in range(rows):
-            for j in range(cols):
-                if maze_map[i, j] == 1:
-                    cx = j * unit - offx
-                    cy = i * unit - offy
-                    ax.add_patch(Rectangle((cx - half, cy - half), unit, unit,
-                                           facecolor="black", edgecolor="black",
-                                           linewidth=0.3, alpha=0.2))
+        radius = float(teleport_info.get("teleport_radius", 1.0))
+        for (x, y) in teleport_info.get("teleport_in_xys", []):
+            ax.add_patch(Circle((x, y), radius, facecolor="none",
+                                edgecolor="cyan", linewidth=2.0))
+        for (x, y) in teleport_info.get("teleport_out_xys", []):
+            ax.add_patch(Circle((x, y), radius, facecolor="none",
+                                edgecolor="red", linewidth=2.0, linestyle="--"))
 
     # Start positions.
     if is_antsoccer:
@@ -321,7 +335,8 @@ def main():
         # On antsoccer the ant and ball figures are read together; the
         # along-the-path interval dots only clutter them.
         show_intervals=not is_antsoccer,
-        title=(f"DDS ant paths | {os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
+        agent_label=agent_label,
+        title=(f"DDS {agent_label.lower()} paths | {os.path.basename(run_dir.rstrip("/"))} | epoch={epoch}\n"
                f"K={num_skills}, steps={args.steps}, "
                f"start=({float(ant_xy[0]):.2f}, {float(ant_xy[1]):.2f})"),
     )

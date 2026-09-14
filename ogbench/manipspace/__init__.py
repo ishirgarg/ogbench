@@ -123,8 +123,10 @@ register(
     ),
 )
 register(
-    # Two cubes, one task: the `task1_single_pnp` pair of cube-double-v0 -- the first cube
-    # stays put and the second moves 0.2 m, so success needs exactly one pick-and-place.
+    # Two cubes, one task: BOTH cubes move 0.2 m across the table, in separate y lanes so
+    # neither one's path or goal is blocked by the other. Success requires both to be on
+    # target, i.e. two pick-and-places. Cube z is 0.02 and the object bounds are
+    # [[0.3, -0.3], [0.55, 0.3]] (manipspace_env.py), so 0.325 -> 0.525 in x fits.
     id='cube-double-center-v0',
     entry_point='ogbench.manipspace.envs.cube_env:CubeEnv',
     max_episode_steps=500,
@@ -133,8 +135,8 @@ register(
         tasks=[
             dict(
                 task_name='center',
-                init_xyzs=[[0.425, 0.0, 0.02], [0.425, -0.1, 0.02]],
-                goal_xyzs=[[0.425, 0.0, 0.02], [0.425, 0.1, 0.02]],
+                init_xyzs=[[0.325, -0.15, 0.02], [0.325, 0.15, 0.02]],
+                goal_xyzs=[[0.525, -0.15, 0.02], [0.525, 0.15, 0.02]],
             )
         ],
         **cube_online_dict,

@@ -163,6 +163,20 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
+def _dataset_dir_kwargs():
+    """`dataset_dir=` for `ogbench.make_env_and_datasets`, honoring `OGBENCH_DATASET_DIR`.
+
+    ogbench defaults to `~/.ogbench/data`, and `~` resolves per-machine, which breaks on
+    Slurm: a job's $HOME is the compute node's own (unsynced, likely dataset-less) home
+    directory, not the login node's, so a cache miss there triggers a download that fails
+    outright on a node with no internet egress. Point OGBENCH_DATASET_DIR at a
+    NAS-resident cache to avoid both. Empty dict when unset, so the default is unchanged.
+    """
+    if os.environ.get('OGBENCH_DATASET_DIR'):
+        return {'dataset_dir': os.environ['OGBENCH_DATASET_DIR']}
+    return {}
+
+
 def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None):
     """Make OGBench environment and datasets.
 
@@ -202,7 +216,7 @@ def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None):
 
     # Use compact dataset to save memory.
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(
-        underlying_name, compact_dataset=True, dataset_path=dataset_path
+        underlying_name, compact_dataset=True, dataset_path=dataset_path, **_dataset_dir_kwargs()
     )
 
     if is_colored:
@@ -287,12 +301,9 @@ def load_offline_dataset(dataset_name, dataset_path=None):
     if slice_length is not None and dataset_path is None:
         dataset_path = make_sliced_datasets(underlying_name, slice_length)
 
-    dataset_dir_kwargs = {}
-    if os.environ.get('OGBENCH_DATASET_DIR'):
-        dataset_dir_kwargs['dataset_dir'] = os.environ['OGBENCH_DATASET_DIR']
-
     train_dataset, _ = ogbench.make_env_and_datasets(
-        underlying_name, compact_dataset=True, dataset_path=dataset_path, dataset_only=True, **dataset_dir_kwargs
+        underlying_name, compact_dataset=True, dataset_path=dataset_path, dataset_only=True,
+        **_dataset_dir_kwargs()
     )
     if is_colored:
         train_dataset['observations'] = colored_obs_augment(train_dataset['observations'])

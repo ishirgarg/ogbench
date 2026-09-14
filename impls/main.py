@@ -243,7 +243,11 @@ def main(_):
     # explains it). Unlike the hindsight re-labelling below, the labelling model is
     # frozen, so this runs once and its output is never stale.
     if hasattr(agent, 'prepare_datasets'):
-        agent.prepare_datasets([d for d in (train_dataset, val_dataset) if d is not None])
+        # Agents whose preparation changes their own state (e.g. a data-estimated
+        # constant) return the new agent; the relabelling agents return None.
+        prepared = agent.prepare_datasets([d for d in (train_dataset, val_dataset) if d is not None])
+        if prepared is not None:
+            agent = prepared
 
     # Hindsight skill re-labelling (Skill-DT, paper Sec. 4.1.1 / Alg. 1). Every
     # `relabel_interval` gradient steps the whole dataset is re-encoded with the

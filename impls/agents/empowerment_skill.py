@@ -478,13 +478,30 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                 params=None
             )
 
-    def empowerment(self, observations, rng):
-        """Monte-Carlo estimate of I(Z; S⁺ | s) for each observation."""
+    def empowerment(self, observations, rng, sample_chunk_size=None):
+        """Monte-Carlo estimate of I(Z; S⁺ | s) for each observation.
+
+        Memory note: the per-sample softmax denominator needs log V^{z'}(psi|s)
+        against ALL K skill embeddings, so a naive vmap over skills (K, outer)
+        composed with a vmap over successor-state samples (N, inner) makes XLA's
+        GPU reduce-fusion autotuner consider materializing a [batch, K, N, K, d]
+        cross term. For K=50, d~512 that hits hundreds of GB even for modest N,
+        and the autotuner has no fallback if a candidate OOMs during profiling
+        (it just aborts the whole compile) — this bit us in practice with
+        num_splus_samples=192 on cube-single-play. So the skill loop runs as a
+        sequential lax.scan (K is small, ~15-50) and the sample loop runs via
+        lax.map in chunks of `sample_chunk_size` (default 64) instead of a
+        single vmap — this bounds peak memory to one chunk regardless of how
+        large num_splus_samples is, at the cost of some parallelism.
+        """
         batch_size = observations.shape[0]
         K = self.config['num_skills']
         num_samples = self.config['num_splus_samples']
         d = self.config['value_latent_dim']
         log_K = jnp.log(K)
+        if sample_chunk_size is None:
+            sample_chunk_size = self.config.get('emp_sample_chunk_size', 64)
+        sample_chunk_size = max(1, min(int(sample_chunk_size), num_samples))
 
         act_rng = jax.random.fold_in(rng, 5)
         rng, sample_rng = jax.random.split(rng)
@@ -495,7 +512,8 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
             observations, use_target=False, policy_params=None, rng=act_rng
         )
 
-        def empowerment_for_skill(phi_z, skill_rng):
+        def empowerment_for_skill(carry, xs):
+            phi_z, skill_rng = xs
             noise = jax.random.normal(skill_rng, (num_samples, *phi_z.shape))
             psi_samples = phi_z[None] + noise * jnp.sqrt(d / 2.0)
 
@@ -507,12 +525,14 @@ class EmpowermentAgent(flax.struct.PyTreeNode):
                 log_denom = logsumexp(log_v_all, axis=0) - log_K
                 return log_v - log_denom
 
-            contributions = jax.vmap(contribution)(psi_samples)  # [N, batch]
-            return contributions.mean(axis=0)
+            contributions = jax.lax.map(
+                contribution, psi_samples, batch_size=sample_chunk_size
+            )  # [N, batch]
+            return carry, contributions.mean(axis=0)
 
-        emp_per_skill = jax.vmap(
-            empowerment_for_skill, in_axes=(0, 0)
-        )(phi_all, skill_rngs)          # [K, batch]
+        _, emp_per_skill = jax.lax.scan(
+            empowerment_for_skill, None, (phi_all, skill_rngs)
+        )  # [K, batch]
         return emp_per_skill.mean(axis=0)
 
     # ── Losses ────────────────────────────────────────────────────────────────

@@ -42,6 +42,11 @@ ENV_NAME=${2:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME S
 SEED=${3:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
 OFFLINE_DATASET=${4:-}
 EPISODE_LENGTH=${5:-}
+# Optional 6th arg: the per-checkpoint subdirectory results are written to. Defaults to
+# `online_controller` so every existing caller is unchanged; pass a different name (e.g.
+# `online_controller_corner`) to keep a sweep on a different online env in its own tree
+# instead of mixing it into the finished one.
+SAVE_SUBDIR=${6:-online_controller}
 
 REPO_DIR=/nas/ucb/ishirgarg/ogbench
 IMPLS_DIR="$REPO_DIR/impls"
@@ -85,7 +90,7 @@ RLPD_FLAG=(--offline_dataset="$OFFLINE_DATASET")
 if [[ "$OFFLINE_DATASET" == "none" ]]; then TAG=norlpd; RLPD_FLAG=(); fi
 EP_FLAG=()
 if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
-SAVE_DIR="$SKILL_CKPT/online_controller/$TAG"
+SAVE_DIR="$SKILL_CKPT/$SAVE_SUBDIR/$TAG"
 mkdir -p "$SAVE_DIR"
 
 echo "[run_dds_online_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"

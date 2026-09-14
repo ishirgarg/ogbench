@@ -60,9 +60,11 @@ if [[ -r "$WANDB_KEY_FILE" ]]; then
 else
     echo "[run_empowerment_controller_alpha_seed] WARNING: $WANDB_KEY_FILE not readable; wandb logging will likely fail." >&2
 fi
-# video_episodes=0, so nothing is rendered; egl is only needed for env construction.
-# (MUJOCO_GL=osmesa is the fallback if a node's EGL cannot open a display.)
-export MUJOCO_GL=${MUJOCO_GL:-egl}
+# video_episodes=0, so nothing is rendered, but dm_control still needs a GL context to
+# construct manipspace (cube) envs. Leave MUJOCO_GL unset so dm_control auto-probes
+# GLFW -> EGL -> OSMesa and falls back past a node's broken headless EGL, instead of
+# forcing egl and hard-failing on it (ImportError: Cannot initialize a headless EGL
+# display -- see run_dds_controller_alpha_seed.sbatch for the same fix).
 export TMPDIR=/nas/ttl=60d/ishirgarg/tmp
 mkdir -p "$TMPDIR"
 export JAX_COMPILATION_CACHE_DIR="$REPO_DIR/impls/.jax_cache"

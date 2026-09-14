@@ -13,6 +13,12 @@ import numpy as np
 from agents import agents as agent_registry
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import restore_agent
+from plot_empowerment_map_antmaze import (
+    _draw_interval_dots,
+    _parse_xy,
+    _raise_time_limit,
+    rollout_skill_ant,
+)
 from matplotlib.patches import Rectangle, Circle
 
 
@@ -43,6 +49,52 @@ def _parse_int_list(text: str) -> List[int]:
     return [int(p) for p in parts]
 
 
+def plot_point_paths(xy_per_skill, start_xy, overlay_maze, overlay_teleporters,
+                     extent, output_path, title=None):
+    """One 2D plot: a thin line per skill (point xy over time), start marked.
+
+    Same figure as the AntMaze skill-path plot, plus the teleporter rings and
+    PointMaze axis labels.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(9, 7))
+    overlay_maze(ax)
+    overlay_teleporters(ax)
+
+    K = len(xy_per_skill)
+    cmap = plt.get_cmap("hsv")
+    for z, xy in enumerate(xy_per_skill):
+        ax.plot(xy[:, 0], xy[:, 1], color=cmap(z / max(K, 1)), linewidth=0.6,
+                alpha=0.9, label=f"skill {z}")
+
+    ax.scatter([start_xy[0]], [start_xy[1]], c="black", s=40, marker="o",
+               edgecolors="white", linewidths=0.8, zorder=5, label="Point start")
+
+    interval_handles = _draw_interval_dots(ax, xy_per_skill)
+    interval_handles = list(interval_handles) + [
+        plt.Line2D([0], [0], color="cyan", linewidth=2.0, label="teleport in"),
+        plt.Line2D([0], [0], color="red", linewidth=2.0, linestyle="--",
+                   label="teleport out"),
+    ]
+
+    x_lo, x_hi, y_lo, y_hi = extent
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Point x")
+    ax.set_ylabel("Point y")
+    if title is not None:
+        ax.set_title(title)
+    if K <= 15:
+        skill_leg = ax.legend(loc="upper right", fontsize=7, framealpha=0.85)
+        ax.add_artist(skill_leg)
+    ax.legend(handles=interval_handles, loc="lower left", fontsize=6,
+              framealpha=0.85, title="interval")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot PointMaze-Teleport empowerment map (same computation as Ant Soccer / AntMaze).")
     parser.add_argument("--ckpt_root", type=str, default="ckpts", help="Root checkpoint directory.")
@@ -67,6 +119,26 @@ def main():
         help="Number of grid points to evaluate per empowerment batch (avoids OOM on large grids).",
     )
     parser.add_argument("--output", type=str, default=None, help="Output image path (.png). Defaults to run dir.")
+    # -- Skill-rollout flags (mirror the antmaze script) --------------------
+    parser.add_argument(
+        "--skill_paths",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render a 2D plot with one point-path line per skill. "
+             "On by default; pass --no-skill_paths to disable.",
+    )
+    parser.add_argument(
+        "--skill_map",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render the empowerment map. On by default; pass --no-skill_map "
+             "to skip the (slow) map computation.",
+    )
+    parser.add_argument("--path_steps", type=int, default=3000,
+                        help="Env steps per skill rollout for --skill_paths.")
+    parser.add_argument("--point_xy", type=str, default=None,
+                        help="Fixed point x,y start for the skill rollouts (e.g. '12,12'). "
+                             "Defaults to a random valid (non-wall) cell.")
     args = parser.parse_args()
 
     run_dir = args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)
@@ -109,41 +181,6 @@ def main():
     # Always expand the plotted extent by half a cell on all borders.
     x_low_plot, x_high_plot = x_low - half, x_high + half
     y_low_plot, y_high_plot = y_low - half, y_high + half
-    xs = np.linspace(x_low, x_high, args.grid_res, dtype=np.float32)
-    ys = np.linspace(y_low, y_high, args.grid_res, dtype=np.float32)
-    xx, yy = np.meshgrid(xs, ys)
-    flat_x = xx.reshape(-1)
-    flat_y = yy.reshape(-1)
-
-    # Pre-assemble observation batch template and just overwrite XY
-    obs_batch = np.repeat(obs0[None, :], args.grid_res * args.grid_res, axis=0)
-    obs_batch[:, 0] = flat_x
-    obs_batch[:, 1] = flat_y
-    obs_batch_jnp = jnp.asarray(obs_batch)
-
-    # Per-point RNG root
-    point_root_seed = int(np.random.default_rng(args.seed).integers(0, 2**31 - 1))
-    point_root_key = jax.random.PRNGKey(point_root_seed)
-    num_points = obs_batch_jnp.shape[0]
-    point_keys = jax.random.split(point_root_key, num_points)
-    # Compute empowerment exactly like Ant Soccer: agent.empowerment averaged over skills internally.
-    # Batch over grid points to avoid OOM on large grids / large num_splus_samples.
-    @jax.jit
-    def _emp_batch(obs_b, keys_b):
-        return jax.vmap(
-            lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
-            in_axes=(0, 0),
-        )(obs_b, keys_b)
-
-    batch_size = max(1, int(args.batch_size))
-    emp_chunks = []
-    for start in range(0, num_points, batch_size):
-        end = min(start + batch_size, num_points)
-        emp_chunks.append(np.asarray(_emp_batch(obs_batch_jnp[start:end], point_keys[start:end])))
-        print(f"  empowerment batch {start}:{end} / {num_points}")
-    emp_vals = np.concatenate(emp_chunks, axis=0)
-    emp_map = emp_vals.reshape(args.grid_res, args.grid_res)
-
     # Overlay helpers: draw maze walls and teleporter rings
     maze_map = getattr(base_env, "maze_map", None)
     offx = getattr(base_env, "_offset_x", 4.0)
@@ -181,6 +218,101 @@ def main():
         for (x, y) in teleport_info.get("teleport_out_xys", []):
             ax.add_patch(Circle((x, y), radius, facecolor="none", edgecolor="red", linewidth=2.0, linestyle="--", label="_teleport_out"))
 
+    # -- Skill-rollout branch (per-skill point paths) -----------------------
+    def is_valid_xy(x, y):
+        if maze_map is None:
+            return True
+        j = int(round((x + offx) / unit))
+        i_ = int(round((y + offy) / unit))
+        rows, cols = maze_map.shape
+        if i_ < 0 or i_ >= rows or j < 0 or j >= cols:
+            return False
+        return int(maze_map[i_, j]) != 1
+
+    def sample_valid_xy():
+        for _ in range(10000):
+            x = float(np.random.uniform(x_low, x_high))
+            y = float(np.random.uniform(y_low, y_high))
+            if is_valid_xy(x, y):
+                return np.array([x, y], dtype=np.float64)
+        raise RuntimeError("Could not sample a valid (non-wall) point position.")
+
+    if args.skill_paths:
+        num_skills = int(agent_cfg.get("num_skills"))
+        # Lift the 1000-step TimeLimit so paths run the full requested horizon.
+        _raise_time_limit(env, args.path_steps)
+
+        if args.point_xy is not None:
+            px_, py_ = _parse_xy(args.point_xy)
+            point_xy = np.array([px_, py_], dtype=np.float64)
+        else:
+            point_xy = sample_valid_xy()
+
+        print(f"Skill rollouts: K={num_skills}, steps={args.path_steps}, "
+              f"point={point_xy.tolist()}")
+
+        xy_per_skill = []
+        for z in range(num_skills):
+            print(f"  rolling out skill {z + 1}/{num_skills}...")
+            _, xy_traj = rollout_skill_ant(
+                env=env, agent=agent, num_skills=num_skills, skill_id=z,
+                ant_xy=point_xy, n_steps=args.path_steps, frame_skip=1,
+                temperature=0.0, seed=z, collect_frames=False, collect_xy=True,
+            )
+            xy_per_skill.append(xy_traj)
+
+        paths_out = os.path.join(run_dir, f"skill_point_paths_e{epoch}.png")
+        plot_point_paths(
+            xy_per_skill=xy_per_skill,
+            start_xy=point_xy,
+            overlay_maze=overlay_maze,
+            overlay_teleporters=overlay_teleporters,
+            extent=(x_low_plot, x_high_plot, y_low_plot, y_high_plot),
+            output_path=paths_out,
+            title=(f"Point paths | run={os.path.basename(run_dir.rstrip('/'))} | epoch={epoch}\n"
+                   f"K={num_skills}, steps={args.path_steps}, "
+                   f"start=({point_xy[0]:.2f}, {point_xy[1]:.2f})"),
+        )
+        print(f"Saved skill point-path plot: {paths_out}")
+
+    if not args.skill_map:
+        return
+
+    xs = np.linspace(x_low, x_high, args.grid_res, dtype=np.float32)
+    ys = np.linspace(y_low, y_high, args.grid_res, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    flat_x = xx.reshape(-1)
+    flat_y = yy.reshape(-1)
+
+    # Pre-assemble observation batch template and just overwrite XY
+    obs_batch = np.repeat(obs0[None, :], args.grid_res * args.grid_res, axis=0)
+    obs_batch[:, 0] = flat_x
+    obs_batch[:, 1] = flat_y
+    obs_batch_jnp = jnp.asarray(obs_batch)
+
+    # Per-point RNG root
+    point_root_seed = int(np.random.default_rng(args.seed).integers(0, 2**31 - 1))
+    point_root_key = jax.random.PRNGKey(point_root_seed)
+    num_points = obs_batch_jnp.shape[0]
+    point_keys = jax.random.split(point_root_key, num_points)
+    # Compute empowerment exactly like Ant Soccer: agent.empowerment averaged over skills internally.
+    # Batch over grid points to avoid OOM on large grids / large num_splus_samples.
+    @jax.jit
+    def _emp_batch(obs_b, keys_b):
+        return jax.vmap(
+            lambda ob, key: agent.empowerment(ob[None, ...], rng=key).squeeze(),
+            in_axes=(0, 0),
+        )(obs_b, keys_b)
+
+    batch_size = max(1, int(args.batch_size))
+    emp_chunks = []
+    for start in range(0, num_points, batch_size):
+        end = min(start + batch_size, num_points)
+        emp_chunks.append(np.asarray(_emp_batch(obs_batch_jnp[start:end], point_keys[start:end])))
+        print(f"  empowerment batch {start}:{end} / {num_points}")
+    emp_vals = np.concatenate(emp_chunks, axis=0)
+    emp_map = emp_vals.reshape(args.grid_res, args.grid_res)
+
     # Plot single heatmap (same style as AntMaze)
     out_img = args.output if args.output is not None else os.path.join(run_dir, f"empowerment_pointmaze_teleport_e{epoch}.png")
     out_npy = os.path.splitext(out_img)[0] + ".npy"
@@ -204,7 +336,7 @@ def main():
     ax.set_xlabel("Point x")
     ax.set_ylabel("Point y")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.suptitle(f"PointMaze-Teleport empowerment | run={os.path.basename(run_dir)} | epoch={epoch}")
+    fig.suptitle(f"PointMaze-Teleport empowerment | run={os.path.basename(run_dir.rstrip('/'))} | epoch={epoch}")
     plt.tight_layout()
     plt.savefig(out_img, dpi=180)
     np.save(out_npy, emp_map)

@@ -270,6 +270,20 @@ register(
     ),
 )
 register(
+    # Ant in the lower-left corner region at (2, 2), ball at (5, 5) up-right of it, goal at (5, 10)
+    # straight up from the ball (5 units). Pass as e.g. `antsoccer-arena-corner-online-v0`.
+    id='antsoccer-arena-corner-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='ball',
+        maze_type='arena',
+        tasks=[dict(agent_init_xy=(2.0, 2.0), ball_init_xy=(5.0, 5.0), goal_xy=(5.0, 10.0))],
+        **online_dict,
+    ),
+)
+register(
     # Ant at cell (3, 4) = xy (12, 8); goal = the center of every other free cell (22 tasks).
     id='antmaze-medium-center-v0',
     entry_point='ogbench.locomaze.maze:make_maze_env',
@@ -298,6 +312,47 @@ register(
         tasks=functools.partial(
             center_to_free_cells_tasks, start_ij=(3, 6), exclude_ijs=((4, 6), (5, 1), (1, 7))
         ),
+        **online_dict,
+    ),
+)
+register(
+    # Same start as pointmaze-teleport-center-v0: cell (3, 6) = xy (20, 8). Only 4
+    # goals instead of the full 41-cell sweep: the maze's bottom-left (1, 1) = (0, 0),
+    # bottom-right (1, 10) = (36, 0), and top-left (7, 1) = (0, 24) corners, plus
+    # (7, 6) = (20, 24) -- straight up from the start along column j=6, past the
+    # teleport-in pad at (4, 6), to the far wall.
+    id='pointmaze-teleport-sparse-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='point',
+        maze_env_type='maze',
+        maze_type='teleport',
+        tasks=[
+            dict(init_xy=(20.0, 8.0), goal_xy=(0.0, 0.0), task_name='bottom_left'),
+            dict(init_xy=(20.0, 8.0), goal_xy=(36.0, 0.0), task_name='bottom_right'),
+            dict(init_xy=(20.0, 8.0), goal_xy=(0.0, 24.0), task_name='top_left'),
+            dict(init_xy=(20.0, 8.0), goal_xy=(20.0, 24.0), task_name='past_teleporter'),
+        ],
+        **online_dict,
+    ),
+)
+register(
+    # Ant at the medium maze's bottom-left corner (1, 1) = xy (0, 0); goals at the
+    # other 3 corners: bottom-right (1, 6) = (20, 0), top-left (6, 1) = (0, 20), and
+    # top-right (6, 6) = (20, 20).
+    id='antmaze-medium-corner-sparse-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='maze',
+        maze_type='medium',
+        tasks=[
+            dict(init_xy=(0.0, 0.0), goal_xy=(20.0, 0.0), task_name='bottom_right'),
+            dict(init_xy=(0.0, 0.0), goal_xy=(0.0, 20.0), task_name='top_left'),
+            dict(init_xy=(0.0, 0.0), goal_xy=(20.0, 20.0), task_name='top_right'),
+        ],
         **online_dict,
     ),
 )

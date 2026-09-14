@@ -79,6 +79,9 @@ def main():
     parser.add_argument("--epoch", type=int, default=None)
     parser.add_argument("--grid_res", type=int, default=30)
     parser.add_argument("--num_splus_samples", type=int, default=192)
+    parser.add_argument("--emp_sample_chunk_size", type=int, default=64,
+                         help="Chunk size for the internal successor-sample loop in "
+                              "agent.empowerment (avoids materializing all splus samples at once).")
     parser.add_argument("--x_min", type=float, default=0.25, help="Gripper sweep min x.")
     parser.add_argument("--x_max", type=float, default=0.60, help="Gripper sweep max x.")
     parser.add_argument("--y_min", type=float, default=-0.35, help="Gripper sweep min y.")
@@ -92,7 +95,9 @@ def main():
         "--openness",
         type=float,
         default=0.0,
-        help="Gripper openness in [0, 1]. 0=closed, 1=open.",
+        help="Gripper aperture control in [0, 1], despite the flag name this is really "
+             "closedness: 0=open, 1=closed (matches the env's own gripper_opening "
+             "observation field / Robotiq driver-joint convention).",
     )
     parser.add_argument(
         "--cube_xys",
@@ -110,7 +115,7 @@ def main():
     )
     args = parser.parse_args()
 
-    run_dir = args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)
+    run_dir = (args.run_dir if args.run_dir is not None else _latest_run_dir(args.ckpt_root)).rstrip("/")
     epoch = args.epoch if args.epoch is not None else _latest_epoch(run_dir)
 
     flags_path = os.path.join(run_dir, "flags.json")
@@ -121,6 +126,7 @@ def main():
 
     agent_cfg = flags["agent"]
     agent_cfg["num_splus_samples"] = int(args.num_splus_samples)
+    agent_cfg["emp_sample_chunk_size"] = int(args.emp_sample_chunk_size)
     env_name = flags["env_name"]
 
     env, train_dataset, _ = make_env_and_datasets(env_name, frame_stack=agent_cfg.get("frame_stack"))
@@ -205,7 +211,8 @@ def main():
 
     maps = [compute_empowerment_map(layout) for layout in layouts]
 
-    state_tag = "closed" if args.openness < 0.5 else "open"
+    # openness is really closedness: 0=open, 1=closed (see --openness help text).
+    state_tag = "open" if args.openness < 0.5 else "closed"
     out_img = args.output if args.output is not None else os.path.join(
         run_dir, f"empowerment_cube_gripperxy_{state_tag}_e{epoch}.png"
     )
