@@ -267,7 +267,26 @@ def main(_):
     first_time = time.time()
     last_time = time.time()
     start_step = (resume_epoch + 1) if resume_epoch is not None else 1
+
+    # Stage-boundary dataset preparation. Agents whose second training stage consumes
+    # labels from a model the first stage froze (OPAL's discrete path: the EM posterior
+    # at `cluster_steps`) label every window ONCE, at the loop index they name or at
+    # the first step of a run resumed past it. The invariant `network.step == i`
+    # before the update at loop index `i` (TrainState starts at step 1 and checkpoints
+    # restore the step) is what makes the boundary exact.
+    stage_prepare_step = None
+    if hasattr(agent, 'stage_prepare_step') and agent.stage_prepare_step() is not None:
+        stage_prepare_step = max(int(agent.stage_prepare_step()), start_step)
+        if stage_prepare_step > FLAGS.train_steps:
+            stage_prepare_step = None
+
     for i in tqdm.tqdm(range(start_step, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        if stage_prepare_step is not None and i == stage_prepare_step:
+            # Returns the agent with its (static) stage flag advanced, like `prepare_datasets`.
+            prepared = agent.stage_prepare_datasets([d for d in (train_dataset, val_dataset) if d is not None])
+            if prepared is not None:
+                agent = prepared
+
         # Re-label the skill histograms (Alg. 1's outer loop), before the batch
         # that the next `relabel_interval` gradient steps are drawn from.
         if relabel_datasets and (i - start_step) % relabel_interval == 0:

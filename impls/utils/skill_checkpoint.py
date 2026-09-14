@@ -5,7 +5,9 @@ Shared version of the recipe the offline controller agents
 locally: rebuild the pretrained agent from the run's own `flags.json`, assert the
 observation pipeline matches, restore `params_<epoch>.pkl`, never train it
 afterwards. DDS checkpoints additionally get `dds_controller`'s phase check
-(`restore_epoch >= skill_pretrain_steps`). The run's `env_name` is printed so a
+(`restore_epoch >= skill_pretrain_steps`), and discrete OPAL checkpoints the
+analogous one (`restore_epoch >= cluster_steps`: the App. F decoder is only
+BC-trained after the EM clustering stage). The run's `env_name` is printed so a
 mismatch with the online env is checkable in the log.
 """
 
@@ -96,6 +98,27 @@ def load_frozen_skill_agent(seed, ex_observations, ex_actions, config, agent_cla
                 f'(skill_pretrain_steps={pretrain_steps}); pick a later epoch from {ckpt_path}.'
             )
         extra = f', sequence_length={skill_config.get("sequence_length")}'
+    elif agent_name == 'opal':
+        latent_type = skill_config.get('latent_type')
+        if latent_type == 'discrete':
+            # A discrete OPAL run spends its first `cluster_steps` on EM clustering
+            # (traj_model + skill_prior); the decoder pi(a | s, z) is BC-trained only
+            # afterwards, so an earlier checkpoint holds an untrained skill policy.
+            cluster_steps = int(skill_config.get('cluster_steps', 0))
+            if int(restore_epoch) < cluster_steps:
+                raise ValueError(
+                    f'{caller}: skill_restore_epoch={restore_epoch} is inside the OPAL EM clustering stage '
+                    f'(cluster_steps={cluster_steps}); the decoder is untrained there. Pick a later epoch '
+                    f'from {ckpt_path}.'
+                )
+        extra = f', latent_type={latent_type!r}, chunk_size={skill_config.get("chunk_size")}'
+    elif agent_name == 'skill_dt':
+        # The Transformer context K and the horizon its rollout histogram is normalized
+        # over (None -> the env's); both are per-checkpoint and shape the online rollout.
+        extra = (
+            f', context_len={skill_config.get("context_len")}, '
+            f'eval_max_steps={skill_config.get("eval_max_steps")}'
+        )
 
     print(
         f'[{caller}] frozen skill policy: {ckpt_path} (epoch {restore_epoch})\n'

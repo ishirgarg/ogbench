@@ -101,6 +101,39 @@ from utils.flax_utils import nonpytree_field, restore_agent
 LABEL_MODES = ('window_mode', 'end_state', 'future_hist')
 
 
+def labels_from_skill_counts(dataset, horizon, label_mode):
+    """One codebook skill per start index of a `SequenceDataset`, read off its per-state skill counts.
+
+    `dataset.relabel_skill_histograms` (run with a frozen Skill-DT's `encode_skill_indices`)
+    stores C[i] = sum_{j<i} one_hot(z_j) with a leading zero row, so the counts over any
+    index range [a, b) are C[b] - C[a]; each `label_mode` (module docstring, Step 1) is one
+    such range per start index t with H = `horizon`:
+
+        window_mode : argmax_k counts over [t, min(t + H, terminal + 1))
+        end_state   : z at min(t + H, terminal)
+        future_hist : argmax_k counts over [t, terminal + 1)   (the paper's Z_t, unnormalized)
+
+    Ties break towards the lowest index. Shared by `skill_dt_controller` (offline, H =
+    `chunk_horizon`) and `online_crl_skill_controller`'s RLPD labeller (H =
+    `skill_commitment_k`). Returns int32 [dataset.size].
+    """
+    C = dataset.skill_cumcounts  # [size + 1, N] int32 (host copy)
+    H = int(horizon)
+    idxs = np.arange(dataset.size)
+    final = dataset.terminal_locs[np.searchsorted(dataset.terminal_locs, idxs)]
+    if label_mode == 'window_mode':
+        stop = np.minimum(idxs + H, final + 1)  # exclusive; clamped to the trajectory
+        counts = C[stop] - C[idxs]
+    elif label_mode == 'end_state':
+        end = np.minimum(idxs + H, final)       # s_{t+H}, clamped to the terminal
+        counts = C[end + 1] - C[end]
+    elif label_mode == 'future_hist':
+        counts = C[final + 1] - C[idxs]         # the paper's Z_t, unnormalized
+    else:
+        raise ValueError(f'label_mode must be one of {LABEL_MODES}, got {label_mode!r}.')
+    return np.argmax(counts, axis=1).astype(np.int32)
+
+
 class SkillDTControllerAgent(flax.struct.PyTreeNode):
     """High-level policy pi_hi(k | s, g) over a frozen Skill-DT's N codebook skills.
 
@@ -133,27 +166,8 @@ class SkillDTControllerAgent(flax.struct.PyTreeNode):
         return self.skill_agent.encode_skill_indices(observations)
 
     def _labels_from_counts(self, dataset):
-        """Per-start-index labels from the dataset's forward-cumulative skill counts.
-
-        `relabel_skill_histograms` stores C[i] = sum_{j<i} one_hot(z_j) with a leading
-        zero row, so the counts over any index range [a, b) are C[b] - C[a].
-        """
-        C = dataset.skill_cumcounts  # [size + 1, N] int32
-        H = int(self.config['chunk_horizon'])
-        idxs = np.arange(dataset.size)
-        final = dataset.terminal_locs[np.searchsorted(dataset.terminal_locs, idxs)]
-        mode = self.config['label_mode']
-        if mode == 'window_mode':
-            stop = np.minimum(idxs + H, final + 1)  # exclusive; clamped to the trajectory
-            counts = C[stop] - C[idxs]
-        elif mode == 'end_state':
-            end = np.minimum(idxs + H, final)       # s_{t+H}, clamped to the terminal
-            counts = C[end + 1] - C[end]
-        elif mode == 'future_hist':
-            counts = C[final + 1] - C[idxs]         # the paper's Z_t, unnormalized
-        else:
-            raise ValueError(f'label_mode must be one of {LABEL_MODES}, got {mode!r}.')
-        return np.argmax(counts, axis=1).astype(np.int32)
+        """Per-start-index labels from the dataset's forward-cumulative skill counts."""
+        return labels_from_skill_counts(dataset, self.config['chunk_horizon'], self.config['label_mode'])
 
     def prepare_datasets(self, datasets):
         """Run the one-time labelling pass over each dataset. Called by `main.py`."""
@@ -494,9 +508,11 @@ def get_config(base_agent_name='gciql'):
         --agent=agents/skill_dt_controller.py:crl   --agent.base.alpha=0.1
     """
     # `sequence_length` is read by SequenceDataset and `chunk_horizon` by this agent; they
-    # name the same H, so they share one FieldReference. 20 is Skill-DT's context length K
-    # (paper Table 5); nothing forces the two to agree.
-    chunk_horizon = ml_collections.FieldReference(20)
+    # name the same H, so they share one FieldReference. 10 is the option length every
+    # controller in this repo labels and trains at (DDS's skill_commitment_k, the
+    # empowerment controllers' chunk_horizon); nothing ties it to Skill-DT's context
+    # length K=20, since the encoder is per-state and the rollout context slides.
+    chunk_horizon = ml_collections.FieldReference(10)
 
     config = ml_collections.ConfigDict(
         dict(

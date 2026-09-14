@@ -407,6 +407,37 @@ class HGCDataset(GCDataset):
         return batch
 
 
+# Observation arrays up to this size are kept resident on the device for the
+# hindsight re-labelling passes (`SequenceDataset.relabel_skill_histograms`), so
+# each pass costs no host gathers and no host-to-device copies. Larger (image)
+# datasets fall back to per-chunk gathers.
+DEVICE_OBSERVATION_CACHE_MAX_BYTES = 1 << 30
+
+
+@partial(jax.jit, static_argnums=(1,))
+def _skill_cumcounts_from_indices(indices, num_skills):
+    """C[i] = sum_{j < i} one_hot(z_j) with a leading zero row: [size + 1, num_skills] int32."""
+    onehot = jax.nn.one_hot(indices, num_skills, dtype=jnp.int32)
+    cumcounts = jnp.cumsum(onehot, axis=0)
+    return jnp.concatenate([jnp.zeros((1, num_skills), jnp.int32), cumcounts], axis=0)
+
+
+@jax.jit
+def _suffix_skill_histogram(cumcounts, end_idxs, seq_idxs):
+    """Normalized skill counts over [seq_idxs, end_idxs) for each window step.
+
+    ``end_idxs`` is ``[B]`` (exclusive end = trajectory terminal + 1) and ``seq_idxs``
+    ``[B, T]``; returns ``[B, T, num_skills]`` float32 rows that sum to 1.
+
+    Must be called under ``jax.enable_x64()``: the quotient is formed in float64 and
+    rounded once to float32, which reproduces numpy's IEEE float32 division bit for
+    bit. XLA:GPU's native float32 divide is off by up to 1 ulp in ~10% of entries.
+    """
+    suffix_counts = (cumcounts[end_idxs[:, None]] - cumcounts[seq_idxs]).astype(jnp.float64)
+    hist = suffix_counts / jnp.maximum(suffix_counts.sum(axis=-1, keepdims=True), 1.0)
+    return hist.astype(jnp.float32)
+
+
 @dataclasses.dataclass
 class SequenceDataset(GCDataset):
     """Dataset that additionally returns fixed-length sub-trajectory windows.
@@ -440,6 +471,10 @@ class SequenceDataset(GCDataset):
         skill counts). Present ONLY after one of those passes has been called; absent
         otherwise.
         Unlike ``skill_hist_seq`` this is a property of the window, not of each step.
+      - ``chunk_log_resp``:   ``[B, K]`` float32 — the log-posterior ``log p(z|tau)`` over
+        the K skills of the WHOLE window under a frozen window-level labeller
+        (`opal` discrete path, from its EM posterior at the EM->BC boundary). Present
+        ONLY after ``relabel_window_log_posteriors`` has been called; absent otherwise.
 
     For semi-MDP / option-style agents (e.g. DDS) it also emits the per-window
     goal-conditioned reward signal and the macro-step bootstrap state — all
@@ -476,11 +511,26 @@ class SequenceDataset(GCDataset):
         ).astype(np.int32)
         # Forward-cumulative skill counts, filled in by `relabel_skill_histograms`.
         # None until the first re-labelling pass, in which case `skill_hist_seq` is
-        # simply absent from the sampled batch.
-        self.skill_cumcounts = None
+        # simply absent from the sampled batch. The counts live on the DEVICE
+        # (`sample` gathers the window histograms there); `skill_cumcounts` exposes a
+        # host copy, materialized on first access after each re-labelling pass.
+        self._skill_cumcounts_dev = None
+        self._skill_cumcounts_host = None
+        # Device-resident copy of the whole observation array for the re-labelling
+        # encoder passes; built lazily by `_device_observations`, None if too large.
+        self._device_observations_cache = None
+        self._device_observations_unavailable = False
         # Per-window skill labels, filled in by `relabel_chunk_skills`. None until that
         # pass runs, in which case `chunk_skills` is simply absent from the batch.
         self.chunk_skills = None
+        # Per-window log-posterior over skills, ``[size, K]`` float32, filled in by
+        # `relabel_window_log_posteriors`. None until that pass runs, in which case
+        # ``chunk_log_resp`` is simply absent from the batch.
+        self.chunk_log_resp = None
+        # Per-window fit of the winning label, filled in by `relabel_chunk_skills` only
+        # (the log-likelihood labellers are the ones whose score is comparable across
+        # windows). Never sampled; read by `utils/rlpd.py` to threshold offline windows.
+        self.chunk_skill_scores = None
 
     def relabel_skill_histograms(self, agent, chunk_bytes=64 * 1024 * 1024, num_skills=None):
         """Hindsight skill re-labelling (Skill-DT, paper Sec. 4.1.1 and Alg. 1).
@@ -514,15 +564,60 @@ class SequenceDataset(GCDataset):
             item_bytes *= int(self.config['frame_stack'])
         chunk_size = int(np.clip(chunk_bytes // max(item_bytes, 1), 1024, 100000))
 
-        if self.skill_cumcounts is None or self.skill_cumcounts.shape[1] != num_skills:
-            self.skill_cumcounts = np.zeros((self.size + 1, num_skills), dtype=np.int32)
-        counts = self.skill_cumcounts[1:]  # view; row i is one-hot(z_i) before the cumsum
-        counts.fill(0)
+        # Everything below is enqueued on the device and never blocks the host: the
+        # encoder runs on device-resident observation slices when the array fits
+        # (`_device_observations`), the one-hot cumulative sum is one fused kernel, and
+        # the result stays on the device for `sample`. A host copy is only made if
+        # something reads `skill_cumcounts` (the offline controllers' label pass).
+        device_observations = self._device_observations()
+        index_chunks = []
         for start in range(0, self.size, chunk_size):
-            idxs = np.arange(start, min(start + chunk_size, self.size))
-            skills = np.asarray(jax.device_get(agent.encode_skill_indices(self.get_observations(idxs))))
-            counts[idxs, skills] = 1
-        np.cumsum(counts, axis=0, out=counts)
+            stop = min(start + chunk_size, self.size)
+            if device_observations is not None:
+                observations = device_observations[start:stop]
+            else:
+                observations = self.get_observations(np.arange(start, stop))
+            index_chunks.append(agent.encode_skill_indices(observations))
+        indices = jnp.concatenate(index_chunks, axis=0) if len(index_chunks) > 1 else index_chunks[0]
+        self._skill_cumcounts_dev = _skill_cumcounts_from_indices(indices.astype(jnp.int32), num_skills)
+        self._skill_cumcounts_host = None
+
+    @property
+    def skill_cumcounts(self):
+        """Host copy of the forward-cumulative skill counts, ``[size + 1, num_skills]`` int32.
+
+        None before the first `relabel_skill_histograms` pass. The copy is made on first
+        access after each pass (a device-to-host transfer of the whole array), so callers
+        that only need `sample`'s histograms never pay for it.
+        """
+        if self._skill_cumcounts_dev is None:
+            return None
+        if self._skill_cumcounts_host is None:
+            self._skill_cumcounts_host = np.asarray(jax.device_get(self._skill_cumcounts_dev))
+        return self._skill_cumcounts_host
+
+    def _device_observations(self):
+        """The whole observation array on the device, or None if it cannot be cached.
+
+        Only plain (non-frame-stacked-on-the-fly) ndarray observations up to
+        `DEVICE_OBSERVATION_CACHE_MAX_BYTES` are cached; slices of it are exactly what
+        `get_observations` would return for the same index range.
+        """
+        if self._device_observations_cache is not None:
+            return self._device_observations_cache
+        if self._device_observations_unavailable:
+            return None
+        observations = self.dataset['observations']
+        on_the_fly_stack = self.config['frame_stack'] is not None and not self.preprocess_frame_stack
+        if (
+            on_the_fly_stack
+            or not isinstance(observations, np.ndarray)
+            or observations.nbytes > DEVICE_OBSERVATION_CACHE_MAX_BYTES
+        ):
+            self._device_observations_unavailable = True
+            return None
+        self._device_observations_cache = jax.device_put(observations)
+        return self._device_observations_cache
 
     def relabel_chunk_skills(self, agent, chunk_bytes=64 * 1024 * 1024):
         """Label every start index with the skill that best explains its whole window.
@@ -556,13 +651,25 @@ class SequenceDataset(GCDataset):
         ``num_skills`` is still the placeholder the agent later fills in from its
         pretrained checkpoint.
 
+        Alongside the labels this stores ``chunk_skill_scores``, the winning skill's
+        window log-likelihood *per step and per action dimension*,
+
+            score(t) = max_z sum_{i} log pi(a_{t+i} | s_{t+i}, z) / (H_t * action_dim),
+
+        where ``H_t`` is the window's own (possibly shortened) length. The raw window
+        sum is not comparable across windows -- it grows with ``H_t`` and, because the
+        policy's log-density is a sum over action dimensions, with the action dimension
+        -- so a threshold on it would mean something different in every env. The
+        normalised score is the mean per-dimension log-density and is directly
+        comparable; ``utils/rlpd.py`` thresholds offline windows on it.
+
         Args:
             agent: agent exposing ``chunk_skill_logliks(observations, actions) -> [B, K]``.
             chunk_bytes: observation bytes pushed through the policy at a time.
 
         Returns:
             dict of label statistics (entropy, coverage, most-frequent-skill share,
-            and the raw per-skill counts).
+            score quantiles, and the raw per-skill counts).
         """
         T = int(self.config['sequence_length'])
 
@@ -578,6 +685,8 @@ class SequenceDataset(GCDataset):
         final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, all_idxs)]
 
         labels = np.empty(self.size, dtype=np.int32)
+        scores = np.empty(self.size, dtype=np.float64)  # winning window loglik, unnormalised
+        window_lengths = np.empty(self.size, dtype=np.int64)
         # K is read off the agent's own output rather than the config: the dataset holds
         # the live `FLAGS.agent`, whose `num_skills` is still the unresolved placeholder
         # at this point (the agent fills it in from its checkpoint, into its own copy).
@@ -608,8 +717,17 @@ class SequenceDataset(GCDataset):
             stops = np.minimum(starts + T, final_state_idxs[starts] + 1)
             window_logliks = cumulative[stops - start] - cumulative[starts - start]
             labels[start:end] = np.argmax(window_logliks, axis=1)
+            scores[start:end] = window_logliks.max(axis=1)
+            window_lengths[start:end] = stops - starts
 
         self.chunk_skills = labels
+        # Per-step, per-action-dimension so the number is comparable across windows,
+        # datasets and envs. `H_t >= 1` for every t: `stops[t] > starts[t]` because the
+        # window always contains its own start (index t is at most its trajectory's
+        # terminal, so `final_state_idxs[t] + 1 > t`).
+        actions = self.dataset['actions']
+        action_dim = int(actions.shape[-1]) if actions.ndim > 1 else 1  # discrete: one logit
+        self.chunk_skill_scores = (scores / (window_lengths * action_dim)).astype(np.float32)
 
         counts = np.bincount(labels, minlength=num_skills).astype(np.float64)
         probs = counts / max(counts.sum(), 1.0)
@@ -618,6 +736,9 @@ class SequenceDataset(GCDataset):
             'label_entropy': float(-(nonzero * np.log(nonzero)).sum()),
             'label_coverage': float((counts > 0).mean()),
             'label_max_frac': float(probs.max()),
+            'score_p10': float(np.quantile(self.chunk_skill_scores, 0.1)),
+            'score_median': float(np.median(self.chunk_skill_scores)),
+            'score_mean': float(self.chunk_skill_scores.mean()),
             'label_counts': counts.astype(np.int64),
         }
 
@@ -638,6 +759,7 @@ class SequenceDataset(GCDataset):
         if labels.shape[0] != self.size:
             raise ValueError(f'labels must have one entry per dataset index ({self.size}), got {labels.shape}.')
         self.chunk_skills = labels
+        self.chunk_skill_scores = None  # this labeller reports no comparable per-window fit
         return self._chunk_skill_stats(labels, num_skills)
 
     @staticmethod
@@ -658,6 +780,86 @@ class SequenceDataset(GCDataset):
             'label_mean_norm': float(np.linalg.norm(labels, axis=-1).mean()),
             'label_std': float(labels.std(axis=0).mean()),
             'label_abs_max': float(np.abs(labels).max()),
+        }
+
+    def _iter_windows(self, chunk_bytes=64 * 1024 * 1024):
+        """Yield ``(idxs, observations_seq, actions_seq, seq_mask)`` for EVERY start index.
+
+        Blocks of consecutive start indices, each window built exactly as ``sample``
+        builds it (clamped to the trajectory terminal, ``seq_mask`` marking the padded
+        steps). Blocks are sized by BYTES as in ``relabel_chunk_skills``; a window is
+        ``T`` observations.
+        """
+        T = int(self.config['sequence_length'])
+
+        leaves = jax.tree_util.tree_leaves(self.dataset['observations'])
+        item_bytes = sum(int(np.prod(leaf.shape[1:])) * leaf.dtype.itemsize for leaf in leaves)
+        if self.config['frame_stack'] is not None and not self.preprocess_frame_stack:
+            item_bytes *= int(self.config['frame_stack'])
+        block_size = int(np.clip(chunk_bytes // max(item_bytes * T, 1), 256, 100000))
+
+        all_idxs = np.arange(self.size)
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, all_idxs)]
+        steps = np.arange(T)
+
+        for start in range(0, self.size, block_size):
+            idxs = np.arange(start, min(start + block_size, self.size))
+            raw_idxs = idxs[:, None] + steps[None, :]                          # [B, T]
+            seq_idxs = np.minimum(raw_idxs, final_state_idxs[idxs][:, None])   # clamp to terminal
+            seq_mask = (raw_idxs <= final_state_idxs[idxs][:, None]).astype(np.float32)
+
+            flat = seq_idxs.reshape(-1)
+            obs_flat = self.get_observations(flat)
+            obs_seq = obs_flat.reshape((len(idxs), T) + obs_flat.shape[1:])
+            act_seq = jax.tree_util.tree_map(
+                lambda arr: arr[flat].reshape((len(idxs), T) + arr.shape[1:]), self.dataset['actions']
+            )
+            yield idxs, obs_seq, act_seq, seq_mask
+
+    def relabel_window_log_posteriors(self, agent, chunk_bytes=64 * 1024 * 1024):
+        """Store the log-posterior over skills of EVERY window under a frozen labeller.
+
+        For each start index ``t`` this evaluates
+
+            agent.window_log_posteriors(observations_seq, seq_mask) -> [B, K] float32
+
+        on exactly the window ``sample`` would build for ``t`` and stores the result
+        as ``self.chunk_log_resp`` (``[size, K]``), so ``sample`` emits the batch's rows
+        as ``chunk_log_resp``. The labeller is frozen, so one pass is exact: sampling
+        a skill from the stored row is identical in distribution to re-running the
+        labeller on the sampled window (the OPAL discrete path's BC stage does this
+        instead of re-evaluating its trajectory model on every batch).
+
+        Args:
+            agent: agent exposing ``window_log_posteriors`` as above.
+            chunk_bytes: window bytes pushed through the labeller at a time.
+
+        Returns:
+            dict of label statistics: mean posterior entropy, entropy of the argmax
+            label histogram, the number of skills that are the argmax of at least one
+            window, and the most-frequent argmax share.
+        """
+        blocks = []
+        for idxs, obs_seq, act_seq, seq_mask in self._iter_windows(chunk_bytes):
+            blocks.append(
+                np.asarray(jax.device_get(agent.window_log_posteriors(obs_seq, seq_mask)), dtype=np.float32)
+            )
+        log_resp = np.concatenate(blocks, axis=0)
+        assert log_resp.shape == (self.size, log_resp.shape[1]), log_resp.shape
+        self.chunk_log_resp = log_resp
+
+        num_skills = log_resp.shape[1]
+        probs = np.exp(log_resp)
+        post_entropy = float(-(probs * log_resp).sum(axis=1).mean())
+        argmax = log_resp.argmax(axis=1)
+        counts = np.bincount(argmax, minlength=num_skills).astype(np.float64)
+        freqs = counts / counts.sum()
+        nz = freqs[freqs > 0]
+        return {
+            'posterior_entropy': post_entropy,
+            'argmax_label_entropy': float(-(nz * np.log(nz)).sum()),
+            'num_used_skills': int((counts > 0).sum()),
+            'max_label_share': float(freqs.max()),
         }
 
     def relabel_chunk_skills_from_windows(self, agent, seed=0, num_skills=None, chunk_bytes=64 * 1024 * 1024):
@@ -687,39 +889,16 @@ class SequenceDataset(GCDataset):
             dict of label statistics: for index labels the same keys as
             ``relabel_chunk_skills``; for latent labels their mean norm and per-dim std.
         """
-        T = int(self.config['sequence_length'])
-
-        # Chunk by BYTES as in `relabel_chunk_skills`; a window is T observations.
-        leaves = jax.tree_util.tree_leaves(self.dataset['observations'])
-        item_bytes = sum(int(np.prod(leaf.shape[1:])) * leaf.dtype.itemsize for leaf in leaves)
-        if self.config['frame_stack'] is not None and not self.preprocess_frame_stack:
-            item_bytes *= int(self.config['frame_stack'])
-        block_size = int(np.clip(chunk_bytes // max(item_bytes * T, 1), 256, 100000))
-
-        all_idxs = np.arange(self.size)
-        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, all_idxs)]
-        steps = np.arange(T)
-
         rng = jax.random.PRNGKey(seed)
         blocks = []
-        for start in range(0, self.size, block_size):
-            idxs = np.arange(start, min(start + block_size, self.size))
-            raw_idxs = idxs[:, None] + steps[None, :]                          # [B, T]
-            seq_idxs = np.minimum(raw_idxs, final_state_idxs[idxs][:, None])   # clamp to terminal
-            seq_mask = (raw_idxs <= final_state_idxs[idxs][:, None]).astype(np.float32)
-
-            flat = seq_idxs.reshape(-1)
-            obs_flat = self.get_observations(flat)
-            obs_seq = obs_flat.reshape((len(idxs), T) + obs_flat.shape[1:])
-            act_seq = jax.tree_util.tree_map(
-                lambda arr: arr[flat].reshape((len(idxs), T) + arr.shape[1:]), self.dataset['actions']
-            )
+        for idxs, obs_seq, act_seq, seq_mask in self._iter_windows(chunk_bytes):
             rng, block_rng = jax.random.split(rng)
             blocks.append(
                 np.asarray(jax.device_get(agent.label_chunk_skills(obs_seq, act_seq, seq_mask, block_rng)))
             )
         labels = np.concatenate(blocks, axis=0)
         self.chunk_skills = labels
+        self.chunk_skill_scores = None  # this labeller reports no comparable per-window fit
         return self._chunk_skill_stats(labels, num_skills)
 
     def sample(self, batch_size, idxs=None, evaluation=False):
@@ -753,18 +932,22 @@ class SequenceDataset(GCDataset):
         # Future-skill histogram to the trajectory end, from the last re-labelling
         # pass. Padded steps are clamped onto the terminal, so their histogram is
         # the terminal's own one-hot; agents mask them out regardless.
-        if self.skill_cumcounts is not None:
-            suffix_counts = (
-                self.skill_cumcounts[final_state_idxs[:, None] + 1] - self.skill_cumcounts[seq_idxs]
-            ).astype(np.float32)
-            batch['skill_hist_seq'] = suffix_counts / np.maximum(
-                suffix_counts.sum(axis=-1, keepdims=True), 1.0
-            )
+        # Gathered on the device (one fused kernel), so the batch carries a device array
+        # for this key; every consumer is a jitted agent function.
+        if self._skill_cumcounts_dev is not None:
+            with jax.enable_x64():  # scoped to this trace; see _suffix_skill_histogram
+                batch['skill_hist_seq'] = _suffix_skill_histogram(
+                    self._skill_cumcounts_dev,
+                    (final_state_idxs + 1).astype(np.int32),
+                    seq_idxs.astype(np.int32),
+                )
 
         # Per-window skill label from `relabel_chunk_skills` (a property of the whole
         # window, so one index per batch element rather than one per step).
         if self.chunk_skills is not None:
             batch['chunk_skills'] = self.chunk_skills[idxs]
+        if self.chunk_log_resp is not None:
+            batch['chunk_log_resp'] = self.chunk_log_resp[idxs]
 
         # Per-window goal-conditioned reward/mask w.r.t. the SAME value goal (matches GCDataset).
         successes_seq = (seq_idxs == value_goal_idxs[:, None]).astype(np.float32)  # [B, T]

@@ -36,9 +36,32 @@ Goals are full goal observations (OGBench convention): the behaviour policy sees
 
 Low-level execution goes through the frozen agent's own `skill_set()` /
 `sample_actions_with_skill()` hooks (the contract `eval_skill_policy.py` uses), so
-any checkpoint family exposing them works: `empowerment_skill` (one-hot skills)
-and `dds` (VQ codebook skills). The frozen agent is a plain pytree field, so
-`save_agent` writes a full copy of it into every controller checkpoint.
+any checkpoint family exposing them works: `empowerment_skill` (one-hot skills),
+`dds` (VQ codebook skills) and `opal` with `latent_type='discrete'` (one-hot skills
+decoded by the Appendix-F BC decoder; a continuous OPAL VAE has no finite skill set
+and is refused). The frozen agent is a plain pytree field, so `save_agent` writes a
+full copy of it into every controller checkpoint.
+
+RLPD labels for an `opal` checkpoint come from the OPAL posterior itself -- the same
+labeller `opal_controller` uses offline: p(z | tau) by Bayes rule over the frozen
+clustering mixture p_w(z) prod_t p_phi(s_t | s_{t-1}, z) (paper App. F, Eq. 71),
+one label per offline k-window, sampled (`opal_label_mode='sample'`, the paper) or
+taken as the argmax (`'mode'`). This mirrors the DDS setup, where the frozen
+encoder + codebook labels the offline windows.
+
+`skill_dt` (Skill Decision Transformer, `agents/skill_dt.py`) is the third family
+and the one STATEFUL low level: its policy reads a K-step context of states and
+re-encoded skills plus a future-skill histogram (paper Sec. A.5), so it cannot be
+driven through the stateless `sample_actions_with_skill`. Instead
+`init_low_level_state` / `low_level_actions_with_state` carry the paper's rollout
+state across the env steps of an episode (the `MacroCollector` threads it), and a
+skill z is executed by filling the unvisited tail of the histogram with z over the
+remaining horizon -- exactly what `skill_dt_controller` does offline, and what the
+paper's own per-skill evaluation does. RLPD labels (below) come from the frozen VQ
+encoder: every state gets its codebook index, and each k-window its
+`skill_dt_label_mode` reduction of those indices (default: the most frequent skill
+in the window), mirroring the DDS setup where the frozen encoder labels the offline
+windows.
 
 Eval follows the repo's `init_eval_state` / `sample_actions_with_state` contract:
 the argmax skill (at temperature 0) is held for `skill_commitment_k` env steps.
@@ -55,12 +78,19 @@ import optax
 
 from agents.dds import DDSAgent
 from agents.empowerment_skill import EmpowermentAgent
+from agents.opal import OPALAgent
+from agents.skill_dt import SkillDTAgent
+from agents.skill_dt_controller import LABEL_MODES as SKILL_DT_LABEL_MODES
+from agents.skill_dt_controller import labels_from_skill_counts
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import GCDiscreteActor, GCDiscreteBilinearCritic, LogParam
 from utils.skill_checkpoint import load_frozen_skill_agent
 
-SKILL_AGENT_CLASSES = dict(empowerment_skill=EmpowermentAgent, dds=DDSAgent)
+SKILL_AGENT_CLASSES = dict(empowerment_skill=EmpowermentAgent, dds=DDSAgent, skill_dt=SkillDTAgent, opal=OPALAgent)
+OPAL_LABEL_MODES = ('sample', 'mode')
+# Families whose frozen policy keeps per-episode rollout state (see `init_low_level_state`).
+STATEFUL_SKILL_AGENTS = ('skill_dt',)
 
 
 LEGACY_ENTROPY_KEYS = ('target_entropy_multiplier', 'target_entropy_cap_frac')
@@ -317,9 +347,23 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
             low_temperature = max(low_temperature, 1e-6)
         return low_temperature
 
+    def _stateful_low_level(self):
+        """Whether the frozen skill policy keeps per-episode rollout state (Skill-DT's K-step context)."""
+        return self.config['skill_agent_name'] in STATEFUL_SKILL_AGENTS
+
+    def _require_stateless(self, hook):
+        if self._stateful_low_level():
+            raise ValueError(
+                f'online_crl_skill_controller.{hook}: the frozen {self.config["skill_agent_name"]!r} policy is '
+                f'stateful (its Transformer reads a K-step context, paper Sec. A.5), so it has no stateless '
+                f'per-step actor. Use init_low_level_state / low_level_actions_with_state (the MacroCollector '
+                f'does) or init_eval_state / sample_actions_with_state (the evaluators do).'
+            )
+
     @jax.jit
     def low_level_actions(self, observations, skills, seed=None):
         """a ~ pi(. | s, z) from the frozen skill policy for a single observation and skill index."""
+        self._require_stateless('low_level_actions')
         if seed is None:
             seed = self.rng
         skill_vectors = self.skill_agent.skill_set()  # (K, skill_width): one-hots or codebook rows
@@ -328,9 +372,52 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
             observations, skill_vector, seed=seed, temperature=self._low_temperature()
         )
 
+    # ── Stateful frozen low level (skill_dt) ───────────────────────────────────
+
+    def init_low_level_state(self, max_steps=None):
+        """Per-episode state of the frozen low-level policy, or None for the stateless families.
+
+        For `skill_dt` this is the paper's Sec. A.5 rollout state (`SkillDTAgent.init_eval_state`):
+        the length-K context buffers, the env-step counter that drives the timestep embedding,
+        and the histogram tail over the episode horizon `max_steps` (the checkpoint's own
+        `eval_max_steps` wins if set, as for a plain Skill-DT rollout). Built once per episode
+        by the `MacroCollector` and by `init_eval_state`; the skill placed in it is a
+        placeholder that `low_level_actions_with_state` overwrites at every step.
+        """
+        if not self._stateful_low_level():
+            return None
+        return self.skill_agent.init_eval_state(skill=0, max_steps=max_steps)
+
+    @jax.jit
+    def low_level_actions_with_state(self, observations, skills, low_state, seed=None):
+        """`low_level_actions` for the stateful frozen policy: returns `(action, new_low_state)`.
+
+        Skill-DT executes skill z the way the paper's own per-skill evaluation does (Sec. A.5):
+        the unvisited tail of the future-skill histogram is filled with z over the remaining
+        horizon, while the observed context (states, re-encoded skills, step counter) is kept
+        -- across env steps AND across the controller's skill switches, exactly as
+        `skill_dt_controller.sample_actions_with_state` does offline. The tail is a pure
+        function of (z, remaining horizon), so rebuilding it every step is identical to
+        rebuilding it only when z changes.
+        """
+        if seed is None:
+            seed = self.rng
+        num_skills = int(self.config['num_skills'])
+        L = low_state['tail_suffix'].shape[0] - 1  # episode horizon (static)
+        skill = jnp.asarray(skills, dtype=jnp.int32)
+        state = {
+            **low_state,
+            'skill': skill,
+            'tail_suffix': self.skill_agent._constant_skill_tail(skill, num_skills, L),
+        }
+        return self.skill_agent.sample_actions_with_state(
+            observations, goals=None, agent_state=state, seed=seed, temperature=self._low_temperature()
+        )
+
     @jax.jit
     def sample_actions(self, observations, goals=None, seed=None, temperature=1.0):
         """Stateless hierarchical action: reselect the skill every step (k=1 behaviour)."""
+        self._require_stateless('sample_actions')
         if seed is None:
             seed = self.rng
         high_seed, low_seed = jax.random.split(seed)
@@ -339,8 +426,15 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
 
     # ── k-step skill commitment at eval (contract used by utils/evaluation.py) ─
 
-    def init_eval_state(self):
-        """Per-episode state: the committed skill and the step counter."""
+    def init_eval_state(self, max_steps=None):
+        """Per-episode state: the committed skill and the step counter.
+
+        For the stateful `skill_dt` low level the state is its own rollout state, which
+        already carries `skill` and `count` (env steps so far) and additionally the
+        Transformer context; `max_steps` is the env horizon the evaluators hand over.
+        """
+        if self._stateful_low_level():
+            return self.init_low_level_state(max_steps=max_steps)
         return {'skill': jnp.zeros((), jnp.int32), 'count': jnp.zeros((), jnp.int32)}
 
     @jax.jit
@@ -356,6 +450,9 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
         reselect = (agent_state['count'] % k) == 0
         sampled = self.sample_skills(observations, goals, seed=high_seed, temperature=temperature)
         skill = jnp.where(reselect, sampled, agent_state['skill']).astype(jnp.int32)
+        if self._stateful_low_level():
+            # The frozen policy's state is the eval state; it advances `count` itself.
+            return self.low_level_actions_with_state(observations, skill, agent_state, seed=low_seed)
         actions = self.low_level_actions(observations, skill, seed=low_seed)
         new_state = {'skill': skill, 'count': agent_state['count'] + 1}
         return actions, new_state
@@ -388,16 +485,63 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def label_chunk_skills(self, observations_seq, actions_seq, seq_mask, seed):
-        """One codebook index per window from the frozen DDS encoder: int32 [B] (the `dds_controller` labeller)."""
-        del seed
-        return self.skill_agent._assign_skill(observations_seq, actions_seq, seq_mask).astype(jnp.int32)
+        """One skill index per window from the frozen window-level labeller: int32 [B].
+
+        `dds`:  the encoder + codebook nearest neighbour (the `dds_controller` labeller).
+        `opal`: the discrete posterior p(z | tau) of the frozen clustering model, by Bayes
+                rule over the mixture (paper App. F Eq. 71; the `opal_controller` labeller):
+                log p_phi(tau | z) = sum_{i>=1} mask_i * log p_phi(s_{t+i} | s_{t+i-1}, z), so a
+                window cut short by its trajectory end sums fewer terms. Only the STATE
+                trajectory is read -- never the actions. `opal_label_mode='sample'` draws
+                z ~ p(z | tau) (what the paper does), `'mode'` takes the argmax.
+        """
+        family = self.config['skill_agent_name']
+        if family == 'dds':
+            del seed
+            return self.skill_agent._assign_skill(observations_seq, actions_seq, seq_mask).astype(jnp.int32)
+        if family != 'opal':
+            raise ValueError(f'label_chunk_skills: no window-level labeller for skill agent {family!r}.')
+
+        num_skills = int(self.config['num_skills'])
+        B, C = seq_mask.shape
+        prev = observations_seq[:, :-1]
+        deltas = observations_seq[:, 1:] - prev
+        step_mask = seq_mask[:, 1:]
+        eye = jnp.eye(num_skills)
+
+        # `lax.map` (not vmap) over the K skills: the labelling pass pushes tens of
+        # thousands of windows at a time, and vmapping would materialise K copies of
+        # every hidden activation at once (same choice as opal_controller).
+        def log_p_for_skill(skill):
+            zs = jnp.broadcast_to(eye[skill], (B, C - 1, num_skills))
+            dist = self.skill_agent.network.select('traj_model')(jnp.concatenate([prev, zs], axis=-1))
+            return (dist.log_prob(deltas) * step_mask).sum(axis=-1)  # [B]
+
+        log_p_tau = jax.lax.map(log_p_for_skill, jnp.arange(num_skills))  # [K, B]
+        log_prior = jax.nn.log_softmax(self.skill_agent.network.select('skill_prior')())
+        log_post = jax.nn.log_softmax(log_prior[:, None] + log_p_tau, axis=0).T  # [B, K]
+        if self.config['opal_label_mode'] == 'sample':
+            labels = jax.random.categorical(seed, log_post, axis=-1)
+        else:
+            labels = jnp.argmax(log_post, axis=-1)
+        return labels.astype(jnp.int32)
+
+    def encode_skill_indices(self, observations):
+        """Discrete skill index of each state under the frozen Skill-DT VQ encoder: [B] int32.
+
+        The hook `SequenceDataset.relabel_skill_histograms` calls (the `skill_dt_controller`
+        labeller). This config has no `relabel_interval`, so main_online.py never re-runs it.
+        """
+        return self.skill_agent.encode_skill_indices(observations)
 
     def label_offline_windows(self, seq_dataset, seed=0):
         """Label every window [t, t + k) of an offline `SequenceDataset` with the frozen agent's labeller.
 
         Dispatches on the skill family: `empowerment_skill` uses the BC log-likelihood
-        argmax, `dds` the encoder + codebook assignment. Returns `(labels [size] int32,
-        stats)`.
+        argmax, `dds` the encoder + codebook assignment, `skill_dt` the VQ encoder's
+        per-state codebook indices reduced over the window (`skill_dt_label_mode`),
+        `opal` the discrete posterior p(z | tau) over the window (`opal_label_mode`).
+        Returns `(labels [size] int32, stats)`.
         """
         k = int(self.config['skill_commitment_k'])
         assert int(seq_dataset.config['sequence_length']) == k, (
@@ -417,6 +561,35 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
             stats = seq_dataset.relabel_chunk_skills_from_windows(
                 self, seed=seed, num_skills=int(self.config['num_skills'])
             )
+        elif family == 'opal':
+            # The `opal_controller.prepare_datasets` pass: the posterior reads the whole
+            # window through the per-step transition model, so any k is well defined
+            # (`create` warns when k differs from the chunk_size the mixture was fit on).
+            if self.config['opal_label_mode'] not in OPAL_LABEL_MODES:
+                raise ValueError(
+                    f'opal_label_mode must be one of {OPAL_LABEL_MODES}, got {self.config["opal_label_mode"]!r}.'
+                )
+            stats = seq_dataset.relabel_chunk_skills_from_windows(
+                self,
+                seed=seed,
+                num_skills=int(self.config['num_skills']),
+                chunk_bytes=int(self.config['label_chunk_bytes']),
+            )
+        elif family == 'skill_dt':
+            # The same two-step pass as `skill_dt_controller.prepare_datasets`: one frozen
+            # encoder sweep gives every state its codebook index (nothing ties k to the
+            # checkpoint -- the encoder is per-state), then each window [t, t + k) takes
+            # its `skill_dt_label_mode` reduction of those indices.
+            num_skills = int(self.config['num_skills'])
+            label_mode = self.config['skill_dt_label_mode']
+            if label_mode not in SKILL_DT_LABEL_MODES:
+                raise ValueError(f'skill_dt_label_mode must be one of {SKILL_DT_LABEL_MODES}, got {label_mode!r}.')
+            seq_dataset.relabel_skill_histograms(
+                self, chunk_bytes=int(self.config['label_chunk_bytes']), num_skills=num_skills
+            )
+            stats = seq_dataset.set_chunk_skills(
+                labels_from_skill_counts(seq_dataset, k, label_mode), num_skills=num_skills
+            )
         else:
             raise ValueError(f'No offline window labeller for skill agent {family!r}.')
         return np.asarray(seq_dataset.chunk_skills, dtype=np.int32), stats
@@ -427,6 +600,9 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
         return self.skill_agent.skill_set(seed=seed, num_skills=num_skills, observations=observations)
 
     def sample_actions_with_skill(self, observations, skills, seed=None, temperature=1.0):
+        # A skill_dt low level has no stateless per-step actor; sweep its skills on the
+        # frozen checkpoint itself (eval_skill_policy.py --run_dir <skill_dt run>).
+        self._require_stateless('sample_actions_with_skill')
         del temperature  # Reproduce the frozen policy's own execution at low_temperature.
         return self.skill_agent.sample_actions_with_skill(
             observations, skills, seed=seed, temperature=self._low_temperature()
@@ -462,6 +638,22 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
                     f'[online_crl_skill_controller] WARNING: skill_commitment_k={config["skill_commitment_k"]} '
                     f'differs from the DDS checkpoint\'s sequence_length={seq_len} (the horizon its skills were '
                     f'trained for; dds_controller defaults to it).'
+                )
+
+        if resolved['agent_name'] == 'opal':
+            latent_type = resolved['skill_config'].get('latent_type')
+            if latent_type != 'discrete':
+                raise ValueError(
+                    f'[online_crl_skill_controller] the opal checkpoint {resolved["ckpt_path"]} has '
+                    f'latent_type={latent_type!r}; the controller is a categorical pi_hi(z | s, g) over a finite '
+                    f'skill set, which only the discrete (App. F) OPAL path has. Use a latent_type=discrete run.'
+                )
+            chunk_size = int(resolved['skill_config'].get('chunk_size', 0))
+            if chunk_size and int(config['skill_commitment_k']) != chunk_size:
+                print(
+                    f'[online_crl_skill_controller] WARNING: skill_commitment_k={config["skill_commitment_k"]} '
+                    f'differs from the OPAL checkpoint\'s chunk_size={chunk_size} (the window its clustering '
+                    f'posterior and decoder were trained on; opal_controller requires equality).'
                 )
 
         # ── Trainable controller: actor + contrastive critic + alpha ─────────
@@ -548,6 +740,23 @@ def get_config():
             min_replay_size=1000,  # Macro-transitions collected before the first update.
             replay_size=50000,  # Replay buffer capacity in macro-transitions.
             offline_ratio=0.5,  # RLPD (--offline_dataset): fraction of every batch drawn from the offline buffer.
+            # RLPD: drop offline windows the frozen skill policy cannot reproduce. The score is the
+            # winning skill's BC log-likelihood per step and per action dimension (so it is comparable
+            # across envs); None -> keep every window, the pre-filter behaviour.
+            offline_loglik_threshold=ml_collections.config_dict.placeholder(float),
+            # RLPD with a `skill_dt` checkpoint: how each offline k-window gets its codebook label
+            # from the frozen VQ encoder's per-state skill indices -- 'window_mode' (the most
+            # frequent skill over the window; the discrete analogue of DDS's encoder label),
+            # 'end_state' (the skill of s_{t+k}) or 'future_hist' (argmax of the paper's Z_t); see
+            # agents/skill_dt_controller.py. Ignored by the other families.
+            skill_dt_label_mode='window_mode',
+            # RLPD with a discrete `opal` checkpoint: 'sample' draws each offline k-window's label
+            # z ~ p(z | tau) from the frozen clustering posterior (the paper's recipe and
+            # opal_controller's default), 'mode' takes its argmax. Ignored by the other families.
+            opal_label_mode='sample',
+            # Observation bytes per labeller block (skill_dt encoder pass; opal posterior pass, where
+            # the K-way transition model keeps a whole block's hidden activations live).
+            label_chunk_bytes=64 * 1024 * 1024,
             # Observation pipeline (must match the skill checkpoint).
             discrete=False,  # Whether the low-level action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None for state-based).

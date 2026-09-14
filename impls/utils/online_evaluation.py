@@ -23,7 +23,7 @@ from matplotlib.cm import ScalarMappable  # noqa: E402
 from matplotlib.collections import LineCollection  # noqa: E402
 from matplotlib.colors import BoundaryNorm  # noqa: E402
 
-from utils.evaluation import supply_rng  # noqa: E402
+from utils.evaluation import init_eval_state, supply_rng  # noqa: E402
 from utils.online_env import env_agent_xy, env_goal_xy  # noqa: E402
 
 
@@ -59,7 +59,9 @@ def evaluate_online(
         goal = info.get('goal')
         goal_frame = info.get('goal_rendered')
         goal_xy = env_goal_xy(env)
-        agent_state = agent.init_eval_state() if use_eval_state else None
+        # Hands the env horizon to hooks that take `max_steps` (a Skill-DT low level sizes
+        # its rollout histogram with it); other agents are called exactly as before.
+        agent_state = init_eval_state(agent, env) if use_eval_state else None
 
         done = False
         step = 0

@@ -14,9 +14,11 @@ controller (JaxGCRL has no offline path for it). Decisions taken by the user on
   * Flat agents store one offline row per env step, exactly like online rows.
   * The skill controller labels every stride-1 window [t, t + k) of each offline
     trajectory with the frozen skill agent's own labeller -- the recipe of
-    `skill_bc_relabel_controller` (empowerment: argmax window BC log-likelihood)
-    and `dds_controller` (DDS: encoder + codebook nearest neighbour), run through
-    `SequenceDataset`'s relabelling drivers -- and stores one macro row
+    `skill_bc_relabel_controller` (empowerment: argmax window BC log-likelihood),
+    `dds_controller` (DDS: encoder + codebook nearest neighbour) and
+    `opal_controller` (discrete OPAL: z ~ p(z | tau), the clustering posterior over
+    the window's state trajectory), run through `SequenceDataset`'s relabelling
+    drivers -- and stores one macro row
     (s_t, z_t, s_{t + k}) per window. Rows are env steps, so future goals are drawn
     with the per-env-step discount and `next_observations` is `k` rows ahead
     (`TrajectoryReplayBuffer.sample(next_offset=k)`); the online macro buffer, whose
@@ -24,6 +26,13 @@ controller (JaxGCRL has no offline path for it). Decisions taken by the user on
   * `MixedBatchSampler` fills an exact `offline_ratio` fraction of every batch from
     the offline buffer (RLPD's symmetric sampling; JaxGCRL only gets 50/50 in
     expectation by shuffling a concatenation).
+
+`agent.offline_loglik_threshold` (skill controller, empowerment labeller only; None by
+default, which changes nothing) additionally drops offline windows whose winning skill's
+BC log-likelihood -- per step and per action dimension, so the number means the same
+thing in every env -- falls below it. Dropped rows are still written to the buffer, as
+non-anchor rows: they keep their trajectory contiguous so the surviving rows keep exact
+k-step next observations and full future-goal horizons.
 
 Rewards, masks and terminals of offline rows are bookkeeping only: both online
 agents are purely contrastive and never read them. Offline rows carry
@@ -126,14 +135,22 @@ def offline_trajectories(seq_dataset):
             yield int(start), int(marker)
 
 
-def _fill_buffer(buffer, seq_dataset, row_fn):
-    """Write every offline trajectory into `buffer`; `row_fn(t, start, marker) -> transition dict`."""
+def _fill_buffer(buffer, seq_dataset, row_fn, keep=None):
+    """Write every offline trajectory into `buffer`; `row_fn(t, start, marker) -> transition dict`.
+
+    `keep` (a `[size]` bool array, or None for all) selects which rows are *anchors*.
+    Rows outside it are still written, as non-anchor rows: dropping them outright would
+    cut their trajectory in two, shortening the future-goal horizon of every earlier row
+    and clamping k-step next observations at the hole. Written-but-not-anchored keeps the
+    trajectory intact and merely removes the row from the sampling pool.
+    """
     observations = seq_dataset.get_observations(np.arange(seq_dataset.size))
     num_rows = 0
     for start, marker in offline_trajectories(seq_dataset):
         for t in range(start, marker):
-            buffer.add_transition(row_fn(t, start, marker, observations))
-            num_rows += 1
+            valid = True if keep is None else bool(keep[t])
+            buffer.add_transition(row_fn(t, start, marker, observations), valid=valid)
+            num_rows += int(valid)
         buffer.end_trajectory(observations[marker])
     return num_rows
 
@@ -162,11 +179,12 @@ def make_offline_flat_source(seq_dataset, example_transition, goal_discount):
     return BufferSource(buffer, discount=float(goal_discount), next_offset=1), num_rows
 
 
-def make_offline_macro_source(seq_dataset, labels, example_transition, k, goal_discount):
+def make_offline_macro_source(seq_dataset, labels, example_transition, k, goal_discount, keep=None):
     """One offline macro row per env step t: (s_t, z_t, s_{min(t+k, end)}), `z_t` the window label.
 
     `goal_discount` is the per-env-step discount (rows are env steps); the k-step
-    next observation comes from `next_offset=k` at sample time.
+    next observation comes from `next_offset=k` at sample time. `keep` restricts which
+    rows are sampled as anchors (see `_fill_buffer`).
     """
     labels = np.asarray(labels)
     assert labels.shape == (seq_dataset.size,), f'expected one label per dataset row, got {labels.shape}'
@@ -183,7 +201,7 @@ def make_offline_macro_source(seq_dataset, labels, example_transition, k, goal_d
             terminals=terminals[last],
         )
 
-    num_rows = _fill_buffer(buffer, seq_dataset, row)
+    num_rows = _fill_buffer(buffer, seq_dataset, row, keep=keep)
     return BufferSource(buffer, discount=float(goal_discount), next_offset=int(k)), num_rows
 
 
@@ -194,6 +212,11 @@ def make_offline_source(dataset_name, agent, example_transition, label_seed=0):
     name = 'rlpd'
 
     if rollout_type == 'flat':
+        if config.get('offline_loglik_threshold') is not None:
+            raise ValueError(
+                'agent.offline_loglik_threshold filters offline windows by how well the frozen skill '
+                "policy explains them, so it needs a skill agent; rollout_type='flat' has none."
+            )
         seq_dataset = load_offline_sequence_dataset(dataset_name, config, sequence_length=1)
         _check_observation_shape(seq_dataset, example_transition)
         source, num_rows = make_offline_flat_source(seq_dataset, example_transition, config['goal_discount'])
@@ -212,11 +235,52 @@ def make_offline_source(dataset_name, agent, example_transition, label_seed=0):
         )
         if counts is not None:
             print(f'[{name}]   per-skill counts: {counts.tolist()}')
-        source, num_rows = make_offline_macro_source(seq_dataset, labels, example_transition, k, config['discount'])
+        keep = _loglik_keep_mask(seq_dataset, config, name)
+        source, num_rows = make_offline_macro_source(
+            seq_dataset, labels, example_transition, k, config['discount'], keep=keep
+        )
         print(f'[{name}] offline dataset {dataset_name}: {num_rows} macro rows (stride 1) in {seq_dataset.size} slots')
         return source
 
     raise ValueError(f'Unknown rollout_type {rollout_type!r}.')
+
+
+def _loglik_keep_mask(seq_dataset, config, name):
+    """Which offline windows survive `agent.offline_loglik_threshold` (None -> all of them).
+
+    A window's score is the winning skill's BC log-likelihood per step and per action
+    dimension (`SequenceDataset.relabel_chunk_skills`); windows scoring below the
+    threshold are windows the frozen skill policy cannot reproduce, so the macro
+    transition (s_t, z_t, s_{t+k}) the buffer would store for them is a transition no
+    skill actually performs. Returning None (the default) keeps the buffer byte-for-byte
+    what it was before this filter existed.
+    """
+    threshold = config.get('offline_loglik_threshold')
+    if threshold is None:
+        return None
+    scores = seq_dataset.chunk_skill_scores
+    if scores is None:
+        raise ValueError(
+            f'agent.offline_loglik_threshold needs per-window BC log-likelihoods, which only the '
+            f'empowerment_skill labeller produces; got skill_agent_name={config["skill_agent_name"]!r}.'
+        )
+    # Marker rows (the invalidated final state of each trajectory) are not windows and are
+    # never anchors anyway; excluding them keeps the reported fraction honest.
+    scores = np.asarray(scores)
+    is_window = np.asarray(seq_dataset.dataset['valids']) > 0
+    keep = (scores >= float(threshold)) & is_window
+    num_keep, num_windows = int(keep.sum()), int(is_window.sum())
+    print(
+        f'[{name}] offline_loglik_threshold={float(threshold):.4f}: keeping {num_keep} / {num_windows} windows '
+        f'({num_keep / max(num_windows, 1):.1%}; scores are max-skill log pi per step per action dim)'
+    )
+    if num_keep == 0:
+        window_scores = scores[is_window]
+        raise ValueError(
+            f'agent.offline_loglik_threshold={float(threshold)} drops every offline window (scores run '
+            f'{float(window_scores.min()):.4f} to {float(window_scores.max()):.4f}); lower it.'
+        )
+    return keep
 
 
 def _check_observation_shape(seq_dataset, example_transition):

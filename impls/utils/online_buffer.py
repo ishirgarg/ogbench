@@ -105,10 +105,17 @@ class TrajectoryReplayBuffer:
         self.total += 1
         return self.total - 1
 
-    def add_transition(self, transition):
-        """Append one real transition of the in-progress trajectory."""
-        abs_idx = self._write_row(transition, valid=True)
-        self.num_transitions += 1
+    def add_transition(self, transition, valid=True):
+        """Append one real transition of the in-progress trajectory.
+
+        `valid=False` stores the row but never draws it as an anchor: it still supplies
+        `observations[i + 1]` to its predecessor and can still be drawn as a future goal,
+        so the trajectory stays contiguous and k-step next observations stay exact. This
+        is how `utils/rlpd.py` drops offline windows whose skill fit is too poor without
+        cutting the trajectory they sit in.
+        """
+        abs_idx = self._write_row(transition, valid=valid)
+        self.num_transitions += int(valid)
         self._open_rows.append(abs_idx)
 
     def end_trajectory(self, final_observation):

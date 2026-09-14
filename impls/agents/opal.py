@@ -84,6 +84,22 @@ Setting `latent_type="discrete"` instead runs the paper's Appendix F offline-DAD
 path: sub-trajectories are clustered into `num_skills` primitives by EM on
 p(tau,z) = p_omega(z) prod_t p_phi(s_t|s_{t-1},z), then pi(a|s,z) is BC-trained on
 the frozen posterior's labels (EM for `cluster_steps`, BC for the rest).
+The stage is a STATIC flag (`config["bc_stage"]`), so each stage is its own jit
+trace and only the active stage's forward AND backward pass exists (a `lax.cond`
+would allocate the union of both branches' residuals every step). At the EM->BC
+boundary `main.py` calls `stage_prepare_datasets`, which labels every dataset
+window ONCE with the frozen posterior p(z|tau)
+(`SequenceDataset.relabel_window_log_posteriors`) and returns the agent with the
+flag flipped. The BC stage then samples z from the stored per-window posterior and
+never evaluates the trajectory model again; sampling from the stored posterior is
+identical in distribution to re-running the (frozen) E-step on every batch (up to
+TF32 matmul noise, which the EM stage itself trained under; the sharp trajectory
+model turns ~1e-4 mean errors into ~1 nat in the log-posterior tails, but the
+argmax and probabilities agree). If a
+batch has no stored posterior (`chunk_log_resp` absent), the BC stage falls back
+to the on-the-fly E-step under `stop_gradient`. `training/past_cluster_steps`
+(traced, from `network.step`) is logged next to `training/in_bc_stage` (the flag)
+so a driver that forgets the hook is visible in the CSV.
 ================================================================================
 """
 
@@ -346,10 +362,13 @@ class OPALAgent(flax.struct.PyTreeNode):
 
     # ── Discrete path: Appendix F clustering + BC ──────────────────────────────
 
-    def _log_p_tau_given_z(self, obs_seq, seq_mask, grad_params):
+    def _log_p_tau_given_z(self, obs_seq, seq_mask, grad_params, sequential=False):
         """log p_phi(tau|z) = sum_{t=1..c-1} log p_phi(s_t|s_{t-1}, z), for every z.
 
         Returns [k, B]. The constant log p(s_0) is dropped (no phi dependence).
+        `sequential=True` loops over the K skills with `lax.map` instead of `vmap`,
+        so the labelling pass can push tens of thousands of windows at once without
+        materialising K copies of every hidden activation.
         """
         B, C, D = obs_seq.shape
         K = self.config["num_skills"]
@@ -365,61 +384,162 @@ class OPALAgent(flax.struct.PyTreeNode):
             )
             return (dist.log_prob(deltas) * step_mask).sum(axis=-1)
 
+        if sequential:
+            return jax.lax.map(log_p_for_skill, jnp.eye(K))
         return jax.vmap(log_p_for_skill)(jnp.eye(K))
 
+    def _e_step(self, obs_seq, seq_mask, params, sequential=False):
+        """Bayes rule over the mixture (App. F Eq. 71).
+
+        Returns (log_prior [K], log_joint [K, B], log_resp [K, B], log_evidence [B]).
+        """
+        log_prior = jax.nn.log_softmax(self.network.select("skill_prior")(params=params))
+        log_p_tau = self._log_p_tau_given_z(obs_seq, seq_mask, params, sequential=sequential)
+        log_joint = log_prior[:, None] + log_p_tau
+        log_evidence = jax.scipy.special.logsumexp(log_joint, axis=0)
+        log_resp = log_joint - log_evidence[None]
+        return log_prior, log_joint, log_resp, log_evidence
+
     def discrete_loss(self, batch, grad_params, rng):
-        """EM on p(tau,z) for `cluster_steps`, then BC on the frozen posterior."""
+        """EM on p(tau,z) for `cluster_steps`, then BC on the frozen posterior.
+
+        The stage is the static `config["bc_stage"]` flag (flipped by
+        `stage_prepare_datasets`), so each stage is a separate trace that computes
+        and back-propagates only its own loss: the EM stage never touches the
+        decoder, and the BC stage never back-propagates through the trajectory
+        model. In the BC stage the posterior comes from the per-window
+        `chunk_log_resp` that `stage_prepare_datasets` stored on the dataset at the
+        boundary; without it (a batch from an unlabelled dataset) the E-step is
+        re-run on the fly under `stop_gradient`.
+        """
         obs_seq = batch["observations_seq"]
         act_seq = batch["actions_seq"]
         seq_mask = batch["seq_mask"]
         B, C = seq_mask.shape
         K = self.config["num_skills"]
-
-        # E-step: p(z|tau) by Bayes rule, held fixed via stop_gradient.
-        log_prior = jax.nn.log_softmax(
-            self.network.select("skill_prior")(params=grad_params)
-        )
-        log_p_tau = self._log_p_tau_given_z(obs_seq, seq_mask, grad_params)
-        log_joint = log_prior[:, None] + log_p_tau
-        log_evidence = jax.scipy.special.logsumexp(log_joint, axis=0)
-        log_resp = log_joint - log_evidence[None]
-        resp = jax.lax.stop_gradient(jnp.exp(log_resp))
-
-        # M-step, normalized per real step to match the VAE path's loss scale.
         denom = jnp.maximum(seq_mask.sum(), 1.0)
-        em_loss = -(resp * log_joint).sum(axis=0).sum() / denom
+        has_labels = "chunk_log_resp" in batch
+        zero = jnp.float32(0.0)
 
-        # BC on one z per window sampled from the posterior.
-        label_rng, _ = jax.random.split(rng)
-        z_idx = jax.random.categorical(
-            label_rng, jax.lax.stop_gradient(log_resp).T, axis=-1
-        )
-        zs = jnp.broadcast_to(jnp.eye(K)[z_idx][:, None, :], (B, C, K))
-        szs = jnp.concatenate([obs_seq, zs], axis=-1)
-        bc_logprob = self.network.select("decoder")(szs, params=grad_params).log_prob(act_seq)
-        bc_loss = -(bc_logprob * seq_mask).sum() / denom
+        def posterior_stats(log_prior, log_resp):
+            """log_resp: [K, B]. Shared metric block so both branches emit one structure."""
+            resp = jnp.exp(log_resp)
+            prior_probs = jnp.exp(log_prior)
+            prior_entropy = -(prior_probs * log_prior).sum()
+            post_entropy = -(resp * log_resp).sum(axis=0).mean()
+            return {
+                "mutual_information": prior_entropy - post_entropy,
+                "prior_entropy": prior_entropy,
+                "posterior_entropy": post_entropy,
+                "prior_min_prob": prior_probs.min(),
+                "prior_max_prob": prior_probs.max(),
+                "num_active_skills": (resp.mean(axis=1) > 1e-3).sum().astype(jnp.float32),
+            }
 
-        in_bc = (self.network.step >= self.config["cluster_steps"]).astype(jnp.float32)
-        total_loss = (1.0 - in_bc) * em_loss + in_bc * bc_loss
+        def em_branch(params):
+            log_prior, log_joint, log_resp, log_evidence = self._e_step(obs_seq, seq_mask, params)
+            # E-step held fixed via stop_gradient; M-step normalized per real step to
+            # match the VAE path's loss scale.
+            resp = jax.lax.stop_gradient(jnp.exp(log_resp))
+            em_loss = -(resp * log_joint).sum(axis=0).sum() / denom
+            info = {
+                "em_loss": em_loss,
+                "bc_loss": zero,
+                "bc_log_prob": zero,
+                "log_evidence": log_evidence.mean(),
+                **posterior_stats(log_prior, jax.lax.stop_gradient(log_resp)),
+            }
+            return em_loss, info
 
-        prior_probs = jnp.exp(log_prior)
-        prior_entropy = -(prior_probs * log_prior).sum()
-        post_entropy = -(resp * log_resp).sum(axis=0).mean()
+        def bc_branch(params):
+            # The clustering model is frozen here: read it through stop_gradient so
+            # no backward pass is traced through the trajectory model.
+            frozen = None if params is None else jax.lax.stop_gradient(params)
+            if has_labels:
+                log_resp = batch["chunk_log_resp"].T                             # [K, B]
+                log_prior = jax.nn.log_softmax(self.network.select("skill_prior")(params=frozen))
+                log_evidence_mean = zero  # not stored; only meaningful during EM
+            else:
+                log_prior, _, log_resp, log_evidence = self._e_step(obs_seq, seq_mask, frozen)
+                log_evidence_mean = log_evidence.mean()
 
-        return total_loss, {
+            # BC on one z per window sampled from the posterior.
+            label_rng, _ = jax.random.split(rng)
+            z_idx = jax.random.categorical(label_rng, log_resp.T, axis=-1)
+            zs = jnp.broadcast_to(jnp.eye(K)[z_idx][:, None, :], (B, C, K))
+            szs = jnp.concatenate([obs_seq, zs], axis=-1)
+            bc_logprob = self.network.select("decoder")(szs, params=params).log_prob(act_seq)
+            bc_loss = -(bc_logprob * seq_mask).sum() / denom
+            info = {
+                "em_loss": zero,
+                "bc_loss": bc_loss,
+                "bc_log_prob": (bc_logprob * seq_mask).sum() / denom,
+                "log_evidence": log_evidence_mean,
+                **posterior_stats(log_prior, log_resp),
+            }
+            return bc_loss, info
+
+        in_bc = bool(self.config.get("bc_stage", False))
+        total_loss, info = (bc_branch if in_bc else em_branch)(grad_params)
+        past_cluster = jnp.asarray(self.network.step >= self.config["cluster_steps"])
+        info = {
             "total_loss": total_loss,
-            "em_loss": em_loss,
-            "bc_loss": bc_loss,
-            "in_bc_stage": in_bc,
-            "log_evidence": log_evidence.mean(),
-            "mutual_information": prior_entropy - post_entropy,
-            "prior_entropy": prior_entropy,
-            "posterior_entropy": post_entropy,
-            "prior_min_prob": prior_probs.min(),
-            "prior_max_prob": prior_probs.max(),
-            "num_active_skills": (resp.mean(axis=1) > 1e-3).sum().astype(jnp.float32),
-            "bc_log_prob": (bc_logprob * seq_mask).sum() / denom,
+            "in_bc_stage": jnp.float32(in_bc),
+            "past_cluster_steps": past_cluster.astype(jnp.float32),
+            **info,
         }
+        return total_loss, info
+
+    # ── Stage boundary: label every window once with the frozen posterior ───────
+
+    @jax.jit
+    def window_log_posteriors(self, observations_seq, seq_mask):
+        """log p(z|tau) for a block of windows, [B, K]. Used by the labelling pass."""
+        _, _, log_resp, _ = self._e_step(observations_seq, seq_mask, None, sequential=True)
+        return log_resp.T
+
+    def stage_prepare_step(self):
+        """Loop index at which `main.py` must call `stage_prepare_datasets` (None: never).
+
+        `main.py` keeps `network.step == i` before the update at loop index `i`, so
+        the BC stage (`step >= cluster_steps`) begins at `i == cluster_steps`, with
+        the clustering params as left by the last EM update and frozen thereafter.
+        """
+        if self.config["latent_type"] != "discrete":
+            return None
+        return int(self.config["cluster_steps"])
+
+    def stage_prepare_datasets(self, datasets):
+        """Enter the BC stage: store the frozen posterior p(z|tau) of every window on
+        each dataset and return the agent with `config["bc_stage"]` set.
+
+        Runs once at the EM->BC boundary (or at resume time, if resuming inside the
+        BC stage: the clustering params are reverted after every BC update, so the
+        restored ones are exactly the frozen ones). Exact and never repeated. The
+        flag lives in the static config, not the checkpoint, so a resumed run gets
+        it back from this same hook.
+        """
+        assert self.config["latent_type"] == "discrete"
+        step = int(self.network.step)
+        assert step >= int(self.config["cluster_steps"]), (
+            f"stage_prepare_datasets called at step {step} < cluster_steps="
+            f"{int(self.config['cluster_steps'])}: the clustering model is not frozen yet."
+        )
+        for i, dataset in enumerate(datasets):
+            if not hasattr(dataset, "relabel_window_log_posteriors"):
+                raise TypeError(
+                    f"dataset {i} ({type(dataset).__name__}) cannot store window posteriors; "
+                    "the discrete OPAL path needs dataset_class='SequenceDataset'."
+                )
+            stats = dataset.relabel_window_log_posteriors(self)
+            print(
+                f"[opal] labelled dataset {i} ({dataset.size} windows) with the frozen posterior: "
+                + ", ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in stats.items()),
+                flush=True,
+            )
+        new_config = dict(self.config)
+        new_config["bc_stage"] = True
+        return self.replace(config=flax.core.FrozenDict(**new_config))
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -436,17 +556,11 @@ class OPALAgent(flax.struct.PyTreeNode):
             loss_fn=lambda p: self.total_loss(batch, p, rng=rng)
         )
 
-        if self.config["latent_type"] == "discrete":
+        if self.config["latent_type"] == "discrete" and self.config.get("bc_stage", False):
             # Revert the clustering params in the BC stage: their gradient is zero
             # there, but leftover Adam momentum would keep moving them.
-            in_bc = self.network.step >= self.config["cluster_steps"]
             frozen = {
-                key: jax.tree_util.tree_map(
-                    lambda old, new: jnp.where(in_bc, old, new),
-                    self.network.params[key],
-                    new_network.params[key],
-                )
-                for key in ("modules_traj_model", "modules_skill_prior")
+                key: self.network.params[key] for key in ("modules_traj_model", "modules_skill_prior")
             }
             new_network = new_network.replace(params={**new_network.params, **frozen})
 
@@ -620,6 +734,8 @@ class OPALAgent(flax.struct.PyTreeNode):
             assert int(config["cluster_steps"]) > 0, (
                 "cluster_steps must be > 0: the BC stage needs a trained p(z|tau)."
             )
+            # Static stage flag; `stage_prepare_datasets` flips it at the boundary.
+            config["bc_stage"] = False
             K = int(config["num_skills"])
 
             traj_model_def = GaussianModule(

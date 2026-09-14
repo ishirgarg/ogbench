@@ -22,13 +22,17 @@
 # Usage (normally invoked by scripts/slurm/submit_dds_online_controller_seeds.sh):
 #   sbatch --job-name=<name> --output=<log> \
 #       scripts/slurm/run_dds_online_controller_seed.sbatch \
-#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH]
+#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH] [SAVE_SUBDIR] [TARGET_ENTROPY_FRAC]
 #
 # OFFLINE_DATASET is optional; omit (or pass "") to use SKILL_CKPT's own dataset
 # (its flags.json env_name) -- i.e. exactly the data the DDS skills were trained
 # on, which is what we want for RLPD. Pass "none" to disable RLPD.
 # EPISODE_LENGTH is optional; omit to use the env's registered horizon
 # (antsoccer-arena-center-online-v0 needs 500 -- the submit script passes it).
+# TARGET_ENTROPY_FRAC is optional (7th positional arg); omit (or pass "") to keep
+# the 0.9 default every existing caller relies on. Added 2026-09-13 for
+# submit_pmt_asoc_cube_entropy_sweep.sh, which sweeps this non-legacy
+# target_entropy_frac knob (target_entropy = frac * log(num_skills)) explicitly.
 #SBATCH --job-name=dds_online_controller
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16gb
@@ -47,6 +51,7 @@ EPISODE_LENGTH=${5:-}
 # `online_controller_corner`) to keep a sweep on a different online env in its own tree
 # instead of mixing it into the finished one.
 SAVE_SUBDIR=${6:-online_controller}
+TARGET_ENTROPY_FRAC=${7:-0.9}
 
 REPO_DIR=/nas/ucb/ishirgarg/ogbench
 IMPLS_DIR="$REPO_DIR/impls"
@@ -93,7 +98,7 @@ if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH")
 SAVE_DIR="$SKILL_CKPT/$SAVE_SUBDIR/$TAG"
 mkdir -p "$SAVE_DIR"
 
-echo "[run_dds_online_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_dds_online_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -103,7 +108,7 @@ srun "$PYTHON" -u main_online.py \
     --agent.skill_checkpoint_path="$SKILL_CKPT" \
     --agent.skill_restore_epoch="$SKILL_EPOCH" \
     --agent.skill_commitment_k=10 \
-    --agent.target_entropy_frac=0.9 \
+    --agent.target_entropy_frac="$TARGET_ENTROPY_FRAC" \
     --total_env_steps=1000000 \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \

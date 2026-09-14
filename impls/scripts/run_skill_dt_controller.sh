@@ -24,7 +24,7 @@
 #     GPUS="0 1"          GPU ids; at most one job per GPU at a time.
 #     BASE_AGENT=gciql    inner algorithm (gciql | crl); add its knobs via EXTRA_FLAGS.
 #     LABEL_MODE=window_mode   window_mode | end_state | future_hist.
-#     CHUNK_HORIZON=20    H, the label window and option length (any value; nothing ties
+#     CHUNK_HORIZON=10    H, the label window and option length (any value; nothing ties
 #                         it to the checkpoint, unlike DDS/OPAL).
 #     SKILL_HORIZON=      env steps a chosen skill is held for (default: CHUNK_HORIZON).
 #     TRAIN_STEPS=1000000
@@ -63,7 +63,7 @@ fi
 
 BASE_AGENT=${BASE_AGENT:-gciql}
 LABEL_MODE=${LABEL_MODE:-window_mode}
-CHUNK_HORIZON=${CHUNK_HORIZON:-20}
+CHUNK_HORIZON=${CHUNK_HORIZON:-10}
 TRAIN_STEPS=${TRAIN_STEPS:-1000000}
 SKILL_HORIZON_FLAG=()
 if [[ -n "${SKILL_HORIZON:-}" ]]; then

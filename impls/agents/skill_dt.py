@@ -82,7 +82,8 @@ HYPERPARAMETERS -- paper Table 5 (Sec. A.2), reproduced exactly
   Codebook size is per-environment in the paper (Table 1): 10 for
   walker2d-medium, halfcheetah-medium and ant-medium; 32 for hopper-medium,
   both -medium-replay tasks and both antmaze-umaze tasks; 64 for both
-  antmaze-medium tasks. The default here is 32, the antmaze-umaze value.
+  antmaze-medium tasks. The default here is 50, the codebook size every other
+  skill-discovery agent in this repo uses (a repo convention, not a paper value).
 
 ================================================================================
 CHOICES THE PAPER DOES NOT PIN DOWN, AND OGBENCH-FORCED DEVIATIONS
@@ -1012,7 +1013,7 @@ def get_config():
         # the paper's statistic).
         relabel_interval=50,
         # VQ-VAE skill codebook.
-        num_skills=32,            # paper Table 1: 10 / 32 / 64 depending on env.
+        num_skills=50,            # repo-wide skill-count default (user, 2026-09-13); paper Table 1 uses 10 / 32 / 64 per env.
         code_dim=256,             # skill embedding dim (MUST equal embed_dim).
         vq_hidden_dims=(256, 256),
         vq_beta=1.0,              # VQLOSS = MSE(z, zhat), Eq. 1 (unweighted).

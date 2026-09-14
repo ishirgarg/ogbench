@@ -11,7 +11,10 @@ into a `TrajectoryReplayBuffer`:
     until the episode ends). The row is (s_t, z, R, mask, done) with
     R = sum_i gamma_low^i r_i over the steps actually taken, mirroring
     `rollout_macro_step` in JaxGCRL's crl_skill_controller. Used by the online
-    CRL skill controller.
+    CRL skill controller. A frozen policy that keeps per-episode state (Skill-DT's
+    Transformer context) exposes `init_low_level_state(max_steps)` /
+    `low_level_actions_with_state(...)`; the collector threads that state through
+    every env step of the episode and rebuilds it at reset.
 
 Both condition the behaviour policy on the episode's task goal (`info['goal']`,
 the full goal observation) and never store it: training goals are relabelled
@@ -22,6 +25,8 @@ Which collector an agent needs is declared by its config (`rollout_type`).
 
 import jax
 import numpy as np
+
+from utils.evaluation import env_horizon
 
 
 class _EpisodeTracker:
@@ -112,6 +117,14 @@ class MacroCollector:
         self.k = int(skill_commitment_k)
         self.gamma_low = float(gamma_low)
         self.tracker = _EpisodeTracker()
+        # Episode horizon handed to a STATEFUL frozen low-level policy (Skill-DT sizes its
+        # rollout histogram with it); None if the env has no TimeLimit.
+        self.horizon = env_horizon(env)
+        # Per-episode state of the frozen low-level policy, or None for the stateless
+        # families (empowerment_skill, dds). Built lazily on the first `step` of every
+        # episode because the agent is not known at construction time.
+        self.low_state = None
+        self._low_state_stale = True
         self._reset_episode()
 
     def _reset_episode(self):
@@ -119,6 +132,8 @@ class MacroCollector:
         self.observation = observation
         self.goal = info['goal']
         self.tracker.reset()
+        self.low_state = None
+        self._low_state_stale = True
 
     @staticmethod
     def example_transition(example_batch):
@@ -131,6 +146,11 @@ class MacroCollector:
         )
 
     def step(self, agent):
+        if self._low_state_stale:
+            init_low_level_state = getattr(agent, 'init_low_level_state', None)
+            self.low_state = None if init_low_level_state is None else init_low_level_state(max_steps=self.horizon)
+            self._low_state_stale = False
+
         self.rng, skill_key, low_key = jax.random.split(self.rng, 3)
         skill = int(agent.sample_skills(observations=self.observation, goals=self.goal, seed=skill_key, temperature=1.0))
 
@@ -142,7 +162,15 @@ class MacroCollector:
         env_steps = 0
         for _ in range(self.k):
             low_key, action_key = jax.random.split(low_key)
-            action = np.asarray(agent.low_level_actions(observations=self.observation, skills=skill, seed=action_key))
+            if self.low_state is None:
+                action = agent.low_level_actions(observations=self.observation, skills=skill, seed=action_key)
+            else:
+                # Stateful frozen policy: the state (a Skill-DT's K-step context and step
+                # counter) persists across macro-steps within the episode.
+                action, self.low_state = agent.low_level_actions_with_state(
+                    observations=self.observation, skills=skill, low_state=self.low_state, seed=action_key
+                )
+            action = np.asarray(action)
             next_observation, reward, terminated, truncated, info = self.env.step(action)
             env_steps += 1
             self.tracker.add(reward, info)

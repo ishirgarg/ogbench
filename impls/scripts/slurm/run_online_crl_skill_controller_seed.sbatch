@@ -17,12 +17,23 @@
 # scripts/slurm/submit_online_crl_skill_controller_rlpd_seeds.sh):
 #   sbatch --job-name=<name> --output=<log> \
 #       scripts/slurm/run_online_crl_skill_controller_seed.sbatch \
-#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH]
+#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH] [SAVE_SUBDIR] [TARGET_ENTROPY_FRAC] [LOGLIK_THRESHOLD]
 #
 # OFFLINE_DATASET is optional; omit (or pass "") to use SKILL_CKPT's own
 # dataset (its flags.json env_name), matching the local script's default.
 # Pass "none" to disable RLPD.
 # EPISODE_LENGTH is optional; omit to use the env's registered horizon.
+# TARGET_ENTROPY_FRAC is optional (7th positional arg); omit (or pass "") to keep
+# the 0.9 default every existing caller relies on. Added 2026-09-13 for
+# submit_pmt_asoc_cube_entropy_sweep.sh, which sweeps this non-legacy
+# target_entropy_frac knob (target_entropy = frac * log(num_skills)) explicitly.
+# LOGLIK_THRESHOLD is optional (8th positional arg); omit (or pass "") to leave
+# agent.offline_loglik_threshold unset, i.e. RLPD mixes in every offline window
+# exactly as before. Pass a float to drop offline windows the frozen skill policy
+# cannot reproduce -- the score is the winning skill's BC log-likelihood per step
+# and per action dimension (utils/rlpd.py), so the same number means the same
+# thing in every env. Added 2026-09-13 for submit_loglik_threshold_sweep.sh.
+# It only has an effect when RLPD is on (OFFLINE_DATASET != "none").
 # antsoccer-arena-center-online-v0 is registered at 1000 but every online run in
 # this repo uses 500 for it (scripts/run_online_crl.sh's per-env table), so the
 # submit scripts pass it explicitly. main_online.py requires
@@ -46,6 +57,8 @@ EPISODE_LENGTH=${5:-}
 # `online_controller_corner`) to keep a sweep on a different online env in its own tree
 # instead of mixing it into the finished one.
 SAVE_SUBDIR=${6:-online_controller}
+TARGET_ENTROPY_FRAC=${7:-0.9}
+LOGLIK_THRESHOLD=${8:-}
 
 REPO_DIR=/nas/ucb/ishirgarg/ogbench
 IMPLS_DIR="$REPO_DIR/impls"
@@ -87,12 +100,20 @@ if [[ -z "$OFFLINE_DATASET" ]]; then OFFLINE_DATASET="$SKILL_DATASET"; fi
 TAG=rlpd
 RLPD_FLAG=(--offline_dataset="$OFFLINE_DATASET")
 if [[ "$OFFLINE_DATASET" == "none" ]]; then TAG=norlpd; RLPD_FLAG=(); fi
+THRESHOLD_FLAG=()
+if [[ -n "$LOGLIK_THRESHOLD" ]]; then
+    if [[ "$TAG" == "norlpd" ]]; then
+        echo "[run_online_crl_skill_controller_seed] ERROR: LOGLIK_THRESHOLD=$LOGLIK_THRESHOLD with OFFLINE_DATASET=none; the filter only acts on the RLPD offline buffer." >&2
+        exit 1
+    fi
+    THRESHOLD_FLAG=(--agent.offline_loglik_threshold="$LOGLIK_THRESHOLD")
+fi
 EP_FLAG=()
 if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
 SAVE_DIR="$SKILL_CKPT/$SAVE_SUBDIR/$TAG"
 mkdir -p "$SAVE_DIR"
 
-echo "[run_online_crl_skill_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_online_crl_skill_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC loglik_threshold=${LOGLIK_THRESHOLD:-<none>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -102,10 +123,11 @@ srun "$PYTHON" -u main_online.py \
     --agent.skill_checkpoint_path="$SKILL_CKPT" \
     --agent.skill_restore_epoch="$SKILL_EPOCH" \
     --agent.skill_commitment_k=10 \
-    --agent.target_entropy_frac=0.9 \
+    --agent.target_entropy_frac="$TARGET_ENTROPY_FRAC" \
     --total_env_steps=1000000 \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \
+    "${THRESHOLD_FLAG[@]}" \
     --log_interval=5000 \
     --eval_interval=20000 \
     --save_interval=100000 \
