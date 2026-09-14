@@ -7,7 +7,7 @@
 # pointmaze checkpoints); it reuses the very same per-run body,
 # run_dds_online_controller_seed.sbatch, so all DDS online-controller runs share
 # one set of flags: RLPD on with the checkpoint's OWN offline dataset, K=10,
-# target_entropy_multiplier=0.5, 1M env steps, eval every 20k.
+# target_entropy_frac=0.9, 1M env steps, eval every 20k.
 #
 # Online env per checkpoint (the deterministic, noise-free `*-center-` task sets;
 # see ogbench/manipspace/__init__.py):

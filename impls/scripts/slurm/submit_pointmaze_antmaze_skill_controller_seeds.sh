@@ -26,7 +26,7 @@
 # with the dataset defaulting -- inside run_dds_online_controller_seed.sbatch /
 # run_online_crl_skill_controller_seed.sbatch -- to each checkpoint's OWN training
 # dataset (its flags.json env_name), i.e. exactly the data its K=50 skills were
-# trained on. skill_commitment_k=10 and target_entropy_multiplier=0.5 are fixed by
+# trained on. skill_commitment_k=10 and target_entropy_frac=0.9 are fixed by
 # those sbatch scripts (not tunable here -- see their own comment blocks for why).
 #
 # Online env per env family: the NEW 4-goal / 3-goal sparse task sets (registered

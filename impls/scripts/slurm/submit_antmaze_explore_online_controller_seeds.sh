@@ -22,7 +22,7 @@
 # RLPD is on: OFFLINE_DATASET is left unset, so each sbatch job defaults it to the
 # checkpoint's own dataset (its flags.json env_name), which is antmaze-medium-explore-v0
 # for all three checkpoints -- i.e. RLPD trains on the same explore data the skills were
-# trained on. K=10 skill commitment, target_entropy_multiplier=0.5, 1M env steps -- see
+# trained on. K=10 skill commitment, target_entropy_frac=0.9, 1M env steps -- see
 # run_dds_online_controller_seed.sbatch / run_online_crl_skill_controller_seed.sbatch for
 # the exact flags.
 #

@@ -7,7 +7,7 @@
 # antmaze empowerment sweep (submit_online_crl_skill_controller_rlpd_seeds.sh): RLPD on,
 # offline dataset = each checkpoint's OWN dataset (the data its low-level skills were
 # trained on, read from flags.json by the sbatch script), K=10 skill commitment,
-# target_entropy_multiplier=0.5, 1M env steps. See
+# target_entropy_frac=0.9, 1M env steps. See
 # run_online_crl_skill_controller_seed.sbatch for the exact flags.
 #
 # The 4 checkpoints (ckpts/final/empowerment_final/<env>/sd000_*), all K=50 skills, 1M

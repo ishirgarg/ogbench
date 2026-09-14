@@ -6,8 +6,8 @@
 # Goal: 5 identical seeds (0-4) per checkpoint, for confidence intervals. Seed 0
 # already finished locally for both checkpoints (see
 # ckpts/empowerment_final/antmaze-medium-{navigate,stitch}/.../online_controller/rlpd/),
-# using the entropy-clamp fix verified 2026-09-02 (target_entropy_multiplier=0.5,
-# clamped to <= target_entropy_cap_frac * log(num_skills)). This script submits
+# using the reachable skill-entropy target verified 2026-09-02
+# (target_entropy_frac=0.9 -> H_target = 0.9 * log(num_skills)). This script submits
 # only what's missing: seeds 1-4 for each of the two checkpoints (8 jobs total),
 # on antmaze-medium-center-online-v0 with RLPD on (offline dataset = each
 # checkpoint's own dataset -- antmaze-medium-navigate-v0 / antmaze-medium-stitch-v0).

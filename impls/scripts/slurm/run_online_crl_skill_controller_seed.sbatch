@@ -8,7 +8,7 @@
 # One run = one seed of agents/online_crl_skill_controller.py on top of a
 # frozen SKILL_CKPT, using its own dataset for RLPD (same default as
 # scripts/run_online_crl_skill_controller.sh: SKILL_CKPT's flags.json env_name).
-# Flags match that script's body (K=10, target_entropy_multiplier=0.5 -- the
+# Flags match that script's body (K=10, target_entropy_frac=0.9 -- the
 # clamped formula from agents/online_crl_skill_controller.py, verified fixed
 # 2026-09-02) so seeds are directly comparable to the already-finished seed-0
 # runs under <SKILL_CKPT>/online_controller/rlpd/.
@@ -102,7 +102,7 @@ srun "$PYTHON" -u main_online.py \
     --agent.skill_checkpoint_path="$SKILL_CKPT" \
     --agent.skill_restore_epoch="$SKILL_EPOCH" \
     --agent.skill_commitment_k=10 \
-    --agent.target_entropy_multiplier=0.5 \
+    --agent.target_entropy_frac=0.9 \
     --total_env_steps=1000000 \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \

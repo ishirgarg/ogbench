@@ -4,7 +4,7 @@
 #
 # Identical in structure and hyperparameters to
 # run_online_crl_skill_controller_seed.sbatch (same K=10 commitment,
-# target_entropy_multiplier=0.5, 1M env steps, same intervals) -- the only
+# target_entropy_frac=0.9, 1M env steps, same intervals) -- the only
 # difference is that SKILL_CKPT points at a `dds` run instead of an
 # `empowerment_skill` run, so the online controller's seeds are directly
 # comparable across the two skill families.
@@ -103,7 +103,7 @@ srun "$PYTHON" -u main_online.py \
     --agent.skill_checkpoint_path="$SKILL_CKPT" \
     --agent.skill_restore_epoch="$SKILL_EPOCH" \
     --agent.skill_commitment_k=10 \
-    --agent.target_entropy_multiplier=0.5 \
+    --agent.target_entropy_frac=0.9 \
     --total_env_steps=1000000 \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Local (non-Slurm) online skill-controller runs on THIS machine's GPUs with a LOW skill-entropy
-# floor: target_entropy_cap_frac=0.2 instead of the 0.9 default.
+# floor: target_entropy_frac=0.2 instead of the 0.9 default.
 #
-# Why: the default sets H_target = min(0.5*action_dim, 0.9*log K) = min(4.0, 3.521) = 3.521 nats for
-# K=50, i.e. 90% of the maximum possible categorical entropy, and the measured actor entropy sits
+# Why: the default sets H_target = 0.9 * log K = 3.521 nats for K=50, i.e. 90% of the maximum
+# possible categorical entropy, and the measured actor entropy sits
 # exactly on it in every finished run -- the constraint is active and holds the policy near uniform.
 # At 3.521 nats the largest share any one skill can take is 0.236, so a selected skill survives ~13
 # env steps on average at skill_commitment_k=10, while the useful antsoccer skills need 90-200 steps
-# of uninterrupted execution. cap_frac=0.2 gives H_target = 0.782 nats, top-skill share up to ~0.89
+# of uninterrupted execution. frac=0.2 gives H_target = 0.782 nats, top-skill share up to ~0.89
 # and a mean committed run of ~90 env steps. It is a FLOOR, not a setpoint: the dual is non-negative,
 # so if the critic prefers more exploration the temperature decays and the constraint stops acting.
 #
@@ -23,7 +23,7 @@
 # lanes are dealt round-robin over the GPUs, so each GPU runs 2 lanes back to back = 4 runs.
 #
 # Results go to <ckpt>/online_controller_h02/rlpd (center) and
-# <ckpt>/online_controller_corner_h02/rlpd (corner) -- separate trees from the finished cap_frac=0.9
+# <ckpt>/online_controller_corner_h02/rlpd (corner) -- separate trees from the finished frac=0.9
 # sweeps in online_controller/ and online_controller_corner/, so nothing on disk is overwritten.
 #
 # RLPD is on for every run, with the offline dataset defaulting to the checkpoint's own training data.
@@ -44,7 +44,7 @@ PYTHON=${PYTHON:-/nas/ucb/ishirgarg/miniconda3/envs/ogbench/bin/python}
 GPUS=${GPUS:-"0 1"}
 DRY_RUN=${DRY_RUN:-0}
 SEEDS=${SEEDS:-"0 1"}
-CAP_FRAC=${CAP_FRAC:-0.2}
+ENT_FRAC=${ENT_FRAC:-0.2}
 EPISODE_LENGTH=${EPISODE_LENGTH:-500}
 TOTAL_STEPS=${TOTAL_STEPS:-1000000}
 LOG_DIR=${LOG_DIR:-logs/h02_local}
@@ -104,7 +104,7 @@ print(max(int(re.search(r'params_(\d+)\.pkl\$', os.path.basename(p)).group(1)) f
     local log="$LOG_DIR/${kind}_${fam}_s${seed}.log"
     mkdir -p "$save_dir"
 
-    echo "[gpu $gpu] START $kind/$fam seed=$seed env=$env_name cap_frac=$CAP_FRAC -> $log"
+    echo "[gpu $gpu] START $kind/$fam seed=$seed env=$env_name ent_frac=$ENT_FRAC -> $log"
     if [[ "$DRY_RUN" == "1" ]]; then return 0; fi
     # Per-process autotune cache: the shared NAS one is NOT concurrency-safe and kills jobs outright.
     CUDA_VISIBLE_DEVICES="$gpu" \
@@ -118,8 +118,7 @@ print(max(int(re.search(r'params_(\d+)\.pkl\$', os.path.basename(p)).group(1)) f
         --agent.skill_checkpoint_path="$ckpt" \
         --agent.skill_restore_epoch="$epoch" \
         --agent.skill_commitment_k=10 \
-        --agent.target_entropy_multiplier=0.5 \
-        --agent.target_entropy_cap_frac="$CAP_FRAC" \
+        --agent.target_entropy_frac="$ENT_FRAC" \
         --total_env_steps="$TOTAL_STEPS" \
         --episode_length="$EPISODE_LENGTH" \
         --offline_dataset="$ds" \
@@ -154,7 +153,7 @@ for i in "${!LANE_ARR[@]}"; do
     assigned[$g]="${assigned[$g]:-} ${LANE_ARR[$i]}"
 done
 
-echo "GPUs: ${GPU_ARR[*]}   seeds: $SEEDS   cap_frac: $CAP_FRAC   total runs: $(( ${#LANE_ARR[@]} * $(wc -w <<< "$SEEDS") ))"
+echo "GPUs: ${GPU_ARR[*]}   seeds: $SEEDS   ent_frac: $ENT_FRAC   total runs: $(( ${#LANE_ARR[@]} * $(wc -w <<< "$SEEDS") ))"
 for g in "${!GPU_ARR[@]}"; do
     echo "  gpu ${GPU_ARR[$g]} lanes:${assigned[$g]}"
 done

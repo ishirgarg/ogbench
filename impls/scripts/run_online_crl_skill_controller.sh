@@ -37,7 +37,10 @@ SAVE_DIR="$SKILL_CKPT/online_controller/$TAG"
 GPU=${GPU:-0}
 SEED=${SEED:-0}
 K=${K:-10}                        # skill_commitment_k
-ENT=${ENT:-0.5}                   # target_entropy_multiplier (same formula as online_crl)
+ENT_FRAC=${ENT_FRAC:-0.9}         # target_entropy_frac: H_target = frac * log(num_skills)
+LEGACY_ENTROPY=${LEGACY_ENTROPY:-0}   # 1 -> pre-2026-09-13 H_target = min(ENT_MULT*action_dim, ENT_CAP*log K)
+ENT_MULT=${ENT_MULT:-0.5}             # legacy only (LEGACY_ENTROPY=1); ignored otherwise
+ENT_CAP=${ENT_CAP:-0.9}               # legacy only (LEGACY_ENTROPY=1); ignored otherwise
 TOTAL_ENV_STEPS=${TOTAL_ENV_STEPS:-1000000}
 EPISODE_LENGTH=${EPISODE_LENGTH:-}   # empty -> env's registered horizon (must be divisible by K)
 
@@ -48,13 +51,23 @@ fi
 
 LOG_DIR=logs/online_crl_skill_controller
 mkdir -p "$LOG_DIR" "$SAVE_DIR"
-LOG="$LOG_DIR/$(basename "$SKILL_CKPT")_${ENV_NAME}_${TAG}_k${K}_ent${ENT}_s${SEED}.log"
+if [[ "$LEGACY_ENTROPY" == "1" ]]; then
+    ENT_FLAGS=(--agent.use_legacy_entropy=True
+               --agent.target_entropy_multiplier="$ENT_MULT"
+               --agent.target_entropy_cap_frac="$ENT_CAP")
+    ENT_TAG="legacy${ENT_MULT}c${ENT_CAP}"
+else
+    ENT_FLAGS=(--agent.target_entropy_frac="$ENT_FRAC")
+    ENT_TAG="$ENT_FRAC"
+fi
+
+LOG="$LOG_DIR/$(basename "$SKILL_CKPT")_${ENV_NAME}_${TAG}_k${K}_ent${ENT_TAG}_s${SEED}.log"
 EP_FLAG=()
 if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
 RLPD_FLAG=()
 if [[ "$OFFLINE_DATASET" != "none" ]]; then RLPD_FLAG=(--offline_dataset="$OFFLINE_DATASET"); fi
 
-echo "ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET k=$K ent=$ENT gpu=$GPU -> $LOG"
+echo "ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET k=$K ent=$ENT_TAG gpu=$GPU -> $LOG"
 CUDA_VISIBLE_DEVICES=$GPU nohup $PYTHON -u main_online.py \
     --env_name="$ENV_NAME" \
     --seed="$SEED" \
@@ -63,7 +76,7 @@ CUDA_VISIBLE_DEVICES=$GPU nohup $PYTHON -u main_online.py \
     --agent.skill_checkpoint_path="$SKILL_CKPT" \
     --agent.skill_restore_epoch="$SKILL_EPOCH" \
     --agent.skill_commitment_k="$K" \
-    --agent.target_entropy_multiplier="$ENT" \
+    "${ENT_FLAGS[@]}" \
     --total_env_steps="$TOTAL_ENV_STEPS" \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \

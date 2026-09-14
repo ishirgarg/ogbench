@@ -6,7 +6,7 @@
 # Same setup as the empowerment_skill controller sweep
 # (submit_online_crl_skill_controller_rlpd_seeds.sh): RLPD on, offline dataset =
 # each checkpoint's OWN dataset (the data its skills were trained on, read from
-# flags.json by the sbatch script), K=10, target_entropy_multiplier=0.5, 1M env
+# flags.json by the sbatch script), K=10, target_entropy_frac=0.9, 1M env
 # steps. See run_dds_online_controller_seed.sbatch for the exact flags.
 #
 # Online env per checkpoint (the deterministic, noise-free `*-center-` task sets;

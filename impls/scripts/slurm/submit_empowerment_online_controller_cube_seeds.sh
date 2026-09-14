@@ -8,7 +8,7 @@
 # checkpoints); it reuses the very same per-run body,
 # run_online_crl_skill_controller_seed.sbatch, so all online-controller runs share one set
 # of flags: RLPD on with the checkpoint's OWN offline dataset, K=10,
-# target_entropy_multiplier=0.5, 1M env steps, eval every 20k. Seeds are directly
+# target_entropy_frac=0.9, 1M env steps, eval every 20k. Seeds are directly
 # comparable to the DDS cube-single online sweep so the two skill families can be compared.
 #
 # Unlike the other empowerment_final env dirs (one sd000_* run each), cube-single-play

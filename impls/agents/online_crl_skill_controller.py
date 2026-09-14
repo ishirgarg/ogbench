@@ -20,11 +20,16 @@ Built from this repo's primitives (no JaxGCRL networks):
         J = E_s sum_z pi(z | s, g) * (alpha * log pi(z | s, g) - Q(s, z, g)),
     with Q evaluated for *every* skill (critic head 0, no gradient).
   * alpha: `LogParam` auto-tuned with alpha * (H(pi) - H_target),
-    H_target = min(target_entropy_multiplier * action_dim, target_entropy_cap_frac * log(num_skills)).
-    The uncapped term is the same formula and multiplier as `online_crl`'s continuous target entropy,
-    so the two agents are directly comparable; the cap keeps it below the categorical distribution's
-    maximum possible entropy log(num_skills), since an unreachable target sends alpha to infinity and
-    collapses the (temperature=0) eval policy onto one fixed skill regardless of state.
+    H_target = target_entropy_frac * log(num_skills).
+    The target is stated directly in the units of the policy it constrains: a categorical over
+    num_skills attains its maximum entropy log(num_skills) at uniform, so target_entropy_frac in
+    [0, 1] asks for that fraction of the maximum and is reachable by construction. (An unreachable
+    target sends alpha to infinity, which erases the Q-learning signal from the actor loss and
+    collapses the (temperature=0) eval policy onto one fixed skill regardless of state -- verified
+    2026-09-02 on a K=50 checkpoint with a target of 4.0 > log(50) = 3.912.)
+    `use_legacy_entropy=True` restores the pre-2026-09-13 formula,
+    min(target_entropy_multiplier * action_dim, target_entropy_cap_frac * log(num_skills)), for
+    reproducing old runs; see `_resolve_target_entropy`.
 
 Goals are full goal observations (OGBench convention): the behaviour policy sees
 `info['goal']`; training goals are relabelled future observations.
@@ -56,6 +61,94 @@ from utils.networks import GCDiscreteActor, GCDiscreteBilinearCritic, LogParam
 from utils.skill_checkpoint import load_frozen_skill_agent
 
 SKILL_AGENT_CLASSES = dict(empowerment_skill=EmpowermentAgent, dds=DDSAgent)
+
+
+LEGACY_ENTROPY_KEYS = ('target_entropy_multiplier', 'target_entropy_cap_frac')
+
+
+def _resolve_target_entropy(config, num_skills, ex_actions):
+    """Resolve H_target for the categorical pi_hi(z | s, g).
+
+    Default (`use_legacy_entropy=False`):
+
+        H_target = target_entropy_frac * log(num_skills)
+
+    stated in the units of the policy it constrains -- a categorical over num_skills maxes out at
+    log(num_skills) (uniform), so any frac <= 1 is attainable by construction.
+
+    Legacy (`use_legacy_entropy=True`), kept so pre-2026-09-13 runs stay reproducible:
+
+        H_target = min(target_entropy_multiplier * action_dim, target_entropy_cap_frac * log(num_skills))
+
+    where action_dim is the *low-level* env action dimensionality -- unrelated to num_skills, and
+    only ever a live term when the cap does not bind.
+
+    The two paths are mutually exclusive and never silently substitute for one another: setting a
+    legacy knob without the gate (what an un-updated pre-2026-09-13 launcher does) raises, rather
+    than quietly running the new formula under the old flags.
+
+    The one exception is a config with no `use_legacy_entropy` key at all -- a `flags.json` written
+    before the gate existed, replayed by the analysis scripts that rebuild an agent from its own
+    checkpoint. There the legacy knobs are the only entropy knobs the run ever had, so the legacy
+    path is selected automatically and the checkpoint is reproduced rather than rejected.
+    """
+    legacy_values = {k: config.get(k, None) for k in LEGACY_ENTROPY_KEYS}
+    supplied = [k for k, v in legacy_values.items() if v is not None]
+
+    use_legacy = config.get('use_legacy_entropy', None)
+    if use_legacy is None:
+        use_legacy = bool(supplied)
+        if use_legacy:
+            print(
+                '[online_crl_skill_controller] config predates use_legacy_entropy and carries '
+                f'{", ".join(supplied)}; reproducing it on the legacy target-entropy path.'
+            )
+    use_legacy = bool(use_legacy)
+
+    if not use_legacy:
+        if supplied:
+            raise ValueError(
+                f'[online_crl_skill_controller] {", ".join(supplied)} set, but use_legacy_entropy=False. '
+                f'These knobs belong to the pre-2026-09-13 target-entropy formula '
+                f'min(target_entropy_multiplier * action_dim, target_entropy_cap_frac * log(num_skills)) '
+                f'and are ignored by the current one (target_entropy_frac * log(num_skills)). Either drop '
+                f'them and pass --agent.target_entropy_frac, or pass --agent.use_legacy_entropy=True to '
+                f'reproduce an old run verbatim.'
+            )
+        target_entropy = float(config['target_entropy_frac']) * float(np.log(num_skills))
+        print(
+            f'[online_crl_skill_controller] target_entropy = target_entropy_frac * log(num_skills) = '
+            f"{float(config['target_entropy_frac']):.3f} * {float(np.log(num_skills)):.3f} = "
+            f'{target_entropy:.3f} (num_skills={num_skills}).'
+        )
+        return target_entropy
+
+    missing = [k for k in LEGACY_ENTROPY_KEYS if legacy_values[k] is None]
+    if missing:
+        raise ValueError(
+            f'[online_crl_skill_controller] use_legacy_entropy=True requires {", ".join(missing)} to be '
+            f'set explicitly (the legacy defaults were target_entropy_multiplier=0.5, '
+            f'target_entropy_cap_frac=0.9). Pass them, or leave use_legacy_entropy=False to use '
+            f'target_entropy_frac * log(num_skills).'
+        )
+
+    action_dim = ex_actions.shape[-1]
+    uncapped_target_entropy = float(legacy_values['target_entropy_multiplier']) * float(action_dim)
+    max_entropy = float(np.log(num_skills))
+    target_entropy_cap = float(legacy_values['target_entropy_cap_frac']) * max_entropy
+    target_entropy = min(uncapped_target_entropy, target_entropy_cap)
+    # An unreachable target sends alpha to infinity, which erases the Q-learning signal from the
+    # actor loss and collapses the (deterministic, temperature=0) eval policy onto one fixed skill
+    # regardless of state (verified 2026-09-02: alpha reached ~1e17 by 1M steps on a K=50 checkpoint
+    # with the unclamped multiplier * action_dim = 4.0 > log(50) = 3.912). The cap is what prevents
+    # that here -- hence the legacy path's min().
+    print(
+        f'[online_crl_skill_controller] LEGACY target_entropy = min(multiplier * action_dim, '
+        f'cap_frac * log(num_skills)) = min({uncapped_target_entropy:.3f}, {target_entropy_cap:.3f}) = '
+        f'{target_entropy:.3f} (action_dim={action_dim}, num_skills={num_skills}); '
+        f'target_entropy_frac is ignored on this path.'
+    )
+    return target_entropy
 
 
 class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
@@ -418,26 +511,7 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
         stored_config['skill_restore_epoch'] = resolved['restore_epoch']
         stored_config['skill_checkpoint_path'] = resolved['ckpt_path']
         stored_config['skill_agent_name'] = resolved['agent_name']
-        # Same formula as online_crl's target entropy (-> `target_entropy_multiplier`), evaluated on
-        # the low-level action_dim, so the two agents are directly comparable -- but a categorical
-        # over num_skills can never exceed log(num_skills), so clamp to a margin below that ceiling.
-        # An unreachable target sends alpha to infinity, which erases the Q-learning signal from the
-        # actor loss and collapses the (deterministic, temperature=0) eval policy onto one fixed skill
-        # regardless of state (verified 2026-09-02: alpha reached ~1e17 by 1M steps on a K=50
-        # checkpoint with the unclamped multiplier*action_dim=4.0 > log(50)=3.912).
-        action_dim = ex_actions.shape[-1]
-        uncapped_target_entropy = float(config['target_entropy_multiplier']) * float(action_dim)
-        max_entropy = float(np.log(num_skills))
-        target_entropy_cap = float(config['target_entropy_cap_frac']) * max_entropy
-        target_entropy = min(uncapped_target_entropy, target_entropy_cap)
-        if uncapped_target_entropy > target_entropy_cap:
-            print(
-                f'[online_crl_skill_controller] target_entropy clamped: target_entropy_multiplier * '
-                f'action_dim = {uncapped_target_entropy:.3f} exceeds target_entropy_cap_frac * '
-                f'log(num_skills) = {target_entropy_cap:.3f} (num_skills={num_skills}); using '
-                f'{target_entropy:.3f}.'
-            )
-        stored_config['target_entropy'] = target_entropy
+        stored_config['target_entropy'] = _resolve_target_entropy(config, num_skills, ex_actions)
         # Future-goal sampling discount per macro-row: gamma^k (gamma measured in env steps).
         stored_config['goal_discount'] = float(config['discount']) ** int(config['skill_commitment_k'])
 
@@ -464,8 +538,10 @@ def get_config():
             # SMDP.
             skill_commitment_k=20,  # Fixed temporal commitment: env steps per high-level decision.
             gamma_low=1.0,  # Intra-macro-step reward discount (bookkeeping only; the learner ignores rewards).
-            target_entropy_multiplier=0.5,  # H_target = multiplier * action_dim (same formula as online_crl).
-            target_entropy_cap_frac=0.9,  # H_target is also clamped to <= cap_frac * log(num_skills) (reachable).
+            target_entropy_frac=0.9,  # H_target = frac * log(num_skills) (frac <= 1 -> always reachable).
+            use_legacy_entropy=False,  # True -> pre-2026-09-13 H_target (requires both knobs below).
+            target_entropy_multiplier=ml_collections.config_dict.placeholder(float),  # Legacy only; raises unless use_legacy_entropy.
+            target_entropy_cap_frac=ml_collections.config_dict.placeholder(float),  # Legacy only; raises unless use_legacy_entropy.
             # Online schedule (consumed by main_online.py); units are macro-steps.
             unroll_length=50,  # Macro-steps collected between update rounds.
             utd_ratio=1,  # Gradient steps per macro-step; each round runs unroll_length * utd_ratio updates.
