@@ -214,7 +214,7 @@ PY
         --total_env_steps="$TOTAL_ENV_STEPS" \
         "${EP_FLAG[@]}" \
         --log_interval=5000 \
-        --eval_interval=20000 \
+        --eval_interval=50000 \
         --save_interval=100000 \
         --eval_episodes=50 \
         --video_episodes=0 \
