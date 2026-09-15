@@ -64,7 +64,7 @@
 # BEFORE SUBMITTING, confirm on BRC (written on the rnn side, cannot see /global/*; each item
 # is preflighted per-run below and fails with a specific message):
 #   1. the checkout at $IMPLS_DIR contains agents/online_composed_skill_policy.py (2026-09-15),
-#   2. the three empowerment_skill checkpoints exist under $CKPT_ROOT,
+#   2. the three exp_names in CELL_RUNS exist under $CKPT_ROOT (the flat OGBench/Debug tree),
 #   3. the three OGBench datasets are present for RLPD (compute nodes may have no internet),
 #   4. `python` on the compute node is the env with jax/flax/ogbench installed.
 #
@@ -86,6 +86,10 @@ IMPLS_DIR=${IMPLS_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
 # other rail scripts use for WANDB_DIR and their save dirs.
 SCRATCH_ROOT=${SCRATCH_ROOT:-/global/scratch/users/ishirgarg/ogbench}
 SAVE_ROOT=${SAVE_ROOT:-$SCRATCH_ROOT/composed_reinforce}
+# Pretrained runs live in the flat main.py save tree on BRC -- <save_dir>/<project>/<run_group>/
+# <exp_name> -- NOT in an env-named ckpts/final/... tree as on rnn. The exp_name of a given run
+# is the same on both clusters, so the cells below address them by exp_name directly.
+CKPT_ROOT=${CKPT_ROOT:-$SCRATCH_ROOT/OGBench/Debug}
 # Local wandb run data goes to scratch too.
 export WANDB_DIR=${WANDB_DIR:-$SCRATCH_ROOT}
 mkdir -p "$WANDB_DIR"
@@ -95,13 +99,25 @@ JOBS_PER_GPU=${JOBS_PER_GPU:-8}
 # -----------------------------
 # Sweep definitions
 # -----------------------------
-# cube-single-play is given as an explicit leaf: that env dir holds FIVE sd000_* runs and this
-# is the one every other sweep in this project uses. The other two are env dirs holding exactly
-# one sd000_* run, resolved below.
-CELL_CKPTS=(
-    "antsoccer-arena-navigate"
-    "pointmaze-teleport-stitch"
-    "cube-single-play/sd000_s_38624008.0.20260908_013305"
+# The three pretrained 50-skill empowerment_skill runs, by exp_name under $CKPT_ROOT. These are
+# the same runs the rnn sweep uses (there they sit under ckpts/final/empowerment_final/<env>/),
+# and the exp_name is identical on both clusters. CELL_DATASETS is the env_name each one was
+# trained on; it is checked against the checkpoint's own flags.json, so a wrong or stale
+# exp_name fails loudly instead of silently training on the wrong cell.
+CELL_RUNS=(
+    "sd000_s_38390672.0.20260901_154836"
+    "sd000_s_38390675.0.20260901_154836"
+    "sd000_s_38624008.0.20260908_013305"
+)
+CELL_NAMES=(
+    antsoccer-arena-navigate
+    pointmaze-teleport-stitch
+    cube-single-play
+)
+CELL_DATASETS=(
+    antsoccer-arena-navigate-v0
+    pointmaze-teleport-stitch-v0
+    cube-single-play-v0
 )
 CELL_ENVS=(
     antsoccer-arena-center-online-v0
@@ -113,9 +129,14 @@ CELL_EPISODE_LENGTHS=(500 "" "")
 LOW_LRS=(3e-4 1e-4 3e-5)
 ENTROPY_FRACS=(0.1 0.5 0.25)
 NUM_SEEDS=5
-NUM_CONFIGS=$(( ${#CELL_CKPTS[@]} * ${#LOW_LRS[@]} * ${#ENTROPY_FRACS[@]} * NUM_SEEDS ))   # 135
+NUM_CONFIGS=$(( ${#CELL_NAMES[@]} * ${#LOW_LRS[@]} * ${#ENTROPY_FRACS[@]} * NUM_SEEDS ))   # 135
 
 GRAD_METHOD=reinforce
+
+# A renamed sweep array once left NUM_CONFIGS unset, and because `set -u` only warns here the
+# launch loop silently started ZERO runs while the task still exited 0. Fail instead.
+(( NUM_CONFIGS > 0 )) || { echo "FATAL: NUM_CONFIGS did not evaluate (sweep arrays renamed?)." >&2; exit 1; }
+(( NUM_CONFIGS == 135 )) || echo "NOTE: NUM_CONFIGS=$NUM_CONFIGS (expected 135); --array must be 0-$(( (NUM_CONFIGS + JOBS_PER_GPU - 1) / JOBS_PER_GPU - 1 ))." >&2
 
 cd "$IMPLS_DIR" || { echo "FATAL: no ogbench checkout at IMPLS_DIR=$IMPLS_DIR" >&2; exit 1; }
 [[ -f main_online.py ]] || {
@@ -124,33 +145,22 @@ cd "$IMPLS_DIR" || { echo "FATAL: no ogbench checkout at IMPLS_DIR=$IMPLS_DIR" >
 [[ -f agents/online_composed_skill_policy.py ]] || {
     echo "FATAL: $IMPLS_DIR has no agents/online_composed_skill_policy.py -- pull master, which has it." >&2; exit 1; }
 
-# Pretrained 50-skill empowerment checkpoints: take CKPT_ROOT if set, else the first of the
-# plausible BRC locations that actually exists, rather than guessing one.
-if [[ -z "${CKPT_ROOT:-}" ]]; then
-    for cand in "$SCRATCH_ROOT/ckpts/final/empowerment_final" "$IMPLS_DIR/ckpts/final/empowerment_final"; do
-        if [[ -d "$cand" ]]; then CKPT_ROOT="$cand"; break; fi
-    done
-fi
-if [[ -z "${CKPT_ROOT:-}" || ! -d "$CKPT_ROOT" ]]; then
-    echo "FATAL: no empowerment_final checkpoint tree found. Tried" >&2
-    echo "       $SCRATCH_ROOT/ckpts/final/empowerment_final and $IMPLS_DIR/ckpts/final/empowerment_final." >&2
-    echo "       Set CKPT_ROOT=<dir containing antsoccer-arena-navigate/, pointmaze-teleport-stitch/, ...>." >&2
-    exit 1
-fi
+[[ -d "$CKPT_ROOT" ]] || {
+    echo "FATAL: CKPT_ROOT=$CKPT_ROOT does not exist. It should be the main.py save tree holding the" >&2
+    echo "       pretrained runs, i.e. <save_dir>/<project>/<run_group> (e.g. .../ogbench/OGBench/Debug)." >&2
+    exit 1; }
 echo "using IMPLS_DIR=$IMPLS_DIR  CKPT_ROOT=$CKPT_ROOT  SAVE_ROOT=$SAVE_ROOT" 
 
-# Resolve a cell's checkpoint dir: (a) an exact leaf with flags.json, or (b) an env dir holding
-# exactly one sd000_* run. Echoes the resolved path.
+# A cell's checkpoint is $CKPT_ROOT/<exp_name>. Echoes it, or fails naming what it looked for.
 resolve_ckpt() {
     local d="$CKPT_ROOT/$1"
-    if [[ -f "$d/flags.json" ]]; then echo "$d"; return 0; fi
-    local m=("$d"/sd000_*/)
-    if (( ${#m[@]} != 1 )) || [[ ! -d "${m[0]}" ]]; then
-        echo "FATAL: no flags.json in $d and not exactly one sd000_* run under it." >&2
-        echo "       Set CKPT_ROOT to where the empowerment_final checkpoints live on BRC." >&2
+    if [[ ! -f "$d/flags.json" ]]; then
+        echo "FATAL: no flags.json at $d" >&2
+        echo "       Expected the pretrained run '$1' directly under CKPT_ROOT=$CKPT_ROOT." >&2
+        echo "       Available there: $(ls -d "$CKPT_ROOT"/sd* 2>/dev/null | head -3 | xargs -n1 basename 2>/dev/null | tr '\n' ' ')..." >&2
         return 1
     fi
-    echo "${m[0]%/}"
+    echo "$d"
 }
 
 # -----------------------------
@@ -168,13 +178,15 @@ for (( j=0; j<JOBS_PER_GPU; j++ )); do
     ENT_IDX=$(( (CFG / 5) % 3 ))
     SEED=$(( CFG % 5 ))
 
-    CELL=${CELL_CKPTS[$CELL_IDX]}
+    CELL=${CELL_NAMES[$CELL_IDX]}
+    CELL_RUN=${CELL_RUNS[$CELL_IDX]}
+    EXPECT_DATASET=${CELL_DATASETS[$CELL_IDX]}
     ENV_NAME=${CELL_ENVS[$CELL_IDX]}
     EPISODE_LENGTH=${CELL_EPISODE_LENGTHS[$CELL_IDX]}
     LOW_LR=${LOW_LRS[$LR_IDX]}
     TARGET_ENTROPY_FRAC=${ENTROPY_FRACS[$ENT_IDX]}
 
-    SKILL_CKPT=$(resolve_ckpt "$CELL") || exit 1
+    SKILL_CKPT=$(resolve_ckpt "$CELL_RUN") || exit 1
     compgen -G "$SKILL_CKPT/params_*.pkl" > /dev/null || { echo "FATAL: no params_*.pkl in $SKILL_CKPT" >&2; exit 1; }
 
     read -r AGENT_NAME NUM_SKILLS SKILL_DATASET < <(python - "$SKILL_CKPT" <<'PY'
@@ -185,6 +197,9 @@ PY
 )
     [[ "$AGENT_NAME" == "empowerment_skill" ]] || { echo "FATAL: $SKILL_CKPT is a $AGENT_NAME run, expected empowerment_skill" >&2; exit 1; }
     [[ "$NUM_SKILLS" == "50" ]] || { echo "FATAL: $SKILL_CKPT has num_skills=$NUM_SKILLS, expected 50" >&2; exit 1; }
+    [[ "$SKILL_DATASET" == "$EXPECT_DATASET" ]] || {
+        echo "FATAL: $SKILL_CKPT was trained on $SKILL_DATASET, but cell '$CELL' expects $EXPECT_DATASET." >&2
+        echo "       The exp_name in CELL_RUNS is wrong or names a different run on this cluster." >&2; exit 1; }
 
     SKILL_EPOCH=$(python - "$SKILL_CKPT" <<'PY'
 import glob, os, re, sys
@@ -207,14 +222,14 @@ PY
         exit 1
     fi
 
-    SAVE_DIR="$SAVE_ROOT/$(basename "$CELL")/rlpd_lowlr${LOW_LR}_ent${TARGET_ENTROPY_FRAC}_${GRAD_METHOD}"
+    SAVE_DIR="$SAVE_ROOT/$CELL/rlpd_lowlr${LOW_LR}_ent${TARGET_ENTROPY_FRAC}_${GRAD_METHOD}"
     mkdir -p "$SAVE_DIR"
     RUN_LOG="$SAVE_DIR/launch_seed${SEED}_${SLURM_JOB_ID:-local}.log"
 
     EP_FLAG=()
     if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
 
-    TAG="cfg${CFG}[$(basename "$CELL") lr=$LOW_LR ent=$TARGET_ENTROPY_FRAC seed=$SEED]"
+    TAG="cfg${CFG}[$CELL lr=$LOW_LR ent=$TARGET_ENTROPY_FRAC seed=$SEED]"
     echo "LAUNCH $TAG"
     echo "   ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH  rlpd=$SKILL_DATASET from $DS_DIR"
     echo "   env=$ENV_NAME ep_len=${EPISODE_LENGTH:-<registered>}  log=$RUN_LOG"
