@@ -68,8 +68,9 @@
 #   3. the three OGBench datasets are present for RLPD (compute nodes may have no internet),
 #   4. `python` on the compute node is the env with jax/flax/ogbench installed.
 #
-# Overrides (env vars): CKPT_ROOT, SAVE_ROOT, IMPLS_DIR, OGBENCH_DATASET_DIR, TOTAL_ENV_STEPS,
-#                       JOBS_PER_GPU.
+# Submit from the impls/ directory:  cd <repo>/impls && sbatch scripts/<this file>
+# Overrides (env vars): CKPT_ROOT, SAVE_ROOT, SCRATCH_ROOT, IMPLS_DIR, OGBENCH_DATASET_DIR,
+#                       TOTAL_ENV_STEPS, JOBS_PER_GPU.
 
 set -uo pipefail
 
@@ -77,17 +78,17 @@ export MUJOCO_GL=egl
 # Mandatory for GPU packing -- see above.
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-# Local wandb run data goes to BRC scratch (home quota is small).
-export WANDB_DIR=${WANDB_DIR:-/global/scratch/users/ishirgarg/ogbench}
+# The checkout is wherever you ran `sbatch` from -- the same convention as the other rail
+# sbatch scripts (run_empowerment_skill_resume_*.sh, run_dds_resume_*.sh), which just call
+# `python main.py` and let Slurm put the job in the submit directory. No hardcoded prefix.
+IMPLS_DIR=${IMPLS_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
+# Everything BRC-side lives under scratch (home quota is small); this is the same root the
+# other rail scripts use for WANDB_DIR and their save dirs.
+SCRATCH_ROOT=${SCRATCH_ROOT:-/global/scratch/users/ishirgarg/ogbench}
+SAVE_ROOT=${SAVE_ROOT:-$SCRATCH_ROOT/composed_reinforce}
+# Local wandb run data goes to scratch too.
+export WANDB_DIR=${WANDB_DIR:-$SCRATCH_ROOT}
 mkdir -p "$WANDB_DIR"
-
-IMPLS_DIR=${IMPLS_DIR:-/global/home/users/ishirgarg/ogbench/impls}
-# Pretrained 50-skill empowerment checkpoints. Mirrors the rnn layout
-# (<repo>/impls/ckpts/final/empowerment_final); override if BRC keeps them elsewhere.
-CKPT_ROOT=${CKPT_ROOT:-$IMPLS_DIR/ckpts/final/empowerment_final}
-# Checkpoints/logs go to scratch, NOT next to the pretrained run as on rnn: $CKPT_ROOT may sit
-# under /global/home, whose quota is small.
-SAVE_ROOT=${SAVE_ROOT:-/global/scratch/users/ishirgarg/ogbench/composed_reinforce}
 TOTAL_ENV_STEPS=${TOTAL_ENV_STEPS:-1000000}
 JOBS_PER_GPU=${JOBS_PER_GPU:-8}
 
@@ -117,8 +118,26 @@ NUM_CONFIGS=$(( ${#CELL_CKPTS[@]} * ${#LOW_LRS[@]} * ${#ENTROPY_FRACS[@]} * NUM_
 GRAD_METHOD=reinforce
 
 cd "$IMPLS_DIR" || { echo "FATAL: no ogbench checkout at IMPLS_DIR=$IMPLS_DIR" >&2; exit 1; }
+[[ -f main_online.py ]] || {
+    echo "FATAL: $IMPLS_DIR is not the impls/ directory (no main_online.py). Submit with" >&2
+    echo "       'cd <repo>/impls && sbatch scripts/$(basename "$0")', or set IMPLS_DIR." >&2; exit 1; }
 [[ -f agents/online_composed_skill_policy.py ]] || {
-    echo "FATAL: $IMPLS_DIR has no agents/online_composed_skill_policy.py -- pull the branch that adds it." >&2; exit 1; }
+    echo "FATAL: $IMPLS_DIR has no agents/online_composed_skill_policy.py -- pull master, which has it." >&2; exit 1; }
+
+# Pretrained 50-skill empowerment checkpoints: take CKPT_ROOT if set, else the first of the
+# plausible BRC locations that actually exists, rather than guessing one.
+if [[ -z "${CKPT_ROOT:-}" ]]; then
+    for cand in "$SCRATCH_ROOT/ckpts/final/empowerment_final" "$IMPLS_DIR/ckpts/final/empowerment_final"; do
+        if [[ -d "$cand" ]]; then CKPT_ROOT="$cand"; break; fi
+    done
+fi
+if [[ -z "${CKPT_ROOT:-}" || ! -d "$CKPT_ROOT" ]]; then
+    echo "FATAL: no empowerment_final checkpoint tree found. Tried" >&2
+    echo "       $SCRATCH_ROOT/ckpts/final/empowerment_final and $IMPLS_DIR/ckpts/final/empowerment_final." >&2
+    echo "       Set CKPT_ROOT=<dir containing antsoccer-arena-navigate/, pointmaze-teleport-stitch/, ...>." >&2
+    exit 1
+fi
+echo "using IMPLS_DIR=$IMPLS_DIR  CKPT_ROOT=$CKPT_ROOT  SAVE_ROOT=$SAVE_ROOT" 
 
 # Resolve a cell's checkpoint dir: (a) an exact leaf with flags.json, or (b) an env dir holding
 # exactly one sd000_* run. Echoes the resolved path.
