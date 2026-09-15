@@ -117,6 +117,29 @@ class TrajectoryReplayBuffer:
         abs_idx = self._write_row(transition, valid=valid)
         self.num_transitions += int(valid)
         self._open_rows.append(abs_idx)
+        return abs_idx
+
+    # ── Field access by absolute index ───────────────────────────────────────
+
+    def read_field(self, key, abs_idxs):
+        """Values of stored field `key` at absolute row indices (all must still be in the buffer)."""
+        abs_idxs = np.asarray(abs_idxs, dtype=np.int64)
+        assert np.all(abs_idxs >= self._oldest_abs()) and np.all(abs_idxs < self.total), (
+            'read_field: some rows have already been evicted (or were never written)'
+        )
+        return self._data[key][self._slot(abs_idxs)]
+
+    def write_field(self, key, abs_idxs, values):
+        """Overwrite stored field `key` at absolute row indices (rows that were added with a placeholder)."""
+        abs_idxs = np.asarray(abs_idxs, dtype=np.int64)
+        assert np.all(abs_idxs >= self._oldest_abs()) and np.all(abs_idxs < self.total), (
+            'write_field: some rows have already been evicted (or were never written)'
+        )
+        self._data[key][self._slot(abs_idxs)] = values
+
+    def valid_field(self, key):
+        """Values of stored field `key` over every valid (sampleable) row currently held."""
+        return self._data[key][np.flatnonzero(self._valids[: self.size])]
 
     def end_trajectory(self, final_observation):
         """Close the in-progress trajectory with a marker row holding its final observation."""

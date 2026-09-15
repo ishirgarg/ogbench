@@ -1,39 +1,40 @@
 #!/usr/bin/env bash
-# Single online_crl_skill_controller run on top of a FROZEN **DDS** skill
-# checkpoint, with RLPD, for the rnn.ist.berkeley.edu Slurm cluster.
+# Single online_crl_skill_controller run on top of a FROZEN **Skill-DT** skill
+# checkpoint (agents/skill_dt.py, arXiv:2301.13573), with RLPD, for the
+# rnn.ist.berkeley.edu Slurm cluster.
 #
-# Identical in structure and hyperparameters to
-# run_online_crl_skill_controller_seed.sbatch (same K=10 commitment,
-# target_entropy_frac=0.9, 1M env steps, same intervals) -- the only
-# difference is that SKILL_CKPT points at a `dds` run instead of an
-# `empowerment_skill` run, so the online controller's seeds are directly
-# comparable across the two skill families.
+# Identical in structure and hyperparameters to run_dds_online_controller_seed.sbatch
+# (same K=10 commitment, target_entropy_frac=0.9, 1M env steps, same intervals) --
+# the only difference is that SKILL_CKPT points at a `skill_dt` run, so the online
+# controller's seeds are directly comparable across the three skill families.
 #
-# Why K=10 specifically: utils/skill_checkpoint.py loads the DDS agent and the
-# controller's DDS offline-window labeller (online_crl_skill_controller.py)
-# REQUIRES skill_commitment_k == the checkpoint's `sequence_length`, which is 10
-# for all five ckpts/final/dds runs. main_online.py also requires
-# episode_horizon % k == 0, which holds for 1000 and 500.
+# What differs inside for Skill-DT (agents/online_crl_skill_controller.py):
+#   * the low level is STATEFUL: the frozen Transformer keeps its K-step context
+#     (paper Sec. A.5) across env steps and across the controller's skill switches;
+#     a skill is executed by filling the unvisited tail of the future-skill
+#     histogram with it over the remaining episode horizon;
+#   * RLPD labels come from the frozen VQ encoder: every offline state gets its
+#     codebook index, each k-window the most frequent one (--agent.skill_dt_label_mode).
+# Unlike DDS, nothing ties K to the checkpoint (the encoder is per-state), so K=10
+# is the shared convention rather than a requirement; main_online.py still needs
+# episode_horizon % K == 0.
 #
 # See run_online_crl_seed.sbatch for the cluster-specific notes this mirrors
-# (wandb key file, NAS dataset cache, JAX compile cache) -- read those before
-# submitting if you haven't already.
+# (wandb key file, NAS dataset cache, JAX compile cache).
 #
-# Usage (normally invoked by scripts/slurm/submit_dds_online_controller_seeds.sh):
+# Usage:
 #   sbatch --job-name=<name> --output=<log> \
-#       scripts/slurm/run_dds_online_controller_seed.sbatch \
+#       scripts/slurm/run_skill_dt_online_controller_seed.sbatch \
 #       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH] [SAVE_SUBDIR] [TARGET_ENTROPY_FRAC]
 #
 # OFFLINE_DATASET is optional; omit (or pass "") to use SKILL_CKPT's own dataset
-# (its flags.json env_name) -- i.e. exactly the data the DDS skills were trained
-# on, which is what we want for RLPD. Pass "none" to disable RLPD.
+# (its flags.json env_name), i.e. exactly the data the Skill-DT skills were
+# discovered on. Pass "none" to disable RLPD.
 # EPISODE_LENGTH is optional; omit to use the env's registered horizon
-# (antsoccer-arena-center-online-v0 needs 500 -- the submit script passes it).
-# TARGET_ENTROPY_FRAC is optional (7th positional arg); omit (or pass "") to keep
-# the 0.9 default every existing caller relies on. Added 2026-09-13 for
-# submit_pmt_asoc_cube_entropy_sweep.sh, which sweeps this non-legacy
-# target_entropy_frac knob (target_entropy = frac * log(num_skills)) explicitly.
-#SBATCH --job-name=dds_online_controller
+# (antsoccer-arena-center-online-v0 needs 500).
+# SAVE_SUBDIR (default online_controller) and TARGET_ENTROPY_FRAC (default 0.9)
+# behave as in the DDS launcher.
+#SBATCH --job-name=skill_dt_online_controller
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16gb
 #SBATCH --gpus=1
@@ -41,9 +42,9 @@
 #SBATCH --qos=default
 set -euo pipefail
 
-SKILL_CKPT=${1:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
-ENV_NAME=${2:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
-SEED=${3:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
+SKILL_CKPT=${1:?usage: run_skill_dt_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
+ENV_NAME=${2:?usage: run_skill_dt_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
+SEED=${3:?usage: run_skill_dt_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
 OFFLINE_DATASET=${4:-}
 EPISODE_LENGTH=${5:-}
 # Optional 6th arg: the per-checkpoint subdirectory results are written to. Defaults to
@@ -62,7 +63,7 @@ WANDB_KEY_FILE=/nas/ucb/ishirgarg/.wandb_api_key
 if [[ -r "$WANDB_KEY_FILE" ]]; then
     export WANDB_API_KEY="$(<"$WANDB_KEY_FILE")"
 else
-    echo "[run_dds_online_controller_seed] WARNING: $WANDB_KEY_FILE not readable; wandb logging will likely fail." >&2
+    echo "[run_skill_dt_online_controller_seed] WARNING: $WANDB_KEY_FILE not readable; wandb logging will likely fail." >&2
 fi
 export TMPDIR=/nas/ttl=60d/ishirgarg/tmp
 mkdir -p "$TMPDIR"
@@ -116,7 +117,7 @@ if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH")
 SAVE_DIR="$SKILL_CKPT/$SAVE_SUBDIR/$TAG"
 mkdir -p "$SAVE_DIR"
 
-echo "[run_dds_online_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC use_tes=$USE_TES job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_skill_dt_online_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC use_tes=$USE_TES job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \

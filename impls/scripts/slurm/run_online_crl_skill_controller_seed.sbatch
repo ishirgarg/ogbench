@@ -100,6 +100,13 @@ if [[ -z "$OFFLINE_DATASET" ]]; then OFFLINE_DATASET="$SKILL_DATASET"; fi
 TAG=rlpd
 RLPD_FLAG=(--offline_dataset="$OFFLINE_DATASET")
 if [[ "$OFFLINE_DATASET" == "none" ]]; then TAG=norlpd; RLPD_FLAG=(); fi
+# RLPD_FRAC_TIME (env var, optional): --rlpd_frac_time, the fraction of total_env_steps during
+# which offline data is mixed in; batches are online-only afterwards (main_online.py, default 1.0).
+# Only meaningful with RLPD on; the tag gets a "_ft<frac>" suffix so save dirs / logs do not collide.
+if [[ -n "${RLPD_FRAC_TIME:-}" && ${#RLPD_FLAG[@]} -gt 0 ]]; then
+    RLPD_FLAG+=(--rlpd_frac_time="$RLPD_FRAC_TIME")
+    TAG="${TAG}_ft${RLPD_FRAC_TIME}"
+fi
 THRESHOLD_FLAG=()
 if [[ -n "$LOGLIK_THRESHOLD" ]]; then
     if [[ "$TAG" == "norlpd" ]]; then
@@ -108,12 +115,23 @@ if [[ -n "$LOGLIK_THRESHOLD" ]]; then
     fi
     THRESHOLD_FLAG=(--agent.offline_loglik_threshold="$LOGLIK_THRESHOLD")
 fi
+# USE_TES (env var, default 0): 1 -> --agent.use_tes=True, TES-SAC target entropy annealing
+# (Xu et al. 2021, arXiv:2112.02852; agents/online_crl_skill_controller.py). The target then
+# starts at TARGET_ENTROPY_FRAC * log(num_skills) (paper: frac 1.0) and is multiplied by 0.9
+# whenever the batch policy entropy stabilises at it. TES_PATIENCE (env var, optional)
+# overrides agent.tes_patience, the paper's unspecified T (default 500 gradient steps).
+USE_TES=${USE_TES:-0}
+TES_FLAG=()
+if [[ "$USE_TES" == "1" ]]; then
+    TES_FLAG=(--agent.use_tes=True)
+    if [[ -n "${TES_PATIENCE:-}" ]]; then TES_FLAG+=(--agent.tes_patience="$TES_PATIENCE"); fi
+fi
 EP_FLAG=()
 if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
 SAVE_DIR="$SKILL_CKPT/$SAVE_SUBDIR/$TAG"
 mkdir -p "$SAVE_DIR"
 
-echo "[run_online_crl_skill_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC loglik_threshold=${LOGLIK_THRESHOLD:-<none>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_online_crl_skill_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC use_tes=$USE_TES loglik_threshold=${LOGLIK_THRESHOLD:-<none>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -127,6 +145,7 @@ srun "$PYTHON" -u main_online.py \
     --total_env_steps=1000000 \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \
+    "${TES_FLAG[@]}" \
     "${THRESHOLD_FLAG[@]}" \
     --log_interval=5000 \
     --eval_interval=20000 \

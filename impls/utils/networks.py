@@ -92,6 +92,20 @@ class LogParam(nn.Module):
         return jnp.exp(log_value)
 
 
+class LogParamVector(nn.Module):
+    """`size` independent log-scale scalar parameters (e.g. one entropy temperature per state bin)."""
+
+    size: int
+    init_value: float = 1.0
+
+    @nn.compact
+    def __call__(self):
+        log_values = self.param(
+            'log_values', init_fn=lambda key: jnp.full((self.size,), jnp.log(self.init_value))
+        )
+        return jnp.exp(log_values)
+
+
 class TransformedWithMode(distrax.Transformed):
     """Transformed distribution with mode calculation."""
 

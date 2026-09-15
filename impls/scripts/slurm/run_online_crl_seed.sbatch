@@ -92,10 +92,30 @@ if [[ "$OFFLINE_DATASET" != "none" ]]; then
     RLPD_FLAG=(--offline_dataset="$OFFLINE_DATASET")
     TAG=rlpd
 fi
+# RLPD_FRAC_TIME (env var, optional): --rlpd_frac_time, the fraction of total_env_steps during
+# which offline data is mixed in; batches are online-only afterwards (main_online.py, default 1.0).
+# Only meaningful with RLPD on; the tag gets a "_ft<frac>" suffix so save dirs / logs do not collide.
+if [[ -n "${RLPD_FRAC_TIME:-}" && ${#RLPD_FLAG[@]} -gt 0 ]]; then
+    RLPD_FLAG+=(--rlpd_frac_time="$RLPD_FRAC_TIME")
+    TAG="${TAG}_ft${RLPD_FRAC_TIME}"
+fi
 EP_FLAG=()
 if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
+# EMP_CKPT_DIR (env var, optional; sbatch exports the submitter's environment): a frozen
+# empowerment_skill run dir for agents/online_crl.py's empowerment-modulated entropy target,
+# with EMP_LAMBDA (1.0), EMP_NUM_BINS (8), EMP_NUM_SPLUS_SAMPLES (64). Tag suffix "_emp<lambda>".
+EMP_FLAG=()
+if [[ -n "${EMP_CKPT_DIR:-}" ]]; then
+    EMP_FLAG=(
+        --agent.emp_checkpoint_path="$EMP_CKPT_DIR"
+        --agent.emp_lambda="${EMP_LAMBDA:-1.0}"
+        --agent.emp_num_bins="${EMP_NUM_BINS:-8}"
+        --agent.emp_num_splus_samples="${EMP_NUM_SPLUS_SAMPLES:-64}"
+    )
+    TAG="${TAG}_emp${EMP_LAMBDA:-1.0}"
+fi
 
-echo "[run_online_crl_seed] env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_online_crl_seed] env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} emp=${EMP_CKPT_DIR:-off} tag=$TAG job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -104,6 +124,7 @@ srun "$PYTHON" -u main_online.py \
     --total_env_steps=1000000 \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \
+    "${EMP_FLAG[@]}" \
     --log_interval=5000 \
     --eval_interval=20000 \
     --save_interval=100000 \

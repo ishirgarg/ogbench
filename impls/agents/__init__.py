@@ -1,4 +1,5 @@
 from agents.bc import BCAgent
+from agents.composed_skill_policy import ComposedSkillPolicyAgent
 from agents.crl import CRLAgent
 from agents.dads import DADSAgent
 from agents.ddpgbc import DDPGBCAgent
@@ -13,6 +14,7 @@ from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
 from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
+from agents.online_composed_skill_policy import OnlineComposedSkillPolicyAgent
 from agents.online_crl import OnlineCRLAgent
 from agents.online_crl_skill_controller import OnlineCRLSkillControllerAgent
 from agents.opal import OPALAgent
@@ -30,6 +32,7 @@ from agents.vq_bet import VQBeTAgent
 
 agents = dict(
     bc=BCAgent,
+    composed_skill_policy=ComposedSkillPolicyAgent,
     crl=CRLAgent,
     dads=DADSAgent,
     ddpgbc=DDPGBCAgent,
@@ -44,6 +47,7 @@ agents = dict(
     gciql=GCIQLAgent,
     gcivl=GCIVLAgent,
     hiql=HIQLAgent,
+    online_composed_skill_policy=OnlineComposedSkillPolicyAgent,
     online_crl=OnlineCRLAgent,
     online_crl_skill_controller=OnlineCRLSkillControllerAgent,
     opal=OPALAgent,

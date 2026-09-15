@@ -32,6 +32,9 @@ print(max(int(re.search(r'params_(\d+)\.pkl\$', os.path.basename(p)).group(1))
 SKILL_DATASET=$($PYTHON -c "import json,sys; print(json.load(open(sys.argv[1] + '/flags.json'))['env_name'])" "$SKILL_CKPT")
 OFFLINE_DATASET=${OFFLINE_DATASET:-$SKILL_DATASET}   # "none" -> no RLPD
 TAG=rlpd; [[ "$OFFLINE_DATASET" == "none" ]] && TAG=norlpd
+# RLPD_FRAC_TIME (env var, optional): fraction of total_env_steps with offline data mixed in
+# (online-only afterwards); suffixes the tag so save dirs / logs do not collide with full-RLPD runs.
+if [[ -n "${RLPD_FRAC_TIME:-}" && "$TAG" == "rlpd" ]]; then TAG="${TAG}_ft${RLPD_FRAC_TIME}"; fi
 SAVE_DIR="$SKILL_CKPT/online_controller/$TAG"
 
 GPU=${GPU:-0}
@@ -61,13 +64,27 @@ else
     ENT_TAG="$ENT_FRAC"
 fi
 
+if [[ "${USE_TES:-0}" == "1" ]]; then ENT_TAG="${ENT_TAG}tes"; fi
 LOG="$LOG_DIR/$(basename "$SKILL_CKPT")_${ENV_NAME}_${TAG}_k${K}_ent${ENT_TAG}_s${SEED}.log"
+# USE_TES (env var, default 0): 1 -> --agent.use_tes=True, TES-SAC target entropy annealing
+# (Xu et al. 2021, arXiv:2112.02852; agents/online_crl_skill_controller.py). The target then
+# starts at TARGET_ENTROPY_FRAC * log(num_skills) (paper: frac 1.0) and is multiplied by 0.9
+# whenever the batch policy entropy stabilises at it. TES_PATIENCE (env var, optional)
+# overrides agent.tes_patience, the paper's unspecified T (default 500 gradient steps).
+USE_TES=${USE_TES:-0}
+TES_FLAG=()
+if [[ "$USE_TES" == "1" ]]; then
+    TES_FLAG=(--agent.use_tes=True)
+    if [[ -n "${TES_PATIENCE:-}" ]]; then TES_FLAG+=(--agent.tes_patience="$TES_PATIENCE"); fi
+fi
 EP_FLAG=()
 if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
 RLPD_FLAG=()
 if [[ "$OFFLINE_DATASET" != "none" ]]; then RLPD_FLAG=(--offline_dataset="$OFFLINE_DATASET"); fi
+# RLPD_FRAC_TIME (env var, optional): --rlpd_frac_time, see the TAG suffix above (main_online.py, default 1.0).
+if [[ -n "${RLPD_FRAC_TIME:-}" && ${#RLPD_FLAG[@]} -gt 0 ]]; then RLPD_FLAG+=(--rlpd_frac_time="$RLPD_FRAC_TIME"); fi
 
-echo "ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET k=$K ent=$ENT_TAG gpu=$GPU -> $LOG"
+echo "ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET k=$K ent=$ENT_TAG use_tes=$USE_TES gpu=$GPU -> $LOG"
 CUDA_VISIBLE_DEVICES=$GPU nohup $PYTHON -u main_online.py \
     --env_name="$ENV_NAME" \
     --seed="$SEED" \
@@ -80,6 +97,7 @@ CUDA_VISIBLE_DEVICES=$GPU nohup $PYTHON -u main_online.py \
     --total_env_steps="$TOTAL_ENV_STEPS" \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \
+    "${TES_FLAG[@]}" \
     --log_interval=5000 \
     --eval_interval=20000 \
     --save_interval=100000 \

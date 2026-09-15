@@ -9,6 +9,11 @@
 # RLPD is on by default: every batch mixes rows from the OGBench dataset named
 # by OFFLINE_DATASET (a single name for all ENVS, or per-env via the map below;
 # set OFFLINE_DATASET=none to train from online data only).
+#
+# Empowerment entropy target (agents/online_crl.py, `emp_*` config): set
+# EMP_CKPT_DIR to a frozen empowerment_skill run dir, or EMP_CKPT_DIR=auto for the
+# per-env default in EMP_DEFAULTS below. EMP_LAMBDA (default 1.0), EMP_NUM_BINS (8)
+# and EMP_NUM_SPLUS_SAMPLES (64) tune it; the tag gets an "_emp<lambda>" suffix.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,6 +40,24 @@ offline_dataset_for() {
     echo "${OFFLINE_DEFAULTS[$1]:-}"
 }
 
+# Empowerment estimator per online env (ckpts/final/empowerment_final, the 50-skill runs).
+EMP_CKPT_DIR=${EMP_CKPT_DIR:-}   # empty -> off; "auto" -> EMP_DEFAULTS; else a run dir
+EMP_LAMBDA=${EMP_LAMBDA:-1.0}
+EMP_NUM_BINS=${EMP_NUM_BINS:-8}
+EMP_NUM_SPLUS_SAMPLES=${EMP_NUM_SPLUS_SAMPLES:-64}
+declare -A EMP_DEFAULTS=(
+    [antmaze-medium-center-online-v0]=ckpts/final/empowerment_final/antmaze-medium-navigate/sd000_s_37866290.0.20260821_030441_k50_s0.01_bc0.001
+    [antsoccer-arena-center-online-v0]=ckpts/final/empowerment_final/antsoccer-arena-navigate/sd000_s_38390672.0.20260901_154836
+    [pointmaze-teleport-center-online-v0]=ckpts/final/empowerment_final/pointmaze-teleport-navigate/sd000_s_38390674.0.20260901_154836
+)
+emp_ckpt_for() {
+    if [[ -z "$EMP_CKPT_DIR" ]]; then echo ""; return; fi
+    if [[ "$EMP_CKPT_DIR" != "auto" ]]; then echo "$EMP_CKPT_DIR"; return; fi
+    local d="${EMP_DEFAULTS[$1]:-}"
+    if [[ -z "$d" ]]; then echo "no EMP_DEFAULTS entry for $1; pass EMP_CKPT_DIR=<run dir>" >&2; exit 1; fi
+    echo "$d"
+}
+
 # Default episode horizon per online env (antsoccer is shorter than the antmaze's registered 1000).
 declare -A EPISODE_LENGTH_DEFAULTS=(
     [antsoccer-arena-center-online-v0]=500
@@ -58,8 +81,26 @@ for i in "${!ENVS[@]}"; do
     RLPD_FLAG=()
     TAG=norlpd
     if [[ -n "$OFFLINE" ]]; then RLPD_FLAG=(--offline_dataset="$OFFLINE"); TAG=rlpd; fi
+    # RLPD_FRAC_TIME (env var, optional): --rlpd_frac_time, the fraction of total_env_steps during
+    # which offline data is mixed in; batches are online-only afterwards (main_online.py, default 1.0).
+    # Only meaningful with RLPD on; the tag gets a "_ft<frac>" suffix so save dirs / logs do not collide.
+    if [[ -n "${RLPD_FRAC_TIME:-}" && ${#RLPD_FLAG[@]} -gt 0 ]]; then
+        RLPD_FLAG+=(--rlpd_frac_time="$RLPD_FRAC_TIME")
+        TAG="${TAG}_ft${RLPD_FRAC_TIME}"
+    fi
+    EMP_CKPT=$(emp_ckpt_for "$ENV_NAME")
+    EMP_FLAG=()
+    if [[ -n "$EMP_CKPT" ]]; then
+        EMP_FLAG=(
+            --agent.emp_checkpoint_path="$EMP_CKPT"
+            --agent.emp_lambda="$EMP_LAMBDA"
+            --agent.emp_num_bins="$EMP_NUM_BINS"
+            --agent.emp_num_splus_samples="$EMP_NUM_SPLUS_SAMPLES"
+        )
+        TAG="${TAG}_emp${EMP_LAMBDA}"
+    fi
     LOG="$LOG_DIR/${ENV_NAME}_${TAG}_s${SEED}.log"
-    echo "launching online_crl env=${ENV_NAME} offline=${OFFLINE:-none} on GPU ${GPU} -> ${LOG}"
+    echo "launching online_crl env=${ENV_NAME} offline=${OFFLINE:-none} emp=${EMP_CKPT:-off} on GPU ${GPU} -> ${LOG}"
     CUDA_VISIBLE_DEVICES=$GPU nohup $PYTHON -u main_online.py \
         --env_name="$ENV_NAME" \
         --seed="$SEED" \
@@ -67,6 +108,7 @@ for i in "${!ENVS[@]}"; do
         --total_env_steps="$TOTAL_ENV_STEPS" \
         "${EP_FLAG[@]}" \
         "${RLPD_FLAG[@]}" \
+        "${EMP_FLAG[@]}" \
         --log_interval=5000 \
         --eval_interval=20000 \
         --save_interval=100000 \

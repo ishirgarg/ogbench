@@ -2,16 +2,21 @@
 
 The online sibling of `main.py`: same flags style, wandb/CSV logging, `exp/`
 layout, `flags.json` and `save_agent` checkpoints, but the agent learns from
-its own rollouts in the OGBench env. Two agents plug in today:
+its own rollouts in the OGBench env. Three agents plug in today:
 
   * `agents/online_crl.py`                  -- flat online CRL (JaxGCRL's `crl`).
   * `agents/online_crl_skill_controller.py` -- CRL high-level controller over a
     frozen skill policy (JaxGCRL's `crl_skill`).
+  * `agents/online_composed_skill_policy.py` -- the same two levels COMPOSED into one
+    flat policy and trained together (no skill horizon, low level not frozen, its own
+    learning rate). Flat rows, so it uses the same collector and RLPD path as `online_crl`.
 
 Loop (JaxGCRL structure, single env): collect `unroll_length` rows (env steps for
-the flat agent, SMDP macro-steps for the controller), then run
+the flat agents, SMDP macro-steps for the controller), then run
 `unroll_length * utd_ratio` gradient steps on batches from the trajectory replay
-buffer, whose goals are relabelled future observations. Logging, evaluation and
+buffer, whose goals are relabelled future observations. `utd_ratio` may be
+fractional (0.1 -> one update per 10 rows), which is how a flat agent is put on the
+same gradient-step budget as a k-step macro agent at the same env steps. Logging, evaluation and
 checkpointing are keyed on *env steps* (`--log_interval`, `--eval_interval`,
 `--save_interval`), so the two agents are comparable on the same x-axis.
 Evaluation runs JaxGCRL-style random-task episodes (`utils/online_evaluation.py`).
@@ -20,6 +25,16 @@ RLPD (`--offline_dataset`): an OGBench dataset is loaded into a second replay
 buffer and an exact `offline_ratio` share of every batch is drawn from it
 (`utils/rlpd.py`); the controller first labels the offline windows with its
 frozen skill agent. Nothing else changes (JaxGCRL `use_rlpd`).
+`--rlpd_frac_time` (default 1.0) limits the mixing to the first fraction of
+`total_env_steps`: after `rlpd_frac_time * total_env_steps` env steps every batch
+is drawn from the online buffer alone (the offline buffer is simply no longer
+sampled; the agent, buffer and update schedule are untouched).
+
+Empowerment entropy target (`online_crl` with `--agent.emp_checkpoint_path`): the flat
+collector's rows carry E(s) from the frozen offline estimator, filled in one batched
+call before every update round (`collector.flush_empowerment`). Right before the
+first update the agent's E_mean / bin edges are finalised from the calibration rows
+(the offline rows under RLPD, else the warm-up online rows); see agents/online_crl.py.
 """
 
 import json
@@ -58,6 +73,12 @@ flags.DEFINE_integer('total_env_steps', 1000000, 'Total number of environment st
 flags.DEFINE_integer('episode_length', None, 'Episode horizon override (None -> the env\'s registered limit).')
 flags.DEFINE_string(
     'offline_dataset', None, 'RLPD: OGBench dataset name mixed into every batch (None -> online data only).'
+)
+flags.DEFINE_float(
+    'rlpd_frac_time',
+    1.0,
+    'RLPD: fraction of total_env_steps during which offline data is mixed into batches (at agent.offline_ratio); '
+    'afterwards batches come from the online buffer only. 1.0 -> RLPD for the whole run.',
 )
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval (env steps).')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval (env steps).')
@@ -133,7 +154,14 @@ def main(_):
     )
 
     unroll_length = int(config['unroll_length'])
-    updates_per_round = unroll_length * int(config['utd_ratio'])
+    # Fractional utd_ratio is allowed (e.g. 0.1 -> one update every 10 rows), so a flat agent
+    # can be run on the same gradient-step budget as a macro agent at the same env steps.
+    # Integer values are unchanged: 50 * 1 == int(50 * 1.0).
+    updates_per_round = int(unroll_length * float(config['utd_ratio']))
+    assert updates_per_round >= 1, (
+        f"unroll_length ({unroll_length}) * utd_ratio ({config['utd_ratio']}) rounds down to 0 updates "
+        f'per round; raise either.'
+    )
     min_replay_size = int(config['min_replay_size'])
     batch_size = int(config['batch_size'])
     goal_discount = float(agent.config['goal_discount'])
@@ -142,8 +170,12 @@ def main(_):
         f'batch_size={batch_size}, min_replay_size={min_replay_size}, goal_discount={goal_discount:.6f}'
     )
 
-    # Batch sampler: the online buffer alone, or RLPD mixing with an offline buffer.
-    sampler = BufferSource(buffer, discount=goal_discount)
+    # Batch sampler: the online buffer alone, or RLPD mixing with an offline buffer for the
+    # first `rlpd_frac_time` of the run (`rlpd_end_step` env steps), then the online buffer alone.
+    assert 0.0 <= FLAGS.rlpd_frac_time <= 1.0, f'rlpd_frac_time must be in [0, 1], got {FLAGS.rlpd_frac_time}.'
+    online_sampler = BufferSource(buffer, discount=goal_discount)
+    sampler = online_sampler
+    rlpd_end_step = 0
     if FLAGS.offline_dataset is not None:
         offline_source = make_offline_source(
             FLAGS.offline_dataset,
@@ -151,12 +183,42 @@ def main(_):
             example_transition(config['rollout_type'], example_batch),
             label_seed=FLAGS.seed,
         )
-        sampler = MixedBatchSampler(sampler, offline_source, float(config['offline_ratio']))
-        num_online, num_offline = sampler.split(batch_size)
+        mixed_sampler = MixedBatchSampler(online_sampler, offline_source, float(config['offline_ratio']))
+        rlpd_end_step = int(round(FLAGS.rlpd_frac_time * FLAGS.total_env_steps))
+        if rlpd_end_step > 0:
+            sampler = mixed_sampler
+        num_online, num_offline = mixed_sampler.split(batch_size)
         print(
             f'[main_online] RLPD: {num_online} online + {num_offline} offline rows per batch '
-            f'(offline goal_discount={offline_source.discount:.6f}, next_offset={offline_source.next_offset})'
+            f'(offline goal_discount={offline_source.discount:.6f}, next_offset={offline_source.next_offset}) '
+            f'for env steps < {rlpd_end_step} (rlpd_frac_time={FLAGS.rlpd_frac_time}), online-only afterwards'
         )
+
+    def finalise_empowerment_stats(agent):
+        """E_mean + quantile bin edges from the calibration rows (offline rows under RLPD, else online rows)."""
+        if FLAGS.offline_dataset is not None:
+            values = offline_source.buffer.valid_field('empowerment')
+            rows_desc = f'{len(values)} offline rows of {FLAGS.offline_dataset}'
+        else:
+            values = buffer.valid_field('empowerment')
+            rows_desc = f'{len(values)} warm-up online rows'
+        values = np.asarray(values, dtype=np.float32)
+        assert np.all(np.isfinite(values)), 'empowerment placeholders left unfilled in the calibration rows'
+        if agent.config['emp_mean'] is not None:
+            mean, source = float(agent.config['emp_mean']), 'agent.emp_mean'
+        elif agent.config['emp_mean_metric'] is not None:
+            mean, source = float(agent.config['emp_mean_metric']), "checkpoint metric training/empowerment/mean"
+        else:
+            mean, source = float(values.mean()), 'calibration rows'
+        agent = agent.with_empowerment_stats(values, mean=mean)
+        edges = agent.config['emp_bin_edges']
+        print(
+            f'[main_online] empowerment stats from {rows_desc}: E_mean={mean:.4f} ({source}; rows mean '
+            f'{values.mean():.4f}, min {values.min():.4f}, max {values.max():.4f}), '
+            f'{int(agent.config["emp_num_bins"])} quantile bins, edges=' + ', '.join(f'{e:.3f}' for e in edges)
+        )
+        wandb.log({'empowerment/e_mean_used': mean, 'empowerment/rows_mean': float(values.mean())}, step=env_steps)
+        return agent
 
     def run_eval(step):
         eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0]) if FLAGS.eval_on_cpu else agent
@@ -230,9 +292,18 @@ def main(_):
             for name, value in out['episode'].items():
                 episode_stats[name].append(value)
 
+        # RLPD -> online-only switch (rlpd_frac_time): checked once per round, on env steps.
+        if sampler is not online_sampler and env_steps >= rlpd_end_step:
+            sampler = online_sampler
+            print(f'[main_online] env step {env_steps}: rlpd_frac_time reached, batches are now online-only')
+
         # Update agent: one round of updates every `unroll_length` rows once the buffer is warm.
         if buffer.num_valid >= min_replay_size and rows_since_update >= unroll_length:
             rows_since_update = 0
+            # Rows added since the last round get their empowerment before they can be sampled.
+            collector.flush_empowerment(agent)
+            if getattr(agent, 'uses_empowerment', False) and not agent.config['emp_stats_ready']:
+                agent = finalise_empowerment_stats(agent)
             for _ in range(updates_per_round):
                 batch = sampler.sample(batch_size)
                 agent, update_info = agent.update(batch)
@@ -250,6 +321,7 @@ def main(_):
             train_metrics['training/env_steps'] = env_steps
             train_metrics['training/num_updates'] = num_updates
             train_metrics['training/buffer_size'] = buffer.num_valid
+            train_metrics['training/rlpd_active'] = float(sampler is not online_sampler)
             train_metrics['time/sps'] = (env_steps - last_log_step) / max(time.time() - last_time, 1e-6)
             train_metrics['time/total_time'] = time.time() - first_time
             last_time = time.time()

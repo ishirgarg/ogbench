@@ -38,10 +38,18 @@ Rewards, masks and terminals of offline rows are bookkeeping only: both online
 agents are purely contrastive and never read them. Offline rows carry
 `rewards = 0`, and masks/terminals copied from the dataset (`terminals` marks the
 last transition of a trajectory, `masks = 1 - terminals`).
+
+Flat rows also carry `empowerment`: the frozen offline estimator's E(s) when the
+flat agent runs with one (`agents/online_crl.py`, `emp_checkpoint_path`), computed
+once over the whole dataset here and cached on disk next to the estimator
+checkpoint (`<ckpt>/empowerment_values/`), and 0 otherwise.
 """
 
 import dataclasses
+import os
+import time
 
+import jax
 import numpy as np
 
 from utils.datasets import Dataset, SequenceDataset
@@ -160,11 +168,21 @@ def _capacity(seq_dataset):
     return int(seq_dataset.size)
 
 
-def make_offline_flat_source(seq_dataset, example_transition, goal_discount):
-    """One offline row per env step: (s_t, a_t, s_{t+1}) with the flat agent's goal discount."""
+def make_offline_flat_source(seq_dataset, example_transition, goal_discount, empowerment=None):
+    """One offline row per env step: (s_t, a_t, s_{t+1}) with the flat agent's goal discount.
+
+    `empowerment` (a `[size]` float array, or None) fills each row's `empowerment` field
+    (None -> 0, the value agents without an estimator never read).
+    """
     buffer = TrajectoryReplayBuffer.create(example_transition, _capacity(seq_dataset))
     actions = np.asarray(seq_dataset.dataset['actions'])
     terminals = np.asarray(seq_dataset.dataset['terminals'], dtype=np.float32)
+    if empowerment is None:
+        empowerment = np.zeros((seq_dataset.size,), dtype=np.float32)
+    empowerment = np.asarray(empowerment, dtype=np.float32)
+    assert empowerment.shape == (seq_dataset.size,), (
+        f'empowerment values {empowerment.shape} do not cover the dataset ({seq_dataset.size} rows)'
+    )
 
     def row(t, start, marker, observations):
         return dict(
@@ -173,6 +191,7 @@ def make_offline_flat_source(seq_dataset, example_transition, goal_discount):
             rewards=np.float32(0.0),
             masks=np.float32(1.0 - terminals[t]),
             terminals=terminals[t],
+            empowerment=empowerment[t],
         )
 
     num_rows = _fill_buffer(buffer, seq_dataset, row)
@@ -219,7 +238,12 @@ def make_offline_source(dataset_name, agent, example_transition, label_seed=0):
             )
         seq_dataset = load_offline_sequence_dataset(dataset_name, config, sequence_length=1)
         _check_observation_shape(seq_dataset, example_transition)
-        source, num_rows = make_offline_flat_source(seq_dataset, example_transition, config['goal_discount'])
+        empowerment = None
+        if getattr(agent, 'uses_empowerment', False):
+            empowerment = offline_empowerment_values(agent, seq_dataset, dataset_name, seed=label_seed)
+        source, num_rows = make_offline_flat_source(
+            seq_dataset, example_transition, config['goal_discount'], empowerment=empowerment
+        )
         print(f'[{name}] offline dataset {dataset_name}: {num_rows} env-step rows in {seq_dataset.size} slots')
         return source
 
@@ -243,6 +267,44 @@ def make_offline_source(dataset_name, agent, example_transition, label_seed=0):
         return source
 
     raise ValueError(f'Unknown rollout_type {rollout_type!r}.')
+
+
+def offline_empowerment_values(agent, seq_dataset, dataset_name, seed=0, name='rlpd'):
+    """E(s) of every dataset row under the agent's frozen estimator, cached next to the estimator checkpoint.
+
+    The cache key names everything the numbers depend on (dataset, restore epoch, samples per
+    state, estimator code path, seed), so a stale file cannot be picked up by a different
+    configuration. The file is written atomically so concurrent Slurm jobs on the same
+    checkpoint cannot read a partial one. Marker rows (`valids == 0`) get a value too; they
+    are never sampled as anchors, so it is unused.
+    """
+    config = agent.config
+    cache_dir = os.path.join(config['emp_checkpoint_path'], 'empowerment_values')
+    cache_name = (
+        f"{dataset_name}_e{config['emp_restore_epoch']}_n{int(config['emp_num_splus_samples'])}"
+        f"_fast{int(bool(config['emp_fast_path']))}_seed{int(seed)}.npy"
+    )
+    cache_path = os.path.join(cache_dir, cache_name)
+    if os.path.exists(cache_path):
+        values = np.load(cache_path)
+        if values.shape == (seq_dataset.size,):
+            print(f'[{name}] offline empowerment: loaded cached values from {cache_path}')
+            return values.astype(np.float32)
+        print(f'[{name}] offline empowerment: cached {cache_path} has shape {values.shape}, recomputing')
+    observations = seq_dataset.get_observations(np.arange(seq_dataset.size))
+    start = time.time()
+    values = agent.empowerment_np(observations, jax.random.PRNGKey(int(seed))).astype(np.float32)
+    print(
+        f'[{name}] offline empowerment: {len(values)} rows in {time.time() - start:.0f}s '
+        f'(mean {values.mean():.4f}, min {values.min():.4f}, max {values.max():.4f})'
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp_path = f'{cache_path}.tmp.{os.getpid()}'
+    with open(tmp_path, 'wb') as f:  # a file handle: np.save(path) would append '.npy' to the temp name
+        np.save(f, values)
+    os.replace(tmp_path, cache_path)
+    print(f'[{name}] offline empowerment: cached to {cache_path}')
+    return values
 
 
 def _loglik_keep_mask(seq_dataset, config, name):

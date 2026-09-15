@@ -30,6 +30,22 @@ Built from this repo's primitives (no JaxGCRL networks):
     `use_legacy_entropy=True` restores the pre-2026-09-13 formula,
     min(target_entropy_multiplier * action_dim, target_entropy_cap_frac * log(num_skills)), for
     reproducing old runs; see `_resolve_target_entropy`.
+  * `use_tes=True`: Target Entropy Scheduled SAC (TES-SAC; Xu, Hu, Liang, McAleer, Abbeel, Fox,
+    "Target Entropy Annealing for Discrete Soft Actor-Critic", NeurIPS 2021 DeepRL workshop,
+    arXiv:2112.02852). The resolved `target_entropy` above is then only the INITIAL target
+    H_0 (the paper uses H_0 = log|A|, i.e. target_entropy_frac=1.0); Algorithm 1 anneals it
+    per gradient step from the mini-batch policy entropy e_t = mean_b H(pi(. | s_b, g_b)):
+        delta = e_t - mu;  mu += (1 - lambda) * delta;  sigma^2 = lambda * (sigma^2 + (1 - lambda) * delta^2)
+        if |mu - H| < mean_threshold and sigma <= std_threshold: i += 1
+        if i >= T: i = 0; H *= target_discount
+    (exponential moving mean / std of Finch 2009, Eqs. 9-10; mu is initialised to H_0, sigma to 0,
+    and neither is reset on a drop). Paper Table 1: lambda=0.999, mean_threshold=0.01,
+    std_threshold=0.05, target_discount=0.9. T ("total conditioned num") is NOT given in the paper
+    and no code is public; `tes_patience` (default 500) is our choice: the moving mean itself needs ~4k steps to re-settle within 0.01
+    nat of a 10%-lower target at lambda=0.999, so T mostly adds a short confirmation margin on top of that.
+    The schedule state lives in `tes_state` (part of the agent pytree, so checkpoints carry it) and
+    is advanced in `update` from the entropy the alpha loss just observed; the alpha loss at step t
+    uses the target as of step t-1 (a one-update lag, immaterial at lambda=0.999).
 
 Goals are full goal observations (OGBench convention): the behaviour policy sees
 `info['goal']`; training goals are relabelled future observations.
@@ -190,12 +206,17 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
             the K skills), `critic` (GCDiscreteBilinearCritic) and `alpha` (LogParam).
         skill_agent: The frozen pretrained skill agent (never updated).
         config: Static configuration dictionary.
+        tes_state: TES-SAC schedule state (`use_tes=True`): dict of scalar arrays `target`
+            (current H_bar), `mu`, `sigma2` (exponential moving mean / variance of the batch
+            policy entropy), `count` (stable steps i) and `drops` (number of target drops so far).
+            None when `use_tes=False`.
     """
 
     rng: Any
     network: Any
     skill_agent: Any
     config: Any = nonpytree_field()
+    tes_state: Any = None
 
     # ── Losses ────────────────────────────────────────────────────────────────
 
@@ -273,7 +294,8 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
 
         alpha_param = self.network.select('alpha')(params=grad_params)
         entropy_sg = jax.lax.stop_gradient(entropy).mean()
-        alpha_loss = alpha_param * (entropy_sg - self.config['target_entropy'])
+        target_entropy = self._current_target_entropy()
+        alpha_loss = alpha_param * (entropy_sg - target_entropy)
 
         total_loss = actor_loss + alpha_loss
         return total_loss, {
@@ -282,7 +304,7 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
             'alpha_loss': alpha_loss,
             'alpha': alpha,
             'entropy': entropy_sg,
-            'target_entropy': self.config['target_entropy'],
+            'target_entropy': target_entropy,
             'q_pi_mean': jnp.sum(pi * q, axis=-1).mean(),
             'q_max_skill_mean': q.max(axis=-1).mean(),
             'pi_max_mean': jnp.mean(jnp.max(pi, axis=-1)),
@@ -306,6 +328,52 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
         loss = critic_loss + actor_loss
         return loss, info
 
+    # ── TES-SAC target entropy schedule (arXiv:2112.02852, Algorithm 1) ──────
+
+    def _current_target_entropy(self):
+        """H_bar for the alpha loss: the scheduled target under `use_tes`, else the constant."""
+        if self.config['use_tes']:
+            return self.tes_state['target']
+        return self.config['target_entropy']
+
+    @staticmethod
+    def init_tes_state(initial_target_entropy):
+        """Algorithm 1, line 1: mu = H_0, sigma = 0, i = 0, H_bar = H_0."""
+        h0 = jnp.asarray(initial_target_entropy, dtype=jnp.float32)
+        return dict(
+            target=h0,
+            mu=h0,
+            sigma2=jnp.zeros((), jnp.float32),
+            count=jnp.zeros((), jnp.int32),
+            drops=jnp.zeros((), jnp.int32),
+        )
+
+    def _tes_step(self, tes_state, batch_entropy):
+        """One timestep of Algorithm 1 given e_t (the mini-batch policy entropy, Eq. 8).
+
+        Lines 3-6 update the exponential moving mean / variance (Eqs. 9-10). Line 7: if mu is not
+        within `tes_mean_threshold` of H_bar, or sigma exceeds `tes_std_threshold`, nothing else
+        changes (as written, i is NOT reset by a failed check). Lines 10-14: otherwise i += 1 and,
+        once i reaches `tes_patience` (T), i = 0 and H_bar *= `tes_target_discount`.
+        """
+        lam = jnp.asarray(self.config['tes_window_discount'], jnp.float32)
+        e_t = jnp.asarray(batch_entropy, jnp.float32)
+        delta = e_t - tes_state['mu']
+        mu = tes_state['mu'] + (1.0 - lam) * delta
+        sigma2 = lam * (tes_state['sigma2'] + (1.0 - lam) * delta**2)
+        sigma = jnp.sqrt(sigma2)
+        target = tes_state['target']
+        stable = jnp.logical_and(
+            jnp.abs(mu - target) < self.config['tes_mean_threshold'],
+            sigma <= self.config['tes_std_threshold'],
+        )
+        count = tes_state['count'] + stable.astype(jnp.int32)
+        drop = count >= int(self.config['tes_patience'])
+        new_target = jnp.where(drop, target * self.config['tes_target_discount'], target)
+        new_count = jnp.where(drop, 0, count)
+        drops = tes_state['drops'] + drop.astype(jnp.int32)
+        return dict(target=new_target, mu=mu, sigma2=sigma2, count=new_count, drops=drops)
+
     @jax.jit
     def update(self, batch):
         """Update the agent and return a new agent with information dictionary."""
@@ -315,7 +383,16 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
             return self.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        return self.replace(network=new_network, rng=new_rng), info
+        new_agent = self.replace(network=new_network, rng=new_rng)
+        if self.config['use_tes']:
+            # Advance the schedule from the entropy the alpha loss just observed (Eq. 8 on this batch).
+            tes_state = self._tes_step(self.tes_state, info['actor/entropy'])
+            new_agent = new_agent.replace(tes_state=tes_state)
+            info['actor/tes_mu'] = tes_state['mu']
+            info['actor/tes_sigma'] = jnp.sqrt(tes_state['sigma2'])
+            info['actor/tes_count'] = tes_state['count']
+            info['actor/tes_drops'] = tes_state['drops']
+        return new_agent, info
 
     # ── Acting: high level ────────────────────────────────────────────────────
 
@@ -707,7 +784,29 @@ class OnlineCRLSkillControllerAgent(flax.struct.PyTreeNode):
         # Future-goal sampling discount per macro-row: gamma^k (gamma measured in env steps).
         stored_config['goal_discount'] = float(config['discount']) ** int(config['skill_commitment_k'])
 
-        return cls(rng, network=network, skill_agent=skill_agent, config=flax.core.FrozenDict(**stored_config))
+        tes_state = None
+        if config['use_tes']:
+            if int(config['tes_patience']) < 1:
+                raise ValueError(f"tes_patience must be >= 1, got {config['tes_patience']}.")
+            if not (0.0 < float(config['tes_target_discount']) < 1.0):
+                raise ValueError(f"tes_target_discount must lie in (0, 1), got {config['tes_target_discount']}.")
+            if not (0.0 <= float(config['tes_window_discount']) < 1.0):
+                raise ValueError(f"tes_window_discount must lie in [0, 1), got {config['tes_window_discount']}.")
+            tes_state = cls.init_tes_state(stored_config['target_entropy'])
+            print(
+                f'[online_crl_skill_controller] TES-SAC on: target_entropy={stored_config["target_entropy"]:.3f} is '
+                f'the INITIAL target H_0 (paper: log(num_skills)={float(np.log(num_skills)):.3f}); '
+                f'lambda={config["tes_window_discount"]}, mean_thr={config["tes_mean_threshold"]}, '
+                f'std_thr={config["tes_std_threshold"]}, k={config["tes_target_discount"]}, T={config["tes_patience"]}.'
+            )
+
+        return cls(
+            rng,
+            network=network,
+            skill_agent=skill_agent,
+            config=flax.core.FrozenDict(**stored_config),
+            tes_state=tes_state,
+        )
 
 
 def get_config():
@@ -734,6 +833,16 @@ def get_config():
             use_legacy_entropy=False,  # True -> pre-2026-09-13 H_target (requires both knobs below).
             target_entropy_multiplier=ml_collections.config_dict.placeholder(float),  # Legacy only; raises unless use_legacy_entropy.
             target_entropy_cap_frac=ml_collections.config_dict.placeholder(float),  # Legacy only; raises unless use_legacy_entropy.
+            # TES-SAC target entropy annealing (arXiv:2112.02852, Algorithm 1). With use_tes=True the
+            # resolved target_entropy above is only the initial target H_0 (paper: log|A|, i.e.
+            # target_entropy_frac=1.0). Values below are the paper's Table 1, except tes_patience (T),
+            # which the paper leaves unspecified.
+            use_tes=False,  # Anneal H_target by tes_target_discount whenever the policy entropy stabilises at it.
+            tes_window_discount=0.999,  # lambda: exponential moving mean / std discount of the batch entropy.
+            tes_mean_threshold=0.01,  # Drop only if |mu - H_target| < this (nats).
+            tes_std_threshold=0.05,  # ... and the moving std of the batch entropy is <= this (nats).
+            tes_target_discount=0.9,  # k: H_target <- k * H_target on every drop.
+            tes_patience=500,  # T: gradient steps satisfying the check (not necessarily consecutive) per drop.
             # Online schedule (consumed by main_online.py); units are macro-steps.
             unroll_length=50,  # Macro-steps collected between update rounds.
             utd_ratio=1,  # Gradient steps per macro-step; each round runs unroll_length * utd_ratio updates.

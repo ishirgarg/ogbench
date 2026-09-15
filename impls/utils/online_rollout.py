@@ -3,9 +3,13 @@
 Two collectors share one interface, `step(agent) -> dict`, and push compact rows
 into a `TrajectoryReplayBuffer`:
 
-  * `FlatCollector`   -- one env step per row: (s, a, r, mask, done). Used by the
+  * `FlatCollector`   -- one env step per row: (s, a, r, mask, done, E(s)). Used by the
     flat online CRL agent. The behaviour policy is the stochastic actor
-    (`temperature=1`), as in JaxGCRL's `actor_step`.
+    (`temperature=1`), as in JaxGCRL's `actor_step`. `E(s)` is the row's offline
+    empowerment estimate (agents/online_crl.py, `emp_checkpoint_path`): rows are written
+    with a NaN placeholder and `flush_empowerment(agent)` fills the pending rows in one
+    batched call, which `main_online.py` runs before every update round. Agents without
+    an estimator store 0 and never read the field.
   * `MacroCollector`  -- one SMDP macro-step per row: the high-level agent picks a
     skill z, which the frozen low-level policy executes for `k` env steps (or
     until the episode ends). The row is (s_t, z, R, mask, done) with
@@ -58,6 +62,7 @@ class FlatCollector:
         self.rng = jax.random.PRNGKey(seed)
         self.discrete = discrete
         self.tracker = _EpisodeTracker()
+        self._pending_empowerment = []  # abs indices of rows whose `empowerment` is still the NaN placeholder
         self._reset_episode()
 
     def _reset_episode(self):
@@ -75,7 +80,24 @@ class FlatCollector:
             rewards=np.float32(0.0),
             masks=np.float32(1.0),
             terminals=np.float32(0.0),
+            empowerment=np.float32(0.0),
         )
+
+    def flush_empowerment(self, agent):
+        """Fill the empowerment field of every row added since the last flush (one batched estimator call).
+
+        Returns the number of rows filled. A no-op for agents without an estimator (their
+        rows were written with 0, not NaN, so the field is never a placeholder).
+        """
+        if not self._pending_empowerment:
+            return 0
+        abs_idxs = np.asarray(self._pending_empowerment, dtype=np.int64)
+        self._pending_empowerment = []
+        self.rng, key = jax.random.split(self.rng)
+        observations = self.buffer.read_field('observations', abs_idxs)
+        values = agent.empowerment_np(observations, key)
+        self.buffer.write_field('empowerment', abs_idxs, values.astype(np.float32))
+        return int(len(abs_idxs))
 
     def step(self, agent):
         self.rng, key = jax.random.split(self.rng)
@@ -88,15 +110,21 @@ class FlatCollector:
         done = bool(terminated or truncated)
         self.tracker.add(reward, info)
 
-        self.buffer.add_transition(
+        uses_empowerment = bool(getattr(agent, 'uses_empowerment', False))
+        abs_idx = self.buffer.add_transition(
             dict(
                 observations=self.observation,
                 actions=action,
                 rewards=np.float32(reward),
                 masks=np.float32(1.0 - float(terminated)),
                 terminals=np.float32(done),
+                # NaN until `flush_empowerment`: sampling an unfilled row would surface as a NaN loss
+                # rather than silently training on a wrong entropy target.
+                empowerment=np.float32(np.nan if uses_empowerment else 0.0),
             )
         )
+        if uses_empowerment:
+            self._pending_empowerment.append(abs_idx)
         self.observation = next_observation
 
         episode = None
@@ -126,6 +154,10 @@ class MacroCollector:
         self.low_state = None
         self._low_state_stale = True
         self._reset_episode()
+
+    def flush_empowerment(self, agent):
+        """Macro rows carry no empowerment field (the flat agent's entropy bonus only); nothing to fill."""
+        return 0
 
     def _reset_episode(self):
         observation, info = self.env.reset()

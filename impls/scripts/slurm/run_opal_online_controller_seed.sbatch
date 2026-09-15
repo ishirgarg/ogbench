@@ -1,39 +1,45 @@
 #!/usr/bin/env bash
-# Single online_crl_skill_controller run on top of a FROZEN **DDS** skill
-# checkpoint, with RLPD, for the rnn.ist.berkeley.edu Slurm cluster.
+# Single online_crl_skill_controller run on top of a FROZEN **discrete OPAL**
+# skill checkpoint (agents/opal.py, latent_type=discrete: App. F clustering +
+# BC decoder), with RLPD, for the rnn.ist.berkeley.edu Slurm cluster.
 #
 # Identical in structure and hyperparameters to
-# run_online_crl_skill_controller_seed.sbatch (same K=10 commitment,
+# run_dds_online_controller_seed.sbatch (same K=10 commitment,
 # target_entropy_frac=0.9, 1M env steps, same intervals) -- the only
-# difference is that SKILL_CKPT points at a `dds` run instead of an
-# `empowerment_skill` run, so the online controller's seeds are directly
-# comparable across the two skill families.
+# difference is that SKILL_CKPT points at an `opal` run, so the online
+# controller's seeds are directly comparable across the three skill families.
 #
-# Why K=10 specifically: utils/skill_checkpoint.py loads the DDS agent and the
-# controller's DDS offline-window labeller (online_crl_skill_controller.py)
-# REQUIRES skill_commitment_k == the checkpoint's `sequence_length`, which is 10
-# for all five ckpts/final/dds runs. main_online.py also requires
-# episode_horizon % k == 0, which holds for 1000 and 500.
+# RLPD labels: online_crl_skill_controller.py labels every offline k-window with
+# the checkpoint's own clustering posterior p(z | tau) (Bayes rule over the frozen
+# mixture p_w(z) prod_t p_phi(s_t | s_{t-1}, z) -- the same labeller
+# agents/opal_controller.py uses offline), drawing z ~ p(z | tau) by default
+# (agent.opal_label_mode=sample, the paper's recipe; pass "mode" for the argmax).
+#
+# Why K=10: it is the `chunk_size` every ckpts/final/opal run was trained with
+# (the window the posterior and the decoder saw); the controller only warns on a
+# mismatch, but a different K would label windows the mixture was never fit on.
+# main_online.py also requires episode_horizon % k == 0 (1000 / 500 / 200 all do).
+#
+# utils/skill_checkpoint.py refuses a checkpoint whose epoch is inside the EM
+# clustering stage (restore_epoch < cluster_steps): the decoder is untrained there.
 #
 # See run_online_crl_seed.sbatch for the cluster-specific notes this mirrors
 # (wandb key file, NAS dataset cache, JAX compile cache) -- read those before
 # submitting if you haven't already.
 #
-# Usage (normally invoked by scripts/slurm/submit_dds_online_controller_seeds.sh):
+# Usage (normally invoked by scripts/slurm/submit_opal_online_controller_seeds.sh):
 #   sbatch --job-name=<name> --output=<log> \
-#       scripts/slurm/run_dds_online_controller_seed.sbatch \
-#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH] [SAVE_SUBDIR] [TARGET_ENTROPY_FRAC]
+#       scripts/slurm/run_opal_online_controller_seed.sbatch \
+#       <SKILL_CKPT> <ENV_NAME> <SEED> [OFFLINE_DATASET] [EPISODE_LENGTH] [SAVE_SUBDIR] [TARGET_ENTROPY_FRAC] [OPAL_LABEL_MODE]
 #
 # OFFLINE_DATASET is optional; omit (or pass "") to use SKILL_CKPT's own dataset
-# (its flags.json env_name) -- i.e. exactly the data the DDS skills were trained
+# (its flags.json env_name) -- i.e. exactly the data the OPAL skills were trained
 # on, which is what we want for RLPD. Pass "none" to disable RLPD.
 # EPISODE_LENGTH is optional; omit to use the env's registered horizon
 # (antsoccer-arena-center-online-v0 needs 500 -- the submit script passes it).
-# TARGET_ENTROPY_FRAC is optional (7th positional arg); omit (or pass "") to keep
-# the 0.9 default every existing caller relies on. Added 2026-09-13 for
-# submit_pmt_asoc_cube_entropy_sweep.sh, which sweeps this non-legacy
-# target_entropy_frac knob (target_entropy = frac * log(num_skills)) explicitly.
-#SBATCH --job-name=dds_online_controller
+# TARGET_ENTROPY_FRAC is optional (7th positional arg); omit (or pass "") for 0.9.
+# OPAL_LABEL_MODE is optional (8th positional arg): "sample" (default) or "mode".
+#SBATCH --job-name=opal_online_controller
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16gb
 #SBATCH --gpus=1
@@ -41,9 +47,9 @@
 #SBATCH --qos=default
 set -euo pipefail
 
-SKILL_CKPT=${1:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
-ENV_NAME=${2:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
-SEED=${3:?usage: run_dds_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
+SKILL_CKPT=${1:?usage: run_opal_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
+ENV_NAME=${2:?usage: run_opal_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
+SEED=${3:?usage: run_opal_online_controller_seed.sbatch SKILL_CKPT ENV_NAME SEED [OFFLINE_DATASET] [EPISODE_LENGTH]}
 OFFLINE_DATASET=${4:-}
 EPISODE_LENGTH=${5:-}
 # Optional 6th arg: the per-checkpoint subdirectory results are written to. Defaults to
@@ -52,6 +58,7 @@ EPISODE_LENGTH=${5:-}
 # instead of mixing it into the finished one.
 SAVE_SUBDIR=${6:-online_controller}
 TARGET_ENTROPY_FRAC=${7:-0.9}
+OPAL_LABEL_MODE=${8:-sample}
 
 REPO_DIR=/nas/ucb/ishirgarg/ogbench
 IMPLS_DIR="$REPO_DIR/impls"
@@ -62,7 +69,7 @@ WANDB_KEY_FILE=/nas/ucb/ishirgarg/.wandb_api_key
 if [[ -r "$WANDB_KEY_FILE" ]]; then
     export WANDB_API_KEY="$(<"$WANDB_KEY_FILE")"
 else
-    echo "[run_dds_online_controller_seed] WARNING: $WANDB_KEY_FILE not readable; wandb logging will likely fail." >&2
+    echo "[run_opal_online_controller_seed] WARNING: $WANDB_KEY_FILE not readable; wandb logging will likely fail." >&2
 fi
 export TMPDIR=/nas/ttl=60d/ishirgarg/tmp
 mkdir -p "$TMPDIR"
@@ -116,7 +123,7 @@ if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH")
 SAVE_DIR="$SKILL_CKPT/$SAVE_SUBDIR/$TAG"
 mkdir -p "$SAVE_DIR"
 
-echo "[run_dds_online_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC use_tes=$USE_TES job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_opal_online_controller_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC use_tes=$USE_TES opal_label_mode=$OPAL_LABEL_MODE job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -127,6 +134,7 @@ srun "$PYTHON" -u main_online.py \
     --agent.skill_restore_epoch="$SKILL_EPOCH" \
     --agent.skill_commitment_k=10 \
     --agent.target_entropy_frac="$TARGET_ENTROPY_FRAC" \
+    --agent.opal_label_mode="$OPAL_LABEL_MODE" \
     --total_env_steps=1000000 \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \
