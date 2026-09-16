@@ -829,7 +829,7 @@ def get_config():
             # SMDP.
             skill_commitment_k=20,  # Fixed temporal commitment: env steps per high-level decision.
             gamma_low=1.0,  # Intra-macro-step reward discount (bookkeeping only; the learner ignores rewards).
-            target_entropy_frac=0.9,  # H_target = frac * log(num_skills) (frac <= 1 -> always reachable).
+            target_entropy_frac=0.5,  # H_target = frac * log(num_skills) (frac <= 1 -> always reachable).
             use_legacy_entropy=False,  # True -> pre-2026-09-13 H_target (requires both knobs below).
             target_entropy_multiplier=ml_collections.config_dict.placeholder(float),  # Legacy only; raises unless use_legacy_entropy.
             target_entropy_cap_frac=ml_collections.config_dict.placeholder(float),  # Legacy only; raises unless use_legacy_entropy.

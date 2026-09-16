@@ -14,6 +14,12 @@
 # EMP_CKPT_DIR to a frozen empowerment_skill run dir, or EMP_CKPT_DIR=auto for the
 # per-env default in EMP_DEFAULTS below. EMP_LAMBDA (default 1.0), EMP_NUM_BINS (8)
 # and EMP_NUM_SPLUS_SAMPLES (64) tune it; the tag gets an "_emp<lambda>" suffix.
+# EMP_ENTROPY_TARGET=False keeps the estimator but drops the per-state target (scalar
+# alpha; tag "_noent"). Exploration reward bonus (same file, `add_explore`): set
+# ADD_EXPLORE=reward (Q_x fit on online rows) or reward-to-rlpd (RLPD rows too), with
+# BONUS_SCALE (default 1.0) the actor weight on Q_x; needs an estimator (EMP_CKPT_DIR).
+# EXPLORE_REWARD picks the reward: empowerment (default, E(s')) or max_episodic_empowerment
+# (running max of E over the episode). Tag suffix "_rb[max]<scale>" / "_rbrlpd[max]<scale>".
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -45,6 +51,10 @@ EMP_CKPT_DIR=${EMP_CKPT_DIR:-}   # empty -> off; "auto" -> EMP_DEFAULTS; else a 
 EMP_LAMBDA=${EMP_LAMBDA:-1.0}
 EMP_NUM_BINS=${EMP_NUM_BINS:-8}
 EMP_NUM_SPLUS_SAMPLES=${EMP_NUM_SPLUS_SAMPLES:-64}
+EMP_ENTROPY_TARGET=${EMP_ENTROPY_TARGET:-}   # empty -> agent default (True); "False" -> scalar alpha
+ADD_EXPLORE=${ADD_EXPLORE:-}   # empty -> off; "reward" | "reward-to-rlpd"
+BONUS_SCALE=${BONUS_SCALE:-1.0}
+EXPLORE_REWARD=${EXPLORE_REWARD:-empowerment}   # "empowerment" | "max_episodic_empowerment" (tag "max")
 declare -A EMP_DEFAULTS=(
     [antmaze-medium-center-online-v0]=ckpts/final/empowerment_final/antmaze-medium-navigate/sd000_s_37866290.0.20260821_030441_k50_s0.01_bc0.001
     [antsoccer-arena-center-online-v0]=ckpts/final/empowerment_final/antsoccer-arena-navigate/sd000_s_38390672.0.20260901_154836
@@ -97,10 +107,26 @@ for i in "${!ENVS[@]}"; do
             --agent.emp_num_bins="$EMP_NUM_BINS"
             --agent.emp_num_splus_samples="$EMP_NUM_SPLUS_SAMPLES"
         )
-        TAG="${TAG}_emp${EMP_LAMBDA}"
+        if [[ "$EMP_ENTROPY_TARGET" == "False" || "$EMP_ENTROPY_TARGET" == "false" || "$EMP_ENTROPY_TARGET" == "0" ]]; then
+            EMP_FLAG+=(--agent.emp_entropy_target=False)
+            TAG="${TAG}_noent"
+        else
+            TAG="${TAG}_emp${EMP_LAMBDA}"
+        fi
+    fi
+    if [[ -n "$ADD_EXPLORE" ]]; then
+        if [[ -z "$EMP_CKPT" ]]; then echo "ADD_EXPLORE=$ADD_EXPLORE needs EMP_CKPT_DIR (the empowerment reward's estimator)" >&2; exit 1; fi
+        EMP_FLAG+=(--agent.add_explore="$ADD_EXPLORE" --agent.bonus_scale="$BONUS_SCALE" --agent.explore_reward="$EXPLORE_REWARD")
+        RB_KIND=""
+        if [[ "$EXPLORE_REWARD" == "max_episodic_empowerment" ]]; then RB_KIND=max; fi
+        case "$ADD_EXPLORE" in
+            reward) TAG="${TAG}_rb${RB_KIND}${BONUS_SCALE}" ;;
+            reward-to-rlpd) TAG="${TAG}_rbrlpd${RB_KIND}${BONUS_SCALE}" ;;
+            *) echo "unknown ADD_EXPLORE=$ADD_EXPLORE (reward | reward-to-rlpd)" >&2; exit 1 ;;
+        esac
     fi
     LOG="$LOG_DIR/${ENV_NAME}_${TAG}_s${SEED}.log"
-    echo "launching online_crl env=${ENV_NAME} offline=${OFFLINE:-none} emp=${EMP_CKPT:-off} on GPU ${GPU} -> ${LOG}"
+    echo "launching online_crl env=${ENV_NAME} offline=${OFFLINE:-none} emp=${EMP_CKPT:-off} add_explore=${ADD_EXPLORE:-off} on GPU ${GPU} -> ${LOG}"
     CUDA_VISIBLE_DEVICES=$GPU nohup $PYTHON -u main_online.py \
         --env_name="$ENV_NAME" \
         --seed="$SEED" \

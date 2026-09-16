@@ -65,6 +65,11 @@ UTD_RATIO=${UTD_RATIO:-}
 # A non-default method is appended to the save-path tag so the two never collide.
 GRAD_METHOD=${GRAD_METHOD:-enumerate}
 REINFORCE_BASELINE=${REINFORCE_BASELINE:-}
+# LEARNED_ACTION_STD (env var, 0/1, softmax only): the high level grows an action log-std head
+# and the composed action is the tanh-squashed Gaussian of online_crl centred on the low level's
+# action, with a second alpha tuned on its entropy (agent docstring, Eq. 9). Without it the
+# softmax collector is deterministic. Tag suffix _astd so the two trees never collide.
+LEARNED_ACTION_STD=${LEARNED_ACTION_STD:-0}
 
 REPO_DIR=/nas/ucb/ishirgarg/ogbench
 IMPLS_DIR="$REPO_DIR/impls"
@@ -123,12 +128,17 @@ if [[ -n "$REINFORCE_BASELINE" ]]; then
         METHOD_TAG="${METHOD_TAG}_b${REINFORCE_BASELINE}"
     fi
 fi
+if [[ "$LEARNED_ACTION_STD" == "1" ]]; then
+    [[ "$GRAD_METHOD" == "softmax" ]] || { echo "ERROR: LEARNED_ACTION_STD=1 needs GRAD_METHOD=softmax (got $GRAD_METHOD)" >&2; exit 1; }
+    METHOD_FLAG+=(--agent.learned_action_std=True)
+    METHOD_TAG="${METHOD_TAG}_astd"
+fi
 
 # The low-level learning rate is the swept axis, so it is part of the save path.
 SAVE_DIR="$SKILL_CKPT/$SAVE_SUBDIR/${TAG}_lowlr${LOW_LR}${METHOD_TAG}"
 mkdir -p "$SAVE_DIR"
 
-echo "[run_online_composed_skill_policy_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC low_lr=$LOW_LR actor_batch_size=${ACTOR_BATCH_SIZE:-<full batch>} utd_ratio=${UTD_RATIO:-<config default>} grad_method=$GRAD_METHOD job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_online_composed_skill_policy_seed] ckpt=$SKILL_CKPT epoch=$SKILL_EPOCH env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} target_entropy_frac=$TARGET_ENTROPY_FRAC low_lr=$LOW_LR actor_batch_size=${ACTOR_BATCH_SIZE:-<full batch>} utd_ratio=${UTD_RATIO:-<config default>} grad_method=$GRAD_METHOD learned_action_std=$LEARNED_ACTION_STD job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -146,7 +156,7 @@ srun "$PYTHON" -u main_online.py \
     "${EP_FLAG[@]}" \
     "${RLPD_FLAG[@]}" \
     --log_interval=5000 \
-    --eval_interval=20000 \
+    --eval_interval=15000 \
     --save_interval=100000 \
-    --eval_episodes=20 \
+    --eval_episodes=100 \
     --video_episodes=0

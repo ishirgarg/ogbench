@@ -35,6 +35,9 @@ collector's rows carry E(s) from the frozen offline estimator, filled in one bat
 call before every update round (`collector.flush_empowerment`). Right before the
 first update the agent's E_mean / bin edges are finalised from the calibration rows
 (the offline rows under RLPD, else the warm-up online rows); see agents/online_crl.py.
+The same E(s) feeds the exploration reward bonus (`--agent.add_explore=reward` or
+`reward-to-rlpd`, r_x = E(s') - E_mean into a separate critic Q_x); with
+`reward-to-rlpd` the RLPD rows carry that reward too, so Q_x is backed up on them.
 """
 
 import json
@@ -80,11 +83,11 @@ flags.DEFINE_float(
     'RLPD: fraction of total_env_steps during which offline data is mixed into batches (at agent.offline_ratio); '
     'afterwards batches come from the online buffer only. 1.0 -> RLPD for the whole run.',
 )
-flags.DEFINE_integer('log_interval', 5000, 'Logging interval (env steps).')
+flags.DEFINE_integer('log_interval', 25000, 'Logging interval (env steps).')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval (env steps).')
 flags.DEFINE_integer('save_interval', 100000, 'Saving interval (env steps).')
 
-flags.DEFINE_integer('eval_episodes', 20, 'Number of random-task evaluation episodes.')
+flags.DEFINE_integer('eval_episodes', 100, 'Number of random-task evaluation episodes.')
 flags.DEFINE_float('eval_temperature', 0, 'Actor (controller) temperature for evaluation.')
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
@@ -193,6 +196,9 @@ def main(_):
             f'(offline goal_discount={offline_source.discount:.6f}, next_offset={offline_source.next_offset}) '
             f'for env steps < {rlpd_end_step} (rlpd_frac_time={FLAGS.rlpd_frac_time}), online-only afterwards'
         )
+
+    if agent.config.get('add_explore') == 'reward-to-rlpd' and FLAGS.offline_dataset is None:
+        print('[main_online] add_explore=reward-to-rlpd without --offline_dataset: no RLPD rows, same as add_explore=reward')
 
     def finalise_empowerment_stats(agent):
         """E_mean + quantile bin edges from the calibration rows (offline rows under RLPD, else online rows)."""

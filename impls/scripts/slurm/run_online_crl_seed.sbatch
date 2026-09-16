@@ -104,6 +104,11 @@ if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH")
 # EMP_CKPT_DIR (env var, optional; sbatch exports the submitter's environment): a frozen
 # empowerment_skill run dir for agents/online_crl.py's empowerment-modulated entropy target,
 # with EMP_LAMBDA (1.0), EMP_NUM_BINS (8), EMP_NUM_SPLUS_SAMPLES (64). Tag suffix "_emp<lambda>".
+# EMP_ENTROPY_TARGET=False keeps the estimator but drops the per-state target (tag "_noent").
+# ADD_EXPLORE=reward | reward-to-rlpd (env var, optional) turns on the exploration reward bonus
+# (agents/online_crl.py `add_explore`, r_x = E(s') - E_mean into its own critic Q_x) with
+# BONUS_SCALE (1.0) the actor weight on Q_x and EXPLORE_REWARD (empowerment | max_episodic_empowerment,
+# the running max of E over the episode; tag "max"); needs EMP_CKPT_DIR. Tag "_rb[max]<scale>" / "_rbrlpd[max]<scale>".
 EMP_FLAG=()
 if [[ -n "${EMP_CKPT_DIR:-}" ]]; then
     EMP_FLAG=(
@@ -112,10 +117,32 @@ if [[ -n "${EMP_CKPT_DIR:-}" ]]; then
         --agent.emp_num_bins="${EMP_NUM_BINS:-8}"
         --agent.emp_num_splus_samples="${EMP_NUM_SPLUS_SAMPLES:-64}"
     )
-    TAG="${TAG}_emp${EMP_LAMBDA:-1.0}"
+    case "${EMP_ENTROPY_TARGET:-}" in
+        False|false|0) EMP_FLAG+=(--agent.emp_entropy_target=False); TAG="${TAG}_noent" ;;
+        *) TAG="${TAG}_emp${EMP_LAMBDA:-1.0}" ;;
+    esac
+fi
+if [[ -n "${ADD_EXPLORE:-}" ]]; then
+    if [[ -z "${EMP_CKPT_DIR:-}" ]]; then
+        echo "[run_online_crl_seed] ADD_EXPLORE=$ADD_EXPLORE needs EMP_CKPT_DIR (the empowerment reward's estimator)" >&2
+        exit 1
+    fi
+    EXPLORE_REWARD=${EXPLORE_REWARD:-empowerment}
+    EMP_FLAG+=(
+        --agent.add_explore="$ADD_EXPLORE"
+        --agent.bonus_scale="${BONUS_SCALE:-1.0}"
+        --agent.explore_reward="$EXPLORE_REWARD"
+    )
+    RB_KIND=""
+    if [[ "$EXPLORE_REWARD" == "max_episodic_empowerment" ]]; then RB_KIND=max; fi
+    case "$ADD_EXPLORE" in
+        reward) TAG="${TAG}_rb${RB_KIND}${BONUS_SCALE:-1.0}" ;;
+        reward-to-rlpd) TAG="${TAG}_rbrlpd${RB_KIND}${BONUS_SCALE:-1.0}" ;;
+        *) echo "[run_online_crl_seed] unknown ADD_EXPLORE=$ADD_EXPLORE (reward | reward-to-rlpd)" >&2; exit 1 ;;
+    esac
 fi
 
-echo "[run_online_crl_seed] env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} emp=${EMP_CKPT_DIR:-off} tag=$TAG job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_online_crl_seed] env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} emp=${EMP_CKPT_DIR:-off} add_explore=${ADD_EXPLORE:-off} tag=$TAG job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \

@@ -42,7 +42,13 @@ last transition of a trajectory, `masks = 1 - terminals`).
 Flat rows also carry `empowerment`: the frozen offline estimator's E(s) when the
 flat agent runs with one (`agents/online_crl.py`, `emp_checkpoint_path`), computed
 once over the whole dataset here and cached on disk next to the estimator
-checkpoint (`<ckpt>/empowerment_values/`), and 0 otherwise.
+checkpoint (`<ckpt>/empowerment_values/`), and 0 otherwise. Marker rows get a value
+too, so `next_empowerment` (E(s') of a trajectory's last transition) is always real.
+`episodic_max_empowerment` is the running max of E along each trajectory (marker
+included), the `max_episodic_empowerment` bonus reward.
+Flat rows also carry `is_offline` (1 here, 0 for online rows): the flat agent's
+exploration bonus critic (`add_explore='reward'`) trains on online rows only and
+masks on this field; `'reward-to-rlpd'` trains on both.
 """
 
 import dataclasses
@@ -143,7 +149,7 @@ def offline_trajectories(seq_dataset):
             yield int(start), int(marker)
 
 
-def _fill_buffer(buffer, seq_dataset, row_fn, keep=None):
+def _fill_buffer(buffer, seq_dataset, row_fn, keep=None, marker_fields=None):
     """Write every offline trajectory into `buffer`; `row_fn(t, start, marker) -> transition dict`.
 
     `keep` (a `[size]` bool array, or None for all) selects which rows are *anchors*.
@@ -151,6 +157,10 @@ def _fill_buffer(buffer, seq_dataset, row_fn, keep=None):
     cut their trajectory in two, shortening the future-goal horizon of every earlier row
     and clamping k-step next observations at the hole. Written-but-not-anchored keeps the
     trajectory intact and merely removes the row from the sampling pool.
+
+    `marker_fields(marker) -> {field: value}` (optional) fills fields of the marker row
+    that closes each trajectory (its other fields are zero), e.g. the final state's
+    empowerment.
     """
     observations = seq_dataset.get_observations(np.arange(seq_dataset.size))
     num_rows = 0
@@ -159,7 +169,10 @@ def _fill_buffer(buffer, seq_dataset, row_fn, keep=None):
             valid = True if keep is None else bool(keep[t])
             buffer.add_transition(row_fn(t, start, marker, observations), valid=valid)
             num_rows += int(valid)
-        buffer.end_trajectory(observations[marker])
+        end_abs = buffer.end_trajectory(observations[marker])
+        if marker_fields is not None:
+            for key, value in marker_fields(marker).items():
+                buffer.write_field(key, [end_abs], np.asarray([value]))
     return num_rows
 
 
@@ -172,7 +185,8 @@ def make_offline_flat_source(seq_dataset, example_transition, goal_discount, emp
     """One offline row per env step: (s_t, a_t, s_{t+1}) with the flat agent's goal discount.
 
     `empowerment` (a `[size]` float array, or None) fills each row's `empowerment` field
-    (None -> 0, the value agents without an estimator never read).
+    (None -> 0, the value agents without an estimator never read); its per-trajectory
+    running max (marker row included) fills `episodic_max_empowerment`.
     """
     buffer = TrajectoryReplayBuffer.create(example_transition, _capacity(seq_dataset))
     actions = np.asarray(seq_dataset.dataset['actions'])
@@ -183,6 +197,7 @@ def make_offline_flat_source(seq_dataset, example_transition, goal_discount, emp
     assert empowerment.shape == (seq_dataset.size,), (
         f'empowerment values {empowerment.shape} do not cover the dataset ({seq_dataset.size} rows)'
     )
+    episodic_max = episodic_running_max(empowerment, seq_dataset)
 
     def row(t, start, marker, observations):
         return dict(
@@ -192,10 +207,25 @@ def make_offline_flat_source(seq_dataset, example_transition, goal_discount, emp
             masks=np.float32(1.0 - terminals[t]),
             terminals=terminals[t],
             empowerment=empowerment[t],
+            episodic_max_empowerment=episodic_max[t],
+            is_offline=np.float32(1.0),
         )
 
-    num_rows = _fill_buffer(buffer, seq_dataset, row)
+    def marker_fields(marker):
+        # The final state's values -> `next_*` of the trajectory's last transition.
+        return dict(empowerment=empowerment[marker], episodic_max_empowerment=episodic_max[marker])
+
+    num_rows = _fill_buffer(buffer, seq_dataset, row, marker_fields=marker_fields)
     return BufferSource(buffer, discount=float(goal_discount), next_offset=1), num_rows
+
+
+def episodic_running_max(values, seq_dataset):
+    """Per-trajectory running max of a `[size]` per-row array (rows [start, marker] inclusive), same shape."""
+    values = np.asarray(values, dtype=np.float32)
+    out = np.array(values, copy=True)
+    for start, marker in offline_trajectories(seq_dataset):
+        out[start : marker + 1] = np.maximum.accumulate(values[start : marker + 1])
+    return out
 
 
 def make_offline_macro_source(seq_dataset, labels, example_transition, k, goal_discount, keep=None):

@@ -66,7 +66,10 @@
 #   DRY_RUN=1                        print the sbatch commands without submitting
 #   SEEDS="0 1"                      a different seed set
 #   LOW_LRS="3e-4 0"                 a different low-lr set (0 == frozen-low-level ablation)
-#   CKPT_KEYS="emp_cube_sgl"         a subset of the three cells
+#   CKPT_KEYS="emp_cube_sgl"         a subset of the cells; emp_pmt_nav (pointmaze-teleport-NAVIGATE,
+#                                    the ckpt the controller baselines at frac=0.5 exist for) is
+#                                    defined but NOT in the default set
+#   LOG_DIR=logs/slurm/foo           where the per-job .log files go
 #   TARGET_ENTROPY_FRAC=0.9          H_target = frac * log(num_skills)
 #   UTD_RATIO=0.1                    one update per 10 env steps instead of per env step, i.e.
 #                                    the controller's gradient budget per ENV STEP (see above)
@@ -75,13 +78,18 @@
 #                                    K-term sum (agent docstring, Eqs. 6-7); results go to a
 #                                    separate rlpd_lowlr<LR>_reinforce/ tree, so it can be run
 #                                    as a second pass without touching the enumerate results
+#   GRAD_METHOD=softmax              softmax(logits) fed to the low level as the skill vector
+#                                    (agent docstring, Eq. 8); tree rlpd_lowlr<LR>_softmax/.
+#                                    submit_composed_online_softmax_lowlr_sweep.sh wraps this.
 #   REINFORCE_BASELINE=none          drop the leave-one-out batch baseline (GRAD_METHOD=reinforce)
+#   LEARNED_ACTION_STD=1             (GRAD_METHOD=softmax) high-level action log-std head + SAC
+#                                    action entropy; tree rlpd_lowlr<LR>_softmax_astd/
 #   TIME_LIMIT=20:00:00              sbatch --time override
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # -> impls/
 
 SBATCH_SCRIPT=scripts/slurm/run_online_composed_skill_policy_seed.sbatch
-LOG_DIR=logs/slurm/composed_online_lowlr
+LOG_DIR=${LOG_DIR:-logs/slurm/composed_online_lowlr}
 DATASET_DIR=${OGBENCH_DATASET_DIR:-/nas/ucb/ishirgarg/.ogbench/data}
 PYTHON=${PYTHON:-/nas/ucb/ishirgarg/miniconda3/envs/ogbench/bin/python}
 TIME_LIMIT=${TIME_LIMIT:-20:00:00}
@@ -97,29 +105,37 @@ GRAD_METHOD=${GRAD_METHOD:-enumerate}
 EXPORT="ALL,GRAD_METHOD=$GRAD_METHOD"
 if [[ -n "$UTD_RATIO" ]]; then EXPORT="$EXPORT,UTD_RATIO=$UTD_RATIO"; fi
 if [[ -n "${REINFORCE_BASELINE:-}" ]]; then EXPORT="$EXPORT,REINFORCE_BASELINE=$REINFORCE_BASELINE"; fi
+LEARNED_ACTION_STD=${LEARNED_ACTION_STD:-0}
+EXPORT="$EXPORT,LEARNED_ACTION_STD=$LEARNED_ACTION_STD"
 if [[ -n "${ACTOR_BATCH_SIZE:-}" ]]; then EXPORT="$EXPORT,ACTOR_BATCH_SIZE=$ACTOR_BATCH_SIZE"; fi
 
-ALL_KEYS=(emp_asoc_nav emp_pmt_stitch emp_cube_sgl)
+# The default cell set is the first three; emp_pmt_nav is opt-in via CKPT_KEYS (both pointmaze
+# checkpoints run on the same sparse online env, they differ only in the pretraining dataset).
+DEFAULT_KEYS="emp_asoc_nav emp_pmt_stitch emp_cube_sgl"
+ALL_KEYS=(emp_asoc_nav emp_pmt_stitch emp_cube_sgl emp_pmt_nav)
 ALL_CKPT_ROOTS=(
     "ckpts/final/empowerment_final/antsoccer-arena-navigate"
     "ckpts/final/empowerment_final/pointmaze-teleport-stitch"
     "ckpts/final/empowerment_final/cube-single-play/sd000_s_38624008.0.20260908_013305"
+    "ckpts/final/empowerment_final/pointmaze-teleport-navigate"
 )
 ALL_ONLINE_ENVS=(
     antsoccer-arena-center-online-v0
     pointmaze-teleport-sparse-online-v0
     cube-single-center-online-v0
+    pointmaze-teleport-sparse-online-v0
 )
-ALL_EPISODE_LENGTHS=(500 "" "")
+ALL_EPISODE_LENGTHS=(500 "" "" "")
 # cube's RLPD pass over its ~300MB dataset is the memory peak (as in every cube sweep here):
 # more headroom, and no 16GB A4000s.
 ALL_EXTRA_SBATCH_FLAGS=(
     ""
     ""
     "--mem=32gb --exclude=ppo.ist.berkeley.edu,vae.ist.berkeley.edu"
+    ""
 )
 
-read -r -a WANTED <<< "${CKPT_KEYS:-${ALL_KEYS[*]}}"
+read -r -a WANTED <<< "${CKPT_KEYS:-$DEFAULT_KEYS}"
 KEYS=(); CKPT_ROOTS=(); ONLINE_ENVS=(); EPISODE_LENGTHS=(); EXTRA_SBATCH_FLAGS=()
 for w in "${WANTED[@]}"; do
     found=0
@@ -197,5 +213,5 @@ done
 
 echo "$( [[ "$DRY_RUN" == "1" ]] && echo "would submit" || echo "submitted" ) $n_submitted jobs" \
      "(low_lrs: $LOW_LRS, seeds: $SEEDS, target_entropy_frac=$TARGET_ENTROPY_FRAC, utd_ratio=${UTD_RATIO:-<agent default 1.0, = controller>}," \
-     "grad_method=$GRAD_METHOD," \
+     "grad_method=$GRAD_METHOD, learned_action_std=$LEARNED_ACTION_STD," \
      "save subdir $SAVE_SUBDIR)"

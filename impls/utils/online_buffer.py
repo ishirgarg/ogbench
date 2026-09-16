@@ -142,7 +142,11 @@ class TrajectoryReplayBuffer:
         return self._data[key][np.flatnonzero(self._valids[: self.size])]
 
     def end_trajectory(self, final_observation):
-        """Close the in-progress trajectory with a marker row holding its final observation."""
+        """Close the in-progress trajectory with a marker row holding its final observation.
+
+        Returns the marker row's absolute index (its other fields are zero; a caller that
+        needs a per-row value there, e.g. the final state's empowerment, `write_field`s it).
+        """
         marker = {key: np.zeros_like(buffer[0]) for key, buffer in self._data.items()}
         marker['observations'] = final_observation
         end_abs = self._write_row(marker, valid=False)
@@ -150,6 +154,7 @@ class TrajectoryReplayBuffer:
             if abs_idx >= self._oldest_abs():
                 self._traj_end[self._slot(abs_idx)] = end_abs
         self._open_rows = []
+        return end_abs
 
     # ── Sampling ─────────────────────────────────────────────────────────────
 
@@ -180,7 +185,10 @@ class TrajectoryReplayBuffer:
 
         Returns:
             Dict with the stored fields at the anchors plus `next_observations`,
-            `value_goals`, `actor_goals`, and `goal_offsets` (in rows).
+            `value_goals`, `actor_goals`, and `goal_offsets` (in rows). Buffers whose rows
+            carry an `empowerment` / `episodic_max_empowerment` field also get
+            `next_empowerment` / `next_episodic_max_empowerment`, that field at the
+            `next_observations` row (the marker row's value for a trajectory's last step).
         """
         assert 0.0 <= discount < 1.0, f'discount must be in [0, 1), got {discount}.'
         assert next_offset >= 1, f'next_offset must be >= 1, got {next_offset}.'
@@ -203,6 +211,9 @@ class TrajectoryReplayBuffer:
 
         batch = {key: buffer[slots] for key, buffer in self._data.items()}
         batch['next_observations'] = self._data['observations'][self._slot(next_abs)]
+        for key in ('empowerment', 'episodic_max_empowerment'):
+            if key in self._data:
+                batch[f'next_{key}'] = self._data[key][self._slot(next_abs)]
         goals = self._data['observations'][self._slot(goal_abs)]
         batch['value_goals'] = goals
         batch['actor_goals'] = goals

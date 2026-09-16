@@ -50,8 +50,41 @@ the [N, K, B, d] tensor; set it False to call the checkpoint's own method.
 E_mean: `emp_mean` if given, else the checkpoint's logged `training/empowerment/mean`
 (its train.csv), else the mean over the calibration rows (offline rows under RLPD,
 otherwise the warm-up online rows); the bin edges always come from those rows.
+`emp_entropy_target=False` keeps the estimator (its E(s) still lands on every row) but
+leaves the entropy constraint as plain scalar-alpha SAC; the reward bonus below is the
+other consumer of E.
+
+Exploration reward bonus (`--agent.add_explore=reward | reward-to-rlpd`)
+-----------------------------------------------------------------------
+Optional, independent of the entropy target (both can be on). A per-transition
+exploration reward r_x(s, a, s') is learned into its OWN non-goal-conditioned critic
+Q_x(s, a) (twin MLP heads + Polyak target copy, `bonus_tau`) by a hard Bellman backup
+
+    Q_x(s, a) <- r_x(s, a, s') + bonus_discount * mask * min_i Q_x^targ(s', a'),   a' ~ pi(. | s', g),
+
+with g the batch row's relabelled future goal (the same goal the actor loss sees). No
+second entropy term is added inside the backup: the run's SAC entropy term already
+lives in the actor loss (decision of 2026-09-15). The actor then maximises
+
+    Q_crl(s, a, g) + bonus_scale * Q_x(s, a) - alpha * log pi(a | s, g).
+
+`explore_reward` names the reward, always a function of the state s' the transition
+lands in, centred with the same E_mean as the entropy target (so Q_x is a discounted
+EXCESS empowerment and sits near 0 rather than at E_mean / (1 - gamma)):
+  * `'empowerment'`:              r_x = E(s') - E_mean, the frozen estimator's empowerment at s'.
+  * `'max_episodic_empowerment'`: r_x = max_{t' <= t+1} E(s_t') - E_mean over the transition's own
+    episode s_1 .. s_{t+1}, i.e. the running max of E along the trajectory so far (rows carry
+    it as `episodic_max_empowerment`; monotone in t within an episode by construction).
+`s'` of a trajectory's last transition is its final observation (the buffer's marker row),
+whose E and running max are filled like every other row's, so the `next_*` fields are
+real everywhere.
+`add_explore='reward'` fits Q_x on ONLINE rows only (offline RLPD rows are masked out of
+its Bellman loss via the rows' `is_offline` flag); `'reward-to-rlpd'` also backs it up on
+the RLPD rows (their E(s') is cached with the dataset). The actor's bonus term and the
+CRL critic are untouched by the mode: both train on every row of the batch as before.
 """
 
+import copy
 import csv
 import json
 import os
@@ -66,7 +99,7 @@ import optax
 from jax.scipy.special import logsumexp
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field, restore_agent
-from utils.networks import GCActor, GCBilinearValue, LogParam, LogParamVector
+from utils.networks import GCActor, GCBilinearValue, GCValue, LogParam, LogParamVector
 from utils.skill_checkpoint import latest_epoch
 
 # Offline estimator families that expose `empowerment(observations, rng) -> [B]` (nats).
@@ -77,6 +110,9 @@ EMPOWERMENT_ESTIMATOR_AGENTS = (
     'empowerment_dads',
     'empowerment_dv',
 )
+
+ADD_EXPLORE_MODES = ('reward', 'reward-to-rlpd')  # plus None / 'none' -> off
+EXPLORE_REWARDS = ('empowerment', 'max_episodic_empowerment')  # per-transition exploration rewards
 
 
 def _read_last_metric(csv_path, column):
@@ -203,6 +239,16 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
     def uses_empowerment(self):
         return self.emp_agent is not None
 
+    @property
+    def uses_entropy_target(self):
+        """Per-state entropy target from E(s) (needs the estimator and `emp_entropy_target`)."""
+        return self.uses_empowerment and bool(self.config['emp_entropy_target'])
+
+    @property
+    def uses_explore_bonus(self):
+        """Exploration reward bonus critic Q_x is on (`add_explore` is 'reward' or 'reward-to-rlpd')."""
+        return self.config['add_explore'] is not None
+
     @jax.jit
     def empowerment(self, observations, seed):
         """E(s) in nats for a batch of observations, from the frozen estimator."""
@@ -286,6 +332,68 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             'logits': logits.mean(),
         }
 
+    # ── Exploration reward bonus ──────────────────────────────────────────────
+
+    def _check_emp_stats_ready(self):
+        if not self.config['emp_stats_ready']:
+            raise RuntimeError(
+                'online_crl: empowerment stats (E_mean, bin edges) are not finalised; '
+                'main_online.py must call agent.with_empowerment_stats before the first update.'
+            )
+
+    def explore_reward(self, batch):
+        """Per-transition exploration reward r_x(s, a, s') for every row of the batch, [B].
+
+        The one hook a new bonus type has to fill in. Both existing rewards are centred
+        with the E_mean the entropy target also uses and read the landing state s':
+        `'empowerment'` E(s') (rows carry `next_empowerment`), `'max_episodic_empowerment'`
+        the running max of E over the episode through s' (`next_episodic_max_empowerment`).
+        """
+        kind = self.config['explore_reward']
+        if kind == 'empowerment':
+            self._check_emp_stats_ready()
+            return batch['next_empowerment'] - self.emp_stats['mean']
+        if kind == 'max_episodic_empowerment':
+            self._check_emp_stats_ready()
+            return batch['next_episodic_max_empowerment'] - self.emp_stats['mean']
+        raise ValueError(f"online_crl: unknown explore_reward {kind!r}")
+
+    def bonus_critic_loss(self, batch, grad_params, rng):
+        """Hard Bellman regression of Q_x(s, a) onto r_x + gamma * mask * min Q_x^targ(s', a'), a' ~ pi(.|s', g).
+
+        `add_explore='reward'` fits only the online rows (`is_offline == 0`); `'reward-to-rlpd'`
+        fits every row. The CRL critic and the actor are not affected by this mask.
+        """
+        next_dist = self.network.select('actor')(batch['next_observations'], batch['actor_goals'])
+        next_actions = next_dist.sample(seed=rng)
+        next_qs = self.network.select('target_bonus_critic')(batch['next_observations'], actions=next_actions)
+        next_q = jnp.min(next_qs, axis=0)  # twin-min, as SAC
+
+        reward = self.explore_reward(batch)  # [B]
+        target_q = reward + self.config['bonus_discount'] * batch['masks'] * next_q
+        # No entropy term here: the run's SAC entropy term is already in the actor loss.
+
+        qs = self.network.select('bonus_critic')(batch['observations'], actions=batch['actions'], params=grad_params)
+        if self.config['add_explore'] == 'reward':
+            weight = 1.0 - batch['is_offline']
+        else:
+            weight = jnp.ones_like(reward)
+        sq_err = jnp.square(qs - target_q[None])  # [2, B]
+        num_rows = jnp.maximum(weight.sum(), 1.0)
+        bonus_critic_loss = (sq_err * weight[None]).sum() / (num_rows * qs.shape[0])
+
+        return bonus_critic_loss, {
+            'bonus_critic_loss': bonus_critic_loss,
+            'q_mean': qs.mean(),
+            'q_max': qs.max(),
+            'q_min': qs.min(),
+            'reward_mean': reward.mean(),
+            'reward_min': reward.min(),
+            'reward_max': reward.max(),
+            'target_q_mean': target_q.mean(),
+            'frac_rows_fit': weight.mean(),
+        }
+
     def actor_loss(self, batch, grad_params, rng):
         """SAC-style actor + alpha losses (JaxGCRL `update_actor_and_alpha`), goal = the sampled future state."""
         dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
@@ -302,13 +410,9 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
 
         entropy = -jax.lax.stop_gradient(log_probs)  # per-sample, [B]
         info = {}
-        if self.uses_empowerment:
+        if self.uses_entropy_target:
             # Per-state entropy target from the row's offline empowerment; temperature per E bin.
-            if not self.config['emp_stats_ready']:
-                raise RuntimeError(
-                    'online_crl: empowerment stats (E_mean, bin edges) are not finalised; '
-                    'main_online.py must call agent.with_empowerment_stats before the first update.'
-                )
+            self._check_emp_stats_ready()
             emp = batch['empowerment']  # [B], nats
             bins = jnp.searchsorted(self.emp_stats['edges'], emp)  # [B] in [0, emp_num_bins)
             target_entropy = self.config['target_entropy'] + self.config['emp_lambda'] * (emp - self.emp_stats['mean'])
@@ -340,7 +444,17 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             alpha_param = self.network.select('alpha')(params=grad_params)
             target_entropy = jnp.full_like(entropy, self.config['target_entropy'])
 
-        actor_loss = (alpha * log_probs - q).mean()
+        if self.uses_explore_bonus:
+            # Exploration bonus: + bonus_scale * Q_x(s, a_pi), Q_x at its stored params (twin-min), on every row.
+            bonus_qs = self.network.select('bonus_critic')(batch['observations'], actions=actions)
+            q_bonus = jnp.min(bonus_qs, axis=0)
+            q_total = q + self.config['bonus_scale'] * q_bonus
+            info['q_bonus_pi_mean'] = q_bonus.mean()
+            info['bonus_term_mean'] = (self.config['bonus_scale'] * q_bonus).mean()
+        else:
+            q_total = q
+
+        actor_loss = (alpha * log_probs - q_total).mean()
         # Entropy temperature: alpha(s) * (H(s) - H_target(s)), H from the stop-gradient sample. With a scalar
         # alpha and constant target this equals the JaxGCRL form alpha * (mean H - H_target).
         alpha_loss = (alpha_param * (entropy - target_entropy)).mean()
@@ -365,7 +479,7 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
-        rng, actor_rng = jax.random.split(rng)
+        rng, actor_rng, bonus_rng = jax.random.split(rng, 3)
 
         critic_loss, critic_info = self.contrastive_loss(batch, grad_params)
         for k, v in critic_info.items():
@@ -376,7 +490,22 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             info[f'actor/{k}'] = v
 
         loss = critic_loss + actor_loss
+        if self.uses_explore_bonus:
+            # Disjoint parameters again (bonus_critic only), so one shared Adam step equals a separate update.
+            bonus_loss, bonus_info = self.bonus_critic_loss(batch, grad_params, bonus_rng)
+            for k, v in bonus_info.items():
+                info[f'bonus_critic/{k}'] = v
+            loss = loss + bonus_loss
         return loss, info
+
+    def target_update(self, network, module_name):
+        """Polyak-average `module_name`'s params into `target_<module_name>` (in place, as agents/sac.py)."""
+        new_target_params = jax.tree_util.tree_map(
+            lambda p, tp: p * self.config['bonus_tau'] + tp * (1 - self.config['bonus_tau']),
+            self.network.params[f'modules_{module_name}'],
+            self.network.params[f'modules_target_{module_name}'],
+        )
+        network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
     def update(self, batch):
@@ -387,6 +516,8 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             return self.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        if self.uses_explore_bonus:
+            self.target_update(new_network, 'bonus_critic')
         return self.replace(network=new_network, rng=new_rng), info
 
     # ── Acting ────────────────────────────────────────────────────────────────
@@ -465,12 +596,31 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             final_fc_init_scale=config['actor_fc_scale'],
             gc_encoder=encoders.get('actor'),
         )
-        # Frozen offline empowerment estimator (optional) -> per-bin entropy temperatures.
+        # Exploration reward bonus mode (None -> off).
+        add_explore = config['add_explore']
+        if add_explore in (None, 'none', ''):
+            add_explore = None
+        elif add_explore not in ADD_EXPLORE_MODES:
+            raise ValueError(f'online_crl: add_explore must be one of {ADD_EXPLORE_MODES} or none, got {add_explore!r}')
+        if add_explore is not None:
+            if config['explore_reward'] not in EXPLORE_REWARDS:
+                raise ValueError(
+                    f"online_crl: explore_reward must be one of {EXPLORE_REWARDS}, got {config['explore_reward']!r}"
+                )
+            if config['emp_checkpoint_path'] is None:  # both rewards are functions of E(s)
+                raise ValueError(
+                    f"online_crl: add_explore with explore_reward={config['explore_reward']!r} needs "
+                    '--agent.emp_checkpoint_path (the frozen estimator that supplies E(s)).'
+                )
+
+        # Frozen offline empowerment estimator (optional): per-bin entropy temperatures when
+        # `emp_entropy_target`, and/or the empowerment exploration reward.
         emp_agent = None
         emp_resolved = None
         if config['emp_checkpoint_path'] is not None:
             assert int(config['emp_num_bins']) >= 1, 'emp_num_bins must be >= 1'
             emp_agent, emp_resolved = load_empowerment_estimator(seed, ex_observations, ex_actions, config)
+        if emp_agent is not None and config['emp_entropy_target']:
             alpha_def = LogParamVector(size=int(config['emp_num_bins']))
         else:
             alpha_def = LogParam()
@@ -480,12 +630,27 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             actor=(actor_def, (ex_observations, ex_goals)),
             alpha=(alpha_def, ()),
         )
+        if add_explore is not None:
+            # Non-goal-conditioned twin critic Q_x(s, a) for the exploration reward + its Polyak target copy.
+            bonus_encoder = None
+            if config['encoder'] is not None:
+                bonus_encoder = GCEncoder(state_encoder=encoder_modules[config['encoder']]())
+            bonus_critic_def = GCValue(
+                hidden_dims=tuple(config['value_hidden_dims']),
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                gc_encoder=bonus_encoder,
+            )
+            network_info['bonus_critic'] = (bonus_critic_def, (ex_observations, None, ex_actions))
+            network_info['target_bonus_critic'] = (copy.deepcopy(bonus_critic_def), (ex_observations, None, ex_actions))
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
         network_def = ModuleDict(networks)
         network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
+        if add_explore is not None:
+            network_params['modules_target_bonus_critic'] = network_params['modules_bonus_critic']
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
         stored_config = config.to_dict() if hasattr(config, 'to_dict') else dict(config)
@@ -494,15 +659,33 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         stored_config['emp_stats_ready'] = False
         stored_config['emp_agent_name'] = None
         stored_config['emp_mean_metric'] = None
+        stored_config['add_explore'] = add_explore
+        if config['bonus_discount'] is None:
+            stored_config['bonus_discount'] = float(config['discount'])
         if emp_resolved is not None:
             stored_config['emp_checkpoint_path'] = emp_resolved['ckpt_path']
             stored_config['emp_restore_epoch'] = emp_resolved['restore_epoch']
             stored_config['emp_agent_name'] = emp_resolved['agent_name']
             stored_config['emp_env_name'] = emp_resolved['env_name']
             stored_config['emp_mean_metric'] = emp_resolved['mean_metric']
+            if config['emp_entropy_target']:
+                print(
+                    f"[online_crl] empowerment entropy target: H_target(s) = {stored_config['target_entropy']:.3f} + "
+                    f"{float(config['emp_lambda'])} * (E(s) - E_mean), {int(config['emp_num_bins'])} alpha bins"
+                )
+            else:
+                print('[online_crl] emp_entropy_target=False: scalar alpha, constant target entropy')
+        if add_explore is not None:
+            rows = 'online rows only' if add_explore == 'reward' else 'online + RLPD rows'
+            formula = {
+                'empowerment': "E(s') - E_mean",
+                'max_episodic_empowerment': "max_{t' <= t+1} E(s_t') - E_mean (episode running max)",
+            }[config['explore_reward']]
             print(
-                f"[online_crl] empowerment entropy target: H_target(s) = {stored_config['target_entropy']:.3f} + "
-                f"{float(config['emp_lambda'])} * (E(s) - E_mean), {int(config['emp_num_bins'])} alpha bins"
+                f"[online_crl] exploration bonus: add_explore={add_explore} (Q_x fit on {rows}), "
+                f"explore_reward={config['explore_reward']} (r_x = {formula}), actor += "
+                f"{float(config['bonus_scale'])} * Q_x(s, a), bonus_discount={stored_config['bonus_discount']}, "
+                f"bonus_tau={float(config['bonus_tau'])}"
             )
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**stored_config), emp_agent=emp_agent)
@@ -531,6 +714,13 @@ def get_config():
             emp_num_bins=8,  # Quantile bins of E, each with its own auto-tuned alpha.
             emp_mean=ml_collections.config_dict.placeholder(float),  # E_mean override (None -> metric, else rows).
             emp_fast_path=True,  # Einsum rewrite of the skill estimator (False -> the checkpoint's own method).
+            emp_entropy_target=True,  # Per-state entropy target from E(s) (above); False -> scalar alpha, E unused there.
+            # Exploration reward bonus (None -> off; see the module docstring).
+            add_explore=ml_collections.config_dict.placeholder(str),  # 'reward' (Q_x on online rows) | 'reward-to-rlpd'.
+            explore_reward='empowerment',  # Bonus reward r_x: 'empowerment' (E(s') - E_mean) | 'max_episodic_empowerment'.
+            bonus_scale=1.0,  # Actor weight on Q_x(s, a) next to the CRL critic ("alpha" of the bonus).
+            bonus_discount=ml_collections.config_dict.placeholder(float),  # Bellman discount of Q_x (None -> discount).
+            bonus_tau=0.005,  # Polyak rate of Q_x's target copy (SAC default).
             # Online schedule (consumed by main_online.py).
             unroll_length=50,  # Env steps collected between update rounds (JaxGCRL unroll_length).
             utd_ratio=1,  # Gradient steps per env step; each round runs unroll_length * utd_ratio updates.

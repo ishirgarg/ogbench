@@ -44,13 +44,13 @@ Eq. 2 is deliberately the same objective the frozen controller already optimises
 Q(s, a_k(z), g). With `low_lr=0.0` (Adam at lr 0 is a no-op) this agent therefore reduces to that
 controller at skill_commitment_k=1, which is the ablation it exists to beat.
 
-`composed_grad_method`: two estimators of the same gradient
------------------------------------------------------------
+`composed_grad_method`: two estimators of the same gradient, and one relaxation
+-------------------------------------------------------------------------------
 Splitting Eq. 2 into its two halves,
 
     J = -alpha * H(pi_hi)  -  E_{k~pi_hi}[ Q(s, a_k, g) ],                           (5)
 
-the entropy half is analytic under either method, so the flag dispatches ONLY the second half:
+the entropy half is analytic under every method, so the flag dispatches ONLY the second half:
 
   'enumerate' (default)  The sum above, evaluated over all K skills. Exact, unbiased, zero
                          variance; K low-level forward passes and K critic evaluations per row.
@@ -77,9 +77,62 @@ the entropy half is analytic under either method, so the flag dispatches ONLY th
                          baseline would need all K critic evaluations, i.e. exactly the cost
                          this method exists to avoid.
 
-Acting is IDENTICAL under both: `sample_actions` draws one k and feeds one pure one-hot to the
-low level. The flag changes only how the gradient of Eq. 5 is estimated, never the policy.
-`actor/objective` logs Eq. 5 on a common scale so the two are directly comparable.
+  'softmax'              NOT an estimator of Eq. 5 but a relaxation of the POLICY: the low level
+                         is conditioned on the full probability vector p = softmax(logits(s,g))
+                         instead of a one-hot,
+
+                             pi(a | s, g) = pi_lo(a | s, p(s, g)),                    (8)
+
+                         so the composed policy is a single low-level pass whose skill input is
+                         continuous, and BOTH levels take an ordinary pathwise gradient of
+                         -Q(s, a, g) through a = pi_lo(s, p): the high level through p (backprop
+                         through the softmax), the low level through a. Exact for Eq. 8, zero
+                         variance, 1 low-level pass per row -- but pi_lo was pretrained on
+                         one-hots only, so interior points of the simplex are off-distribution
+                         for it until it adapts (low_lr > 0), and Eq. 8 is a different policy
+                         class from Eq. 1 (it can express a = pi_lo(s, 0.5 z_1 + 0.5 z_2), which
+                         no mixture of one-hot skills can). The entropy term is kept, on the same
+                         categorical, and acts as a pull of p toward uniform. Requires
+                         skill_commitment_k == 1 (asserted): with a horizon the vector p would
+                         have to be frozen across steps, which nothing here implements.
+
+Acting is IDENTICAL under 'enumerate' and 'reinforce': `sample_actions` draws one k and feeds
+one pure one-hot to the low level; the flag changes only how the gradient of Eq. 5 is estimated,
+never the policy. Under 'softmax' acting follows Eq. 8: the low level is fed
+p = softmax(logits / temperature) (temperature=0, the evaluator's, makes p the argmax one-hot, so
+eval is a plain committed skill). NOTE this makes the collector's policy DETERMINISTIC at the
+default low_temperature=0 -- the categorical is never sampled, so no exploration noise enters
+anywhere; set low_temperature > 0 if you want any. The recorded eval "skill" is argmax p.
+`actor/objective` logs Eq. 5 (Eq. 8's -Q for 'softmax') on a common scale.
+
+`learned_action_std` (softmax mode only): SAC-style action noise from the high level
+--------------------------------------------------------------------------------------
+Under 'softmax' nothing is ever sampled, so at low_temperature=0 the collector is deterministic.
+With `learned_action_std=True` the high level grows a second head, a state-and-goal-conditioned
+log-std `action_log_std(s, g)` (clipped to [action_log_std_min, action_log_std_max], the range
+online_crl uses), and the composed action becomes the tanh-squashed Gaussian of online_crl/SAC
+centred on the low level's action:
+
+    a = tanh( atanh(clip(mu_lo(s, p(s,g)))) + exp(log_std_hi(s,g)) * eps ),  eps ~ N(0, I).  (9)
+
+At zero noise a = clip(mu_lo), i.e. the deterministic softmax policy EXACTLY (to the 1e-5
+clip margin), so the pretrained mean mapping is preserved; the atanh is straight-through in the
+backward pass (value atanh(clip(mu)), gradient 1), so its 1/(1-mu^2) blow-up near the box never
+reaches the low level. The constant unit std the pretrained low level shipped with is simply not
+used (low_temperature must be 0). Eq. 9 is reparameterised, so the same pathwise gradient of -Q
+reaches p, mu_lo and now log_std_hi.
+
+The entropy is that of the SQUASHED distribution, estimated as online_crl does (closed-form
+Gaussian part + the sampled tanh log-det, sum_i log(1 - a_i^2)). This matters: the pre-squash
+Gaussian entropy is unbounded in the std, so an alpha term on it drives log_std into its clip
+where the gradient is zero and it can never come back (observed: std 1 -> 5 in five updates
+against a fresh critic). The squashed entropy peaks at a finite std (the uniform on the box, A
+log 2) and falls beyond it, so the bonus itself stops the runaway. A second alpha,
+`action_alpha`, is tuned toward `action_target_entropy` (default -0.5 * A, online_crl's target).
+The categorical entropy term on p and its alpha stay exactly as they are, so
+`target_entropy_frac` is now a REGULARISER on how soft p is rather than the exploration knob.
+Acting samples Eq. 9 at the high level's temperature (the collector's 1 scales the std, the
+evaluator's 0 zeroes it and takes the argmax one-hot).
 
 Entropy
 -------
@@ -122,6 +175,7 @@ import os
 from typing import Any
 
 import flax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -132,11 +186,11 @@ from agents.empowerment_skill import EmpowermentAgent
 from agents.opal import OPALAgent
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCBilinearValue, GCDiscreteActor, LogParam
+from utils.networks import MLP, GCBilinearValue, GCDiscreteActor, LogParam, default_init
 from utils.skill_checkpoint import load_frozen_skill_agent
 
 # How the expectation over the discrete skill is turned into a gradient (see `actor_loss`).
-COMPOSED_GRAD_METHODS = ('enumerate', 'reinforce')
+COMPOSED_GRAD_METHODS = ('enumerate', 'reinforce', 'softmax')
 REINFORCE_BASELINES = ('batch', 'none')
 
 # Pretrained families with a finite skill set AND a low level that is a plain function of
@@ -158,6 +212,38 @@ UNSUPPORTED_SKILL_AGENTS = {
         'not well defined. Use agents/online_crl_skill_controller.py, which executes it as an option.'
     ),
 }
+
+
+class GCActionLogStd(nn.Module):
+    """State-and-goal-conditioned per-dimension action log-std head (Eq. 9): an MLP over (s, g).
+
+    Mirrors `GCDiscreteActor`'s input handling (optional `gc_encoder` for pixels, otherwise a
+    plain concat) and the small-scale final init `GCActor` uses for its std head, so the noise
+    starts near exp(0) = 1 and moves from there.
+    """
+
+    hidden_dims: Any
+    action_dim: int
+    log_std_min: float = -5.0
+    log_std_max: float = 2.0
+    final_fc_init_scale: float = 1e-2
+    gc_encoder: Any = None
+    activations: Any = nn.gelu
+
+    def setup(self):
+        self.trunk = MLP(self.hidden_dims, activate_final=True, activations=self.activations)
+        self.log_std_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
+
+    def __call__(self, observations, goals=None, goal_encoded=False):
+        if self.gc_encoder is not None:
+            inputs = self.gc_encoder(observations, goals, goal_encoded=goal_encoded)
+        else:
+            inputs = [observations]
+            if goals is not None:
+                inputs.append(goals)
+            inputs = jnp.concatenate(inputs, axis=-1)
+        log_stds = self.log_std_net(self.trunk(inputs))
+        return jnp.clip(log_stds, self.log_std_min, self.log_std_max)
 
 
 class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
@@ -214,6 +300,34 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
         else:
             actions = self._low_dist(observations, skills, low_params, temperature=temperature).sample(seed=rng)
         return jnp.clip(actions, -1.0, 1.0)
+
+    # Margin keeping atanh finite: the deterministic action is clip(mu) to within this.
+    _SQUASH_EPS = 1e-5
+
+    def _noisy_low_action(self, observations, goals, skills, low_params, rng, temperature=1.0, grad_params=None):
+        """Eq. 9: tanh(atanh(clip(mu_lo(s, z))) + temperature * exp(log_std_hi(s, g)) * eps).
+
+        `learned_action_std` only. Returns (action, entropy_estimate [B]) where the estimate is
+        the squashed distribution's -log pi(a) with the Gaussian part in closed form:
+        sum_i log_std_i + A/2 (1 + log 2 pi) + sum_i log(1 - a_i^2). Its expectation is the
+        squashed entropy and its reparameterised gradient is that entropy's gradient.
+        """
+        mean = self._low_dist(observations, skills, low_params, temperature=1.0).mode()
+        mean = jnp.clip(mean, -1.0 + self._SQUASH_EPS, 1.0 - self._SQUASH_EPS)
+        # Straight-through atanh: forward value atanh(mean), backward gradient 1. Together with
+        # tanh's (1 - a^2) on the way out, the low level sees d a / d mu_lo = 1 - a^2 <= 1,
+        # i.e. the soft version of clip's gradient, never the 1/(1 - mu^2) of atanh.
+        pre = mean + jax.lax.stop_gradient(jnp.arctanh(mean) - mean)
+        log_std = self.network.select('action_log_std')(observations, goals, params=grad_params)
+        eps = jax.random.normal(rng, mean.shape)
+        u = pre + temperature * jnp.exp(log_std) * eps
+        actions = jnp.tanh(u)
+        action_dim = mean.shape[-1]
+        # log(1 - tanh(u)^2) = 2 (log 2 - u - softplus(-2u)), the numerically stable form.
+        log_det = 2.0 * (jnp.log(2.0) - u - jax.nn.softplus(-2.0 * u))
+        gauss_entropy = jnp.sum(log_std, axis=-1) + 0.5 * action_dim * (1.0 + jnp.log(2.0 * jnp.pi))
+        entropy_est = gauss_entropy + jnp.sum(log_det, axis=-1)
+        return actions, entropy_est, log_std
 
     def _per_skill_actions(self, observations, low_params, rng):
         """a_k for every skill: [K, B, action_dim]. `jax.vmap` over the skill axis."""
@@ -305,10 +419,13 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
         # alpha is read at its STORED value: the actor loss never trains it, `alpha_loss` does.
         alpha = self.network.select('alpha')()
 
-        if self.config['composed_grad_method'] == 'enumerate':
+        method = self.config['composed_grad_method']
+        if method == 'enumerate':
             q_loss, info = self._q_loss_enumerate(observations, goals, pi, alpha, log_pi, low_params, act_rng)
-        else:
+        elif method == 'reinforce':
             q_loss, info = self._q_loss_reinforce(observations, goals, log_pi, alpha, low_params, act_rng)
+        else:
+            q_loss, info = self._q_loss_softmax(observations, goals, pi, low_params, act_rng, grad_params)
 
         # -alpha * H(pi_hi): the entropy half of Eq. 5. Gradient reaches only the high level.
         entropy_loss = -(alpha * entropy).mean()
@@ -318,6 +435,25 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
         entropy_sg = jax.lax.stop_gradient(entropy).mean()
         target_entropy = self.config['target_entropy']
         alpha_loss = alpha_param * (entropy_sg - target_entropy)
+
+        if self.config['learned_action_std']:
+            # SAC on the action Gaussian of Eq. 9: -action_alpha * H_a, its own alpha tuned
+            # toward action_target_entropy. The categorical term above is untouched.
+            action_entropy = info.pop('action_entropy_rows')  # (B,), carries gradient to the std head
+            action_alpha = self.network.select('action_alpha')()
+            action_alpha_param = self.network.select('action_alpha')(params=grad_params)
+            action_entropy_loss = -(action_alpha * action_entropy).mean()
+            action_entropy_sg = jax.lax.stop_gradient(action_entropy).mean()
+            action_alpha_loss = action_alpha_param * (action_entropy_sg - self.config['action_target_entropy'])
+            actor_loss = actor_loss + action_entropy_loss
+            alpha_loss = alpha_loss + action_alpha_loss
+            info.update(
+                action_entropy=action_entropy_sg,
+                action_entropy_loss=action_entropy_loss,
+                action_alpha=action_alpha,
+                action_alpha_loss=action_alpha_loss,
+                action_target_entropy=self.config['action_target_entropy'],
+            )
 
         total_loss = actor_loss + alpha_loss
         info.update(
@@ -330,8 +466,9 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
             target_entropy=target_entropy,
             pi_max_mean=jnp.mean(jnp.max(pi, axis=-1)),
         )
-        # Eq. 5 itself, on the same scale under both methods (exact under 'enumerate', the
-        # one-sample estimate under 'reinforce'), so learning curves are comparable.
+        # Eq. 5 itself, on the same scale under every method (exact under 'enumerate', the
+        # one-sample estimate under 'reinforce', Eq. 8's -Q under 'softmax'), so learning curves
+        # are comparable.
         info['objective'] = jax.lax.stop_gradient(info.pop('q_term') - (alpha * entropy).mean())
         return total_loss, info
 
@@ -456,6 +593,45 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
         info.update(self._low_action_stats(actions))
         return q_loss, info
 
+    def _q_loss_softmax(self, observations, goals, pi, low_params, rng, grad_params=None):
+        """-Q(s, pi_lo(s, p), g) with p = pi_hi(.|s,g) fed to the low level as a VECTOR (Eq. 8).
+
+        No skill is sampled and none is enumerated: the probability vector itself is the
+        low level's conditioning input, in place of the one-hot z_k. The action is then a
+        smooth function of BOTH parameter trees, so a single pathwise gradient reaches the
+        high level (through the softmax, via p) and the low level (through a). One low-level
+        forward pass and one critic evaluation per row.
+
+        This is a relaxation of the policy, not an estimator of Eq. 5's gradient: it
+        optimises Eq. 8, whose value -Q(s, a(p), g) is reported as `q_term` so the objective
+        curve stays on the same scale as the other two methods.
+        """
+        # `pi` carries the gradient to the high level; nothing is stop-gradiented here.
+        info = {}
+        if self.config['learned_action_std']:
+            # Eq. 9: the high level's std head adds reparameterised noise to the low level's mean.
+            actions, entropy_rows, log_std = self._noisy_low_action(
+                observations, goals, pi, low_params, rng, grad_params=grad_params
+            )
+            info['action_entropy_rows'] = entropy_rows
+            info['action_std_mean'] = jnp.exp(jax.lax.stop_gradient(log_std)).mean()
+            info['action_log_std_mean'] = jax.lax.stop_gradient(log_std).mean()
+        else:
+            actions = self._low_action(observations, pi, low_params, rng=rng)  # (B, A)
+        q = self.network.select('critic')(observations, goals, actions=actions)[0]  # (B,)
+
+        q_loss = -q.mean()
+        info.update({
+            'q_term': q_loss,
+            'q_pi_mean': q.mean(),
+            # How far the conditioning vector sits from the one-hot vertices pi_lo was trained
+            # on: 1 at a vertex, 1/K at the centroid (`pi_max_mean` in actor_loss is the same
+            # number; the L2 norm is the complementary view).
+            'skill_vec_l2_mean': jnp.linalg.norm(jax.lax.stop_gradient(pi), axis=-1).mean(),
+        })
+        info.update(self._low_action_stats(actions))
+        return q_loss, info
+
     @jax.jit
     def total_loss(self, batch, grad_params, low_params, rng=None):
         """Critic loss (full batch) + composed actor loss (over both parameter trees)."""
@@ -495,6 +671,8 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
 
         info = dict(info)
         info['actor/grad_norm_high'] = optax.global_norm(grads['main']['modules_actor'])
+        if self.config['learned_action_std']:
+            info['actor/grad_norm_action_log_std'] = optax.global_norm(grads['main']['modules_action_log_std'])
         info['actor/grad_norm_low'] = optax.global_norm(grads['low'])
         info['critic/grad_norm'] = optax.global_norm(grads['main']['modules_critic'])
 
@@ -526,24 +704,46 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
         skills = skills.astype(jnp.int32)
         return skills[0] if single else skills
 
+    def _skill_conditioning(self, obs_b, goals_b, seed, temperature):
+        """The vector handed to the low level for a batch, plus the skill index to RECORD for it.
+
+        'enumerate' / 'reinforce': k ~ pi_hi(.|s,g) at `temperature`, returned as its one-hot (Eq. 1).
+        'softmax': p = softmax(logits / temperature) itself (Eq. 8); the recorded index is argmax p.
+        At temperature=0 both give the argmax one-hot, so evaluation is identical across methods.
+        """
+        if self.config['composed_grad_method'] == 'softmax':
+            probs = self.network.select('actor')(obs_b, goals_b, temperature=temperature).probs  # (B, K)
+            return probs, jnp.argmax(probs, axis=-1).astype(jnp.int32)
+        skill_idxs = self.network.select('actor')(obs_b, goals_b, temperature=temperature).sample(seed=seed)
+        skill_idxs = skill_idxs.astype(jnp.int32)
+        return self._skill_vectors()[skill_idxs], skill_idxs
+
     @jax.jit
     def sample_actions(self, observations, goals=None, seed=None, temperature=1.0):
-        """a ~ pi(.|s,g) of Eq. 1: draw k ~ pi_hi(.|s,g), then act with pi_lo(.|s,z_k). One env step.
+        """a ~ pi(.|s,g): Eq. 1 (draw k, act with pi_lo(.|s,z_k)) or Eq. 8 under 'softmax'. One env step.
 
         `temperature` is the HIGH level's (the collector explores at 1, the evaluator commits at 0);
         the low level always acts at `low_temperature`, as it does under a frozen controller.
         """
         if seed is None:
             seed = self.rng
+        if goals is None:
+            raise ValueError('online_composed_skill_policy needs a goal: pi_hi(k | s, g) is goal-conditioned.')
         high_seed, low_seed = jax.random.split(seed)
         single = self._single_obs(observations)
         obs_b = observations[None, ...] if single else observations
+        goals_b = goals[None, ...] if single else goals
 
-        skill_idxs = self.sample_skills(observations, goals, seed=high_seed, temperature=temperature)
-        skill_idxs = jnp.atleast_1d(skill_idxs)
-        skills = self._skill_vectors()[skill_idxs]
-        actions = self._low_action(obs_b, skills, rng=low_seed)
+        skills, _ = self._skill_conditioning(obs_b, goals_b, high_seed, temperature)
+        actions = self._act_low(obs_b, goals_b, skills, low_seed, temperature)
         return actions[0] if single else actions
+
+    def _act_low(self, obs_b, goals_b, skills, rng, temperature):
+        """The low level's action for acting: Eq. 9 with the std scaled by `temperature` when
+        `learned_action_std`, else the plain (low_temperature) action."""
+        if self.config['learned_action_std']:
+            return self._noisy_low_action(obs_b, goals_b, skills, None, rng, temperature=temperature)[0]
+        return self._low_action(obs_b, skills, rng=rng)
 
     # ── Eval hooks (contract used by utils/online_evaluation.py) ──────────────
     #
@@ -563,15 +763,18 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
             seed = self.rng
         if agent_state is None:
             agent_state = self.init_eval_state()
+        if goals is None:
+            raise ValueError('online_composed_skill_policy needs a goal: pi_hi(k | s, g) is goal-conditioned.')
         high_seed, low_seed = jax.random.split(seed)
-
-        skill = self.sample_skills(observations, goals, seed=high_seed, temperature=temperature)
         single = self._single_obs(observations)
         obs_b = observations[None, ...] if single else observations
-        skills = self._skill_vectors()[jnp.atleast_1d(skill)]
-        actions = self._low_action(obs_b, skills, rng=low_seed)
+        goals_b = goals[None, ...] if single else goals
+
+        skills, skill_idxs = self._skill_conditioning(obs_b, goals_b, high_seed, temperature)
+        actions = self._act_low(obs_b, goals_b, skills, low_seed, temperature)
         actions = actions[0] if single else actions
-        return actions, {'skill': skill.astype(jnp.int32), 'count': agent_state['count'] + 1}
+        skill = skill_idxs[0] if single else skill_idxs
+        return actions, {'skill': skill, 'count': agent_state['count'] + 1}
 
     # ── Skill-conditioned evaluation hooks (see eval_skill_policy.py) ─────────
     #
@@ -624,6 +827,24 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
             raise ValueError(
                 f"reinforce_baseline must be one of {sorted(REINFORCE_BASELINES)}, got "
                 f"{config['reinforce_baseline']!r}."
+            )
+        if config['learned_action_std']:
+            if config['composed_grad_method'] != 'softmax':
+                raise ValueError(
+                    "learned_action_std=True requires composed_grad_method='softmax': under 'enumerate' the "
+                    'K-component mixture has no closed-form action entropy, and under \'reinforce\' the sampled '
+                    f"skill already carries the exploration. Got {config['composed_grad_method']!r}."
+                )
+            if float(config['low_temperature']) != 0.0:
+                raise ValueError(
+                    "learned_action_std=True replaces the low level's own std with the high level's head, so "
+                    f"low_temperature must be 0 (got {config['low_temperature']})."
+                )
+        if config['composed_grad_method'] == 'softmax' and int(config['skill_commitment_k']) != 1:
+            raise ValueError(
+                f"composed_grad_method='softmax' requires skill_commitment_k == 1 (got "
+                f"{config['skill_commitment_k']}): the low level is conditioned on the probability vector "
+                f'p(s, g) of the CURRENT step, and holding it fixed across a skill horizon is not implemented.'
             )
 
         # ── The pretrained low level (TRAINED here, unlike every *_controller) ──
@@ -687,6 +908,20 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
             actor=(actor_def, (ex_observations, ex_goals)),
             alpha=(alpha_def, ()),
         )
+        if config['learned_action_std']:
+            # Eq. 9: the high level's second head (per-dimension action log-std over (s, g)) and
+            # the second entropy temperature. Both live in `network`, i.e. train at `lr`.
+            if config['encoder'] is not None:
+                encoders['action_log_std'] = GCEncoder(concat_encoder=encoder_modules[config['encoder']]())
+            log_std_def = GCActionLogStd(
+                hidden_dims=tuple(config['actor_hidden_dims']),
+                action_dim=ex_actions.shape[-1],
+                log_std_min=float(config['action_log_std_min']),
+                log_std_max=float(config['action_log_std_max']),
+                gc_encoder=encoders.get('action_log_std'),
+            )
+            network_info['action_log_std'] = (log_std_def, (ex_observations, ex_goals))
+            network_info['action_alpha'] = (LogParam(), ())
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -702,18 +937,34 @@ class OnlineComposedSkillPolicyAgent(flax.struct.PyTreeNode):
         stored_config['skill_checkpoint_path'] = resolved['ckpt_path']
         stored_config['skill_agent_name'] = resolved['agent_name']
         stored_config['target_entropy'] = float(config['target_entropy_frac']) * float(np.log(num_skills))
+        if config['learned_action_std']:
+            action_dim = int(ex_actions.shape[-1])
+            stored_config['action_target_entropy'] = (
+                -0.5 * action_dim if config['action_target_entropy'] is None else float(config['action_target_entropy'])
+            )
+            print(
+                f'[online_composed_skill_policy] learned_action_std=True: the high level has an action log-std head '
+                f'(clipped to [{float(config["action_log_std_min"])}, {float(config["action_log_std_max"])}]) that '
+                f"replaces the low level's constant std; action_target_entropy = "
+                f"{stored_config['action_target_entropy']:.3f} (action_dim={action_dim}), its own alpha. The "
+                f'categorical entropy target below is now a regulariser on p, not the exploration knob.'
+            )
         # Rows are env steps, so the buffer's future-goal discount is the per-step one.
         stored_config['goal_discount'] = float(config['discount'])
         method = config['composed_grad_method']
+        method_desc = {
+            'enumerate': 'an EXACT gradient from the K-term sum over skills.',
+            'reinforce': "a REINFORCE gradient from one sampled skill, rewarded by the low level's own loss.",
+            'softmax': (
+                'a pathwise gradient through softmax(logits), which is fed to the low level AS THE SKILL '
+                'VECTOR (no one-hot, no sampling; acting does the same, so the collector is deterministic at '
+                f"low_temperature={float(config['low_temperature'])})."
+            ),
+        }[method]
         print(
             f'[online_composed_skill_policy] composed_grad_method={method!r}'
             + (f" (reinforce_baseline={config['reinforce_baseline']!r})" if method == 'reinforce' else '')
-            + f': the high level gets '
-            + (
-                'an EXACT gradient from the K-term sum over skills.'
-                if method == 'enumerate'
-                else "a REINFORCE gradient from one sampled skill, rewarded by the low level's own loss."
-            )
+            + f': the high level gets {method_desc}'
         )
         print(
             f"[online_composed_skill_policy] target_entropy = target_entropy_frac * log(num_skills) = "
@@ -753,7 +1004,7 @@ def get_config():
             latent_dim=512,  # Latent dimension for phi and psi.
             layer_norm=True,  # Whether to use layer normalization.
             discount=0.99,  # Discount per env step (future-goal sampling: P(offset=j) ~ discount^j).
-            target_entropy_frac=0.9,  # H_target = frac * log(num_skills) (frac <= 1 -> always reachable).
+            target_entropy_frac=0.5,  # H_target = frac * log(num_skills) (frac <= 1 -> always reachable).
             # How the Q signal reaches the two levels (both optimise the SAME objective, Eq. 5):
             #   'enumerate' -- sum over all K skills. Exact, zero-variance, K low-level forward
             #                  passes and K critic evaluations per row.
@@ -762,11 +1013,22 @@ def get_config():
             #                  a score-function gradient with the low level's loss as a negative
             #                  reward. 1 low-level pass per row, but the high-level gradient now
             #                  carries variance.
+            #   'softmax'   -- relaxation, not an estimator: softmax(logits) is handed to the low
+            #                  level AS ITS SKILL VECTOR, so one pathwise gradient reaches both
+            #                  levels. Changes the policy (acting feeds the same vector; eval at
+            #                  temperature 0 is still the argmax one-hot). Needs skill_commitment_k=1.
             composed_grad_method='enumerate',
             # REINFORCE only: baseline subtracted from the reward. 'batch' is the leave-one-out
             # batch mean of Q (exactly unbiased); 'none' is b = 0. Ignored by 'enumerate'.
             reinforce_baseline='batch',
             low_temperature=0.0,  # Sampling temperature of the low level (0 -> its mode, as when frozen).
+            # 'softmax' only: give the high level an action log-std head and sample
+            # a = clip(mu_lo(s, p) + exp(log_std_hi(s, g)) * eps) (Eq. 9), with a second alpha tuned on
+            # the action Gaussian's entropy. Otherwise the softmax collector is deterministic.
+            learned_action_std=False,
+            action_target_entropy=ml_collections.config_dict.placeholder(float),  # None -> -0.5 * action_dim.
+            action_log_std_min=-5.0,  # Clip range of the action log-std head (online_crl's).
+            action_log_std_max=2.0,
             # Pretrained low level (trained here at low_lr).
             skill_checkpoint_path=ml_collections.config_dict.placeholder(str),  # Required: skill run dir.
             skill_restore_epoch=ml_collections.config_dict.placeholder(int),  # Pretrained epoch (None -> latest).

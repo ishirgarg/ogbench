@@ -3,13 +3,19 @@
 Two collectors share one interface, `step(agent) -> dict`, and push compact rows
 into a `TrajectoryReplayBuffer`:
 
-  * `FlatCollector`   -- one env step per row: (s, a, r, mask, done, E(s)). Used by the
-    flat online CRL agent. The behaviour policy is the stochastic actor
+  * `FlatCollector`   -- one env step per row: (s, a, r, mask, done, E(s), is_offline=0).
+    Used by the flat online CRL agent. The behaviour policy is the stochastic actor
     (`temperature=1`), as in JaxGCRL's `actor_step`. `E(s)` is the row's offline
     empowerment estimate (agents/online_crl.py, `emp_checkpoint_path`): rows are written
     with a NaN placeholder and `flush_empowerment(agent)` fills the pending rows in one
-    batched call, which `main_online.py` runs before every update round. Agents without
-    an estimator store 0 and never read the field.
+    batched call, which `main_online.py` runs before every update round. The marker row
+    that closes an episode (the final observation) is filled the same way, so every
+    transition's E(s') exists (the reward of the exploration bonus). Each row also gets
+    `episodic_max_empowerment`, the running max of E over its episode up to and including
+    the row (the `max_episodic_empowerment` bonus reward); it is derived at flush time
+    from the freshly written E values and the row before it. Agents without an
+    estimator store 0 and never read either field. `is_offline` is 0 on every online
+    row and 1 on RLPD rows (utils/rlpd.py); the exploration bonus critic masks on it.
   * `MacroCollector`  -- one SMDP macro-step per row: the high-level agent picks a
     skill z, which the frozen low-level policy executes for `k` env steps (or
     until the episode ends). The row is (s_t, z, R, mask, done) with
@@ -63,6 +69,8 @@ class FlatCollector:
         self.discrete = discrete
         self.tracker = _EpisodeTracker()
         self._pending_empowerment = []  # abs indices of rows whose `empowerment` is still the NaN placeholder
+        self._pending_first = []  # parallel to the above: does the row start a new episode?
+        self._episode_first_row = True  # the next row written starts a new episode
         self._reset_episode()
 
     def _reset_episode(self):
@@ -70,6 +78,7 @@ class FlatCollector:
         self.observation = observation
         self.goal = info['goal']
         self.tracker.reset()
+        self._episode_first_row = True
 
     @staticmethod
     def example_transition(example_batch):
@@ -81,22 +90,48 @@ class FlatCollector:
             masks=np.float32(1.0),
             terminals=np.float32(0.0),
             empowerment=np.float32(0.0),
+            episodic_max_empowerment=np.float32(0.0),
+            is_offline=np.float32(0.0),
         )
 
-    def flush_empowerment(self, agent):
-        """Fill the empowerment field of every row added since the last flush (one batched estimator call).
+    def _mark_pending(self, abs_idx):
+        """Queue a row for `flush_empowerment` (NaN placeholders until then)."""
+        self._pending_empowerment.append(abs_idx)
+        self._pending_first.append(self._episode_first_row)
+        self._episode_first_row = False
 
-        Returns the number of rows filled. A no-op for agents without an estimator (their
-        rows were written with 0, not NaN, so the field is never a placeholder).
+    def flush_empowerment(self, agent):
+        """Fill `empowerment` and `episodic_max_empowerment` of every row added since the last flush.
+
+        One batched estimator call for E; the running max walks the pending rows in order
+        (they are contiguous and in write order), restarting at each episode's first row
+        and otherwise taking the max of the row's E and the previous row's running max
+        (already in the buffer, or computed earlier in this walk). Returns the number of
+        rows filled. A no-op for agents without an estimator (their rows were written
+        with 0, not NaN, so the field is never a placeholder).
         """
         if not self._pending_empowerment:
             return 0
         abs_idxs = np.asarray(self._pending_empowerment, dtype=np.int64)
+        firsts = self._pending_first
         self._pending_empowerment = []
+        self._pending_first = []
         self.rng, key = jax.random.split(self.rng)
         observations = self.buffer.read_field('observations', abs_idxs)
-        values = agent.empowerment_np(observations, key)
-        self.buffer.write_field('empowerment', abs_idxs, values.astype(np.float32))
+        values = agent.empowerment_np(observations, key).astype(np.float32)
+        self.buffer.write_field('empowerment', abs_idxs, values)
+
+        running = np.empty_like(values)
+        for i, (abs_idx, first) in enumerate(zip(abs_idxs, firsts)):
+            if first:
+                running[i] = values[i]
+            else:
+                prev = running[i - 1] if i > 0 and abs_idxs[i - 1] == abs_idx - 1 else (
+                    self.buffer.read_field('episodic_max_empowerment', [abs_idx - 1])[0]
+                )
+                running[i] = max(values[i], prev)
+        assert np.all(np.isfinite(running)), 'episodic running max hit an unfilled predecessor row'
+        self.buffer.write_field('episodic_max_empowerment', abs_idxs, running)
         return int(len(abs_idxs))
 
     def step(self, agent):
@@ -121,15 +156,24 @@ class FlatCollector:
                 # NaN until `flush_empowerment`: sampling an unfilled row would surface as a NaN loss
                 # rather than silently training on a wrong entropy target.
                 empowerment=np.float32(np.nan if uses_empowerment else 0.0),
+                episodic_max_empowerment=np.float32(np.nan if uses_empowerment else 0.0),
+                is_offline=np.float32(0.0),
             )
         )
         if uses_empowerment:
-            self._pending_empowerment.append(abs_idx)
+            self._mark_pending(abs_idx)
         self.observation = next_observation
 
         episode = None
         if done:
-            self.buffer.end_trajectory(next_observation)
+            end_abs = self.buffer.end_trajectory(next_observation)
+            if uses_empowerment:
+                # The marker row is never an anchor but it IS the last transition's next state,
+                # whose E(s') the exploration bonus reads: give it the same NaN-until-flushed slots.
+                nan = np.array([np.nan], dtype=np.float32)
+                self.buffer.write_field('empowerment', [end_abs], nan)
+                self.buffer.write_field('episodic_max_empowerment', [end_abs], nan)
+                self._mark_pending(end_abs)
             episode = self.tracker.summary()
             self._reset_episode()
         return dict(env_steps=1, rows=1, episode=episode)

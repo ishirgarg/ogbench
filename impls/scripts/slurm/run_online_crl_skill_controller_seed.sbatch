@@ -148,7 +148,7 @@ srun "$PYTHON" -u main_online.py \
     "${TES_FLAG[@]}" \
     "${THRESHOLD_FLAG[@]}" \
     --log_interval=5000 \
-    --eval_interval=20000 \
+    --eval_interval=15000 \
     --save_interval=100000 \
-    --eval_episodes=20 \
+    --eval_episodes=100 \
     --video_episodes=0
