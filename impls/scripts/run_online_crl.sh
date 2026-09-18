@@ -19,7 +19,9 @@
 # ADD_EXPLORE=reward (Q_x fit on online rows) or reward-to-rlpd (RLPD rows too), with
 # BONUS_SCALE (default 1.0) the actor weight on Q_x; needs an estimator (EMP_CKPT_DIR).
 # EXPLORE_REWARD picks the reward: empowerment (default, E(s')) or max_episodic_empowerment
-# (running max of E over the episode). Tag suffix "_rb[max]<scale>" / "_rbrlpd[max]<scale>".
+# (running max of E over the episode). BONUS_TIME_FRAC (agent default: unset, no annealing) linearly decays
+# bonus_scale to 0 by that fraction of TOTAL_ENV_STEPS, held at 0 after; 0 disables the bonus
+# from the start, 1.0 decays over the whole run. Tag suffix "_rb[max]<scale>[_ann<frac>]".
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -55,6 +57,8 @@ EMP_ENTROPY_TARGET=${EMP_ENTROPY_TARGET:-}   # empty -> agent default (True); "F
 ADD_EXPLORE=${ADD_EXPLORE:-}   # empty -> off; "reward" | "reward-to-rlpd"
 BONUS_SCALE=${BONUS_SCALE:-1.0}
 EXPLORE_REWARD=${EXPLORE_REWARD:-empowerment}   # "empowerment" | "max_episodic_empowerment" (tag "max")
+BONUS_TIME_FRAC=${BONUS_TIME_FRAC:-}   # empty -> agent default (no annealing); else fraction of total_env_steps at
+                                        # which bonus_scale has linearly decayed to 0 (tag "_ann<frac>")
 declare -A EMP_DEFAULTS=(
     [antmaze-medium-center-online-v0]=ckpts/final/empowerment_final/antmaze-medium-navigate/sd000_s_37866290.0.20260821_030441_k50_s0.01_bc0.001
     [antsoccer-arena-center-online-v0]=ckpts/final/empowerment_final/antsoccer-arena-navigate/sd000_s_38390672.0.20260901_154836
@@ -117,6 +121,10 @@ for i in "${!ENVS[@]}"; do
     if [[ -n "$ADD_EXPLORE" ]]; then
         if [[ -z "$EMP_CKPT" ]]; then echo "ADD_EXPLORE=$ADD_EXPLORE needs EMP_CKPT_DIR (the empowerment reward's estimator)" >&2; exit 1; fi
         EMP_FLAG+=(--agent.add_explore="$ADD_EXPLORE" --agent.bonus_scale="$BONUS_SCALE" --agent.explore_reward="$EXPLORE_REWARD")
+        if [[ -n "$BONUS_TIME_FRAC" ]]; then
+            EMP_FLAG+=(--agent.explore_reward_time_frac="$BONUS_TIME_FRAC")
+            TAG="${TAG}_ann${BONUS_TIME_FRAC}"
+        fi
         RB_KIND=""
         if [[ "$EXPLORE_REWARD" == "max_episodic_empowerment" ]]; then RB_KIND=max; fi
         case "$ADD_EXPLORE" in

@@ -37,7 +37,10 @@ first update the agent's E_mean / bin edges are finalised from the calibration r
 (the offline rows under RLPD, else the warm-up online rows); see agents/online_crl.py.
 The same E(s) feeds the exploration reward bonus (`--agent.add_explore=reward` or
 `reward-to-rlpd`, r_x = E(s') - E_mean into a separate critic Q_x); with
-`reward-to-rlpd` the RLPD rows carry that reward too, so Q_x is backed up on them.
+`reward-to-rlpd` the RLPD rows carry that reward too, so Q_x is backed up on them. The
+current env step count is passed into every `update` call of an agent with the bonus on,
+which anneals the actor's weight on Q_x to 0 by `agent.explore_reward_time_frac` of
+`--total_env_steps` (agents/online_crl.py `bonus_scale_at`).
 """
 
 import json
@@ -111,6 +114,10 @@ def main(_):
 
     # Set up environments (no offline data is loaded).
     config = FLAGS.agent
+    # Available to any online agent (config_flags.DEFINE_config_file used lock_config=False, so
+    # this is safe even for agents whose own get_config() doesn't declare the key); online_crl's
+    # exploration-bonus annealing (`bonus_scale_at`) is the one consumer today.
+    config['total_env_steps'] = FLAGS.total_env_steps
     if 'rollout_type' not in config:
         raise ValueError(
             f'main_online.py needs an online agent config with `rollout_type` '
@@ -312,7 +319,13 @@ def main(_):
                 agent = finalise_empowerment_stats(agent)
             for _ in range(updates_per_round):
                 batch = sampler.sample(batch_size)
-                agent, update_info = agent.update(batch)
+                # env_steps only matters to online_crl's exploration-bonus annealing
+                # (bonus_scale_at); every other agent's update() ignores the extra kwarg's
+                # absence just as before -- pass it only where it is understood.
+                if getattr(agent, 'uses_explore_bonus', False):
+                    agent, update_info = agent.update(batch, env_steps=env_steps)
+                else:
+                    agent, update_info = agent.update(batch)
                 num_updates += 1
                 for name, value in update_info.items():
                     round_infos[name].append(value)

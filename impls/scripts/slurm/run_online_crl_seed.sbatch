@@ -108,7 +108,9 @@ if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH")
 # ADD_EXPLORE=reward | reward-to-rlpd (env var, optional) turns on the exploration reward bonus
 # (agents/online_crl.py `add_explore`, r_x = E(s') - E_mean into its own critic Q_x) with
 # BONUS_SCALE (1.0) the actor weight on Q_x and EXPLORE_REWARD (empowerment | max_episodic_empowerment,
-# the running max of E over the episode; tag "max"); needs EMP_CKPT_DIR. Tag "_rb[max]<scale>" / "_rbrlpd[max]<scale>".
+# the running max of E over the episode; tag "max"); needs EMP_CKPT_DIR. BONUS_TIME_FRAC (empty ->
+# agent default, no annealing) linearly decays bonus_scale to 0 by that fraction of total_env_steps (tag "_ann<frac>").
+# Tag "_rb[max]<scale>[_ann<frac>]" / "_rbrlpd[max]<scale>[_ann<frac>]".
 EMP_FLAG=()
 if [[ -n "${EMP_CKPT_DIR:-}" ]]; then
     EMP_FLAG=(
@@ -133,6 +135,10 @@ if [[ -n "${ADD_EXPLORE:-}" ]]; then
         --agent.bonus_scale="${BONUS_SCALE:-1.0}"
         --agent.explore_reward="$EXPLORE_REWARD"
     )
+    if [[ -n "${BONUS_TIME_FRAC:-}" ]]; then
+        EMP_FLAG+=(--agent.explore_reward_time_frac="$BONUS_TIME_FRAC")
+        TAG="${TAG}_ann${BONUS_TIME_FRAC}"
+    fi
     RB_KIND=""
     if [[ "$EXPLORE_REWARD" == "max_episodic_empowerment" ]]; then RB_KIND=max; fi
     case "$ADD_EXPLORE" in

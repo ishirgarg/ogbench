@@ -82,6 +82,21 @@ real everywhere.
 its Bellman loss via the rows' `is_offline` flag); `'reward-to-rlpd'` also backs it up on
 the RLPD rows (their E(s') is cached with the dataset). The actor's bonus term and the
 CRL critic are untouched by the mode: both train on every row of the batch as before.
+
+`explore_reward_time_frac` (default None -- NO annealing, constant `bonus_scale` for the
+whole run) optionally anneals the actor's use of the bonus: set it to a float in (0, 1] and
+the weight on Q_x(s, a) decays LINEARLY from `bonus_scale` at env step 0 to 0 at env step
+`explore_reward_time_frac * total_env_steps`, staying 0 after (`main_online.py` threads
+the current env step into every `update` call for this; `total_env_steps` is copied into
+the agent's own config from `--total_env_steps` before `create`, so it is baked into the
+jitted loss like every other config value). Only the ACTOR's weight on Q_x is annealed --
+Q_x itself keeps fitting r_x for the whole run, so `bonus_critic/*` stays meaningful to
+inspect even once the actor has stopped reading it. Rationale (2026-09-16 discussion): a
+bootstrapped state bonus pulls the policy back to whatever is locally high-empowerment
+under its OWN rollout distribution, i.e. a familiar "hub", not toward unvisited high-E
+territory -- annealing does not fix that targeting problem, but CRL relabels goals from
+any future observation, so states visited during an early, noisier, high-bonus phase stay
+useful to the critic long after the bonus itself has decayed to 0.
 """
 
 import copy
@@ -394,7 +409,40 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             'frac_rows_fit': weight.mean(),
         }
 
-    def actor_loss(self, batch, grad_params, rng):
+    def bonus_scale_at(self, env_steps):
+        """Actor's current weight on Q_x(s, a): constant `bonus_scale` unless
+        `explore_reward_time_frac` is set, in which case it linearly decays to 0 by env step
+        `explore_reward_time_frac * total_env_steps`, held at 0 after. `env_steps` is a traced
+        scalar (the env step count at the start of this update round); `total_env_steps` and
+        `explore_reward_time_frac` are static config, baked in at trace time.
+        """
+        scale0 = float(self.config['bonus_scale'])
+        frac = self.config['explore_reward_time_frac']
+        total = self.config['total_env_steps']
+        if frac is None:
+            # Default: no annealing schedule at all, regardless of whether total_env_steps
+            # happens to be known.
+            return jnp.asarray(scale0, dtype=jnp.float32)
+        frac = float(frac)
+        if total is None:
+            # A schedule was requested but there is no time budget to schedule against, e.g.
+            # the agent was built without main_online.py setting total_env_steps -- fall back
+            # to the constant rather than error, so the bonus is still usable standalone.
+            return jnp.asarray(scale0, dtype=jnp.float32)
+        if frac <= 0.0:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+        assert env_steps is not None, (
+            'bonus_scale_at: total_env_steps is set (the schedule is wired up) but env_steps was '
+            "not passed to update()/total_loss()/actor_loss(); main_online.py threads it in "
+            'automatically whenever agent.uses_explore_bonus, so this usually means the agent was '
+            'called directly. Pass env_steps explicitly, or leave total_env_steps unset for the '
+            'constant bonus_scale (no decay).'
+        )
+        decay_denom = frac * float(total)
+        progress = jnp.asarray(env_steps, dtype=jnp.float32) / decay_denom
+        return scale0 * jnp.clip(1.0 - progress, 0.0, 1.0)
+
+    def actor_loss(self, batch, grad_params, rng, env_steps=None):
         """SAC-style actor + alpha losses (JaxGCRL `update_actor_and_alpha`), goal = the sampled future state."""
         dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
         actions, log_probs = dist.sample_and_log_prob(seed=rng)
@@ -445,12 +493,16 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             target_entropy = jnp.full_like(entropy, self.config['target_entropy'])
 
         if self.uses_explore_bonus:
-            # Exploration bonus: + bonus_scale * Q_x(s, a_pi), Q_x at its stored params (twin-min), on every row.
+            # Exploration bonus: + bonus_scale(t) * Q_x(s, a_pi), Q_x at its stored params (twin-min),
+            # on every row. bonus_scale(t) is the env-step-annealed weight (bonus_scale_at); with
+            # env_steps=None (no schedule wired up) it is just the constant bonus_scale.
             bonus_qs = self.network.select('bonus_critic')(batch['observations'], actions=actions)
             q_bonus = jnp.min(bonus_qs, axis=0)
-            q_total = q + self.config['bonus_scale'] * q_bonus
+            scale = self.bonus_scale_at(env_steps)
+            q_total = q + scale * q_bonus
+            info['bonus_scale_effective'] = scale
             info['q_bonus_pi_mean'] = q_bonus.mean()
-            info['bonus_term_mean'] = (self.config['bonus_scale'] * q_bonus).mean()
+            info['bonus_term_mean'] = (scale * q_bonus).mean()
         else:
             q_total = q
 
@@ -475,7 +527,7 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         return total_loss, info
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, env_steps=None):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
@@ -485,7 +537,7 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng, env_steps=env_steps)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
@@ -508,12 +560,17 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
-    def update(self, batch):
-        """Update the agent and return a new agent with information dictionary."""
+    def update(self, batch, env_steps=None):
+        """Update the agent and return a new agent with information dictionary.
+
+        `env_steps` (the env step count at the start of this round, from `main_online.py`'s
+        loop) drives the exploration-bonus annealing (`bonus_scale_at`); leave it None for
+        plain flat CRL, or when `explore_reward_time_frac` is left at its default (no annealing).
+        """
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, env_steps=env_steps)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         if self.uses_explore_bonus:
@@ -681,11 +738,22 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
                 'empowerment': "E(s') - E_mean",
                 'max_episodic_empowerment': "max_{t' <= t+1} E(s_t') - E_mean (episode running max)",
             }[config['explore_reward']]
+            frac = config['explore_reward_time_frac']
+            total = config['total_env_steps']
+            if frac is None:
+                schedule = 'no annealing (explore_reward_time_frac unset) -- constant bonus_scale'
+            elif total is None:
+                schedule = f'explore_reward_time_frac={float(frac)} but total_env_steps unknown -- constant bonus_scale'
+            elif float(frac) <= 0.0:
+                schedule = 'explore_reward_time_frac<=0 -- bonus off from step 0'
+            else:
+                frac = float(frac)
+                schedule = f'linearly decayed to 0 by env step {int(round(frac * total))} (explore_reward_time_frac={frac})'
             print(
                 f"[online_crl] exploration bonus: add_explore={add_explore} (Q_x fit on {rows}), "
                 f"explore_reward={config['explore_reward']} (r_x = {formula}), actor += "
-                f"{float(config['bonus_scale'])} * Q_x(s, a), bonus_discount={stored_config['bonus_discount']}, "
-                f"bonus_tau={float(config['bonus_tau'])}"
+                f"bonus_scale(t) * Q_x(s, a), bonus_scale(0)={float(config['bonus_scale'])}, {schedule}, "
+                f"bonus_discount={stored_config['bonus_discount']}, bonus_tau={float(config['bonus_tau'])}"
             )
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**stored_config), emp_agent=emp_agent)
@@ -721,6 +789,11 @@ def get_config():
             bonus_scale=1.0,  # Actor weight on Q_x(s, a) next to the CRL critic ("alpha" of the bonus).
             bonus_discount=ml_collections.config_dict.placeholder(float),  # Bellman discount of Q_x (None -> discount).
             bonus_tau=0.005,  # Polyak rate of Q_x's target copy (SAC default).
+            explore_reward_time_frac=ml_collections.config_dict.placeholder(float),  # None (default) ->
+            # NO annealing, constant bonus_scale. Set to a fraction in (0, 1] to linearly decay
+            # bonus_scale to 0 by that fraction of total_env_steps, held at 0 after (<=0 -> bonus
+            # off from the start); needs total_env_steps (set by main_online.py from --total_env_steps).
+            total_env_steps=ml_collections.config_dict.placeholder(int),  # Set by main_online.py; None -> no decay.
             # Online schedule (consumed by main_online.py).
             unroll_length=50,  # Env steps collected between update rounds (JaxGCRL unroll_length).
             utd_ratio=1,  # Gradient steps per env step; each round runs unroll_length * utd_ratio updates.
