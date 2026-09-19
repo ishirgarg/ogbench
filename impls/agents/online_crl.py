@@ -97,6 +97,47 @@ under its OWN rollout distribution, i.e. a familiar "hub", not toward unvisited 
 territory -- annealing does not fix that targeting problem, but CRL relabels goals from
 any future observation, so states visited during an early, noisier, high-bonus phase stay
 useful to the critic long after the bonus itself has decayed to 0.
+
+Distilled future-max empowerment bonus (`--agent.add_explore=distill | distill-to-rlpd`)
+---------------------------------------------------------------------------------------
+An ALTERNATIVE to Q_x (same `add_explore` switch, so the two are mutually exclusive
+ablation arms; same `bonus_scale` "alpha", same `explore_reward_time_frac` annealing).
+No reward, no Bellman backup, no target network: a second network E'(s, a) (twin
+non-goal-conditioned MLP heads, the Q_x architecture) is REGRESSED (MSE, both heads) onto
+the Monte Carlo max of the frozen estimator's empowerment along the row's own trajectory.
+`distill_target` picks which max (decision of 2026-09-19: the episode max is the default):
+
+    'episode_max':  E'(s_t, a_t)  <-  max_k E(s_k) - E_mean,       ALL k of the trajectory (k < t too), so
+                                                                   every row of a trajectory shares one target;
+    'future_max':   E'(s_t, a_t)  <-  max_{k > t} E(s_k) - E_mean,  only the states after s_t;
+
+both through the trajectory's final observation,
+
+and the actor maximises  Q_crl(s, a, g) + bonus_scale * min_i E'_i(s, a) - alpha * log pi(a | s, g)
+directly (E' at its stored params, gradient through the reparameterised action only).
+`explore_reward` is not read in these modes. Targets are centred with the run's E_mean
+like r_x (a constant: the actor gradient is unchanged, the regression is better conditioned).
+
+Rows carry the target as `distill_target` plus a `distill_target_ready` flag. An online
+row's target only exists once its episode has ended (`FlatCollector.flush_empowerment`
+writes a reverse cummax over every episode that closed since the last flush); rows of the
+episode still in progress are masked out of the E' regression until then (pure Monte
+Carlo, decision of 2026-09-18) and are used by everything else as before. Offline rows'
+targets are one reverse cummax per trajectory over the cached offline E values at load
+time (utils/rlpd.py), so RLPD adds no per-update cost.
+  * `'distill'` (online only): E' is fit on ONLINE rows only, and the actor's bonus term is
+    added on ONLINE rows only (`is_offline == 0`) -- E' is never evaluated on offline
+    states it was not trained on. The actor loss stays a mean over the whole batch, i.e.
+    every row's loss is alpha*log pi - Q_crl - [row is online] * bonus_scale * E'.
+  * `'distill-to-rlpd'` (offline + online): E' is fit on online AND RLPD rows, and the
+    actor's bonus term is on every row.
+
+`bonus_grad_diagnostics=True` (either bonus family) logs, per update, the actor-parameter
+gradient norms of the three actor terms taken separately -- the CRL term -Q_crl, the
+bonus term at bonus_scale = 1, the entropy term -- plus their per-sample action-gradient
+norms, under `bonus_grad/*`. `bonus_grad/scale_equal_param` = ||g_crl|| / ||g_bonus|| is the
+`bonus_scale` at which the two actor gradients have equal norm. Costs three extra actor
+backward passes per update, so it is off by default.
 """
 
 import copy
@@ -126,7 +167,10 @@ EMPOWERMENT_ESTIMATOR_AGENTS = (
     'empowerment_dv',
 )
 
-ADD_EXPLORE_MODES = ('reward', 'reward-to-rlpd')  # plus None / 'none' -> off
+Q_BONUS_MODES = ('reward', 'reward-to-rlpd')  # Bellman critic Q_x over an exploration reward
+DISTILL_MODES = ('distill', 'distill-to-rlpd')  # regressed future-max empowerment E'(s, a)
+DISTILL_TARGETS = ('episode_max', 'future_max')  # E' regression target: max of E over the whole trajectory | after s_t
+ADD_EXPLORE_MODES = Q_BONUS_MODES + DISTILL_MODES  # plus None / 'none' -> off
 EXPLORE_REWARDS = ('empowerment', 'max_episodic_empowerment')  # per-transition exploration rewards
 
 
@@ -261,8 +305,18 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
 
     @property
     def uses_explore_bonus(self):
-        """Exploration reward bonus critic Q_x is on (`add_explore` is 'reward' or 'reward-to-rlpd')."""
+        """Some exploration bonus is in the actor loss (any `add_explore` mode): Q_x or the distilled E'."""
         return self.config['add_explore'] is not None
+
+    @property
+    def uses_q_bonus(self):
+        """Exploration reward bonus critic Q_x is on (`add_explore` is 'reward' or 'reward-to-rlpd')."""
+        return self.config['add_explore'] in Q_BONUS_MODES
+
+    @property
+    def uses_distill_bonus(self):
+        """Distilled future-max empowerment E'(s, a) is on (`add_explore` is 'distill' or 'distill-to-rlpd')."""
+        return self.config['add_explore'] in DISTILL_MODES
 
     @jax.jit
     def empowerment(self, observations, seed):
@@ -409,6 +463,110 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             'frac_rows_fit': weight.mean(),
         }
 
+    def distill_loss(self, batch, grad_params):
+        """MSE regression of E'(s, a) (both heads) onto the row's Monte Carlo target (`distill_target`: episode or future max of E) - E_mean.
+
+        Only rows whose target exists are fit (`distill_target_ready`: offline rows always, online
+        rows once their episode has ended); `add_explore='distill'` additionally drops the
+        offline RLPD rows. Not-ready rows hold a NaN target, which the `where` keeps out.
+        """
+        self._check_emp_stats_ready()
+        weight = batch['distill_target_ready']
+        if self.config['add_explore'] == 'distill':
+            weight = weight * (1.0 - batch['is_offline'])
+        target = jnp.where(weight > 0, batch['distill_target'] - self.emp_stats['mean'], 0.0)  # [B]
+
+        es = self.network.select('distill_critic')(batch['observations'], actions=batch['actions'], params=grad_params)
+        sq_err = jnp.square(es - target[None])  # [2, B]
+        num_rows = jnp.maximum(weight.sum(), 1.0)
+        distill_loss = (sq_err * weight[None]).sum() / (num_rows * es.shape[0])
+
+        target_mean = (target * weight).sum() / num_rows
+        target_var = (jnp.square(target - target_mean) * weight).sum() / num_rows
+        online = 1.0 - batch['is_offline']
+        return distill_loss, {
+            'distill_loss': distill_loss,
+            # 1 - MSE / Var(target): how much of the target's spread E' explains on the fitted rows.
+            'explained_variance': 1.0 - distill_loss / jnp.maximum(target_var, 1e-8),
+            'e_mean': (es.mean(axis=0) * weight).sum() / num_rows,
+            'e_max': jnp.where(weight > 0, es.max(axis=0), -jnp.inf).max(),
+            'e_min': jnp.where(weight > 0, es.min(axis=0), jnp.inf).min(),
+            'target_mean': target_mean,
+            'target_std': jnp.sqrt(target_var),
+            'target_min': jnp.where(weight > 0, target, jnp.inf).min(),
+            'target_max': jnp.where(weight > 0, target, -jnp.inf).max(),
+            'frac_rows_fit': weight.mean(),
+            'frac_online_rows_ready': (batch['distill_target_ready'] * online).sum() / jnp.maximum(online.sum(), 1.0),
+        }
+
+    def bonus_value(self, batch, actions):
+        """The actor's exploration bonus at `actions`, before `bonus_scale`: `(value [B], row weight [B])`.
+
+        Q_x modes: twin-min Q_x(s, a) on every row. Distill modes: twin-min E'(s, a), on every
+        row for 'distill-to-rlpd' and on online rows only for 'distill'. Both networks are read
+        at their stored params, so the gradient reaches the actor through `actions` only.
+        """
+        module = 'distill_critic' if self.uses_distill_bonus else 'bonus_critic'
+        values = self.network.select(module)(batch['observations'], actions=actions)
+        value = jnp.min(values, axis=0)
+        if self.config['add_explore'] == 'distill':
+            weight = 1.0 - batch['is_offline']
+        else:
+            weight = jnp.ones_like(value)
+        return value, weight
+
+    def bonus_grad_stats(self, batch, rng):
+        """Gradient norms of the actor's three loss terms taken separately (`bonus_grad_diagnostics`).
+
+        Terms, each a mean over the batch like the actor loss itself: CRL -Q_crl(s, a_pi, g), the
+        bonus -w * B(s, a_pi) at bonus_scale = 1 (B = Q_x or E', w its row weight), and the entropy
+        term alpha * log pi. `scale_equal_param` is the bonus_scale at which the bonus term's
+        actor-parameter gradient has the CRL term's norm; `scale_equal_action` the same from the
+        per-sample action gradients dQ/da, dB/da (mean norm over the rows the bonus is on).
+        """
+        actor_params = self.network.params['modules_actor']
+        if self.uses_entropy_target:
+            alpha = self.network.select('alpha')()[jnp.searchsorted(self.emp_stats['edges'], batch['empowerment'])]
+        else:
+            alpha = self.network.select('alpha')()
+
+        def terms(params):
+            dist = self.network.select('actor')(
+                batch['observations'], batch['actor_goals'], params={'modules_actor': params}
+            )
+            actions, log_probs = dist.sample_and_log_prob(seed=rng)
+            q = self.network.select('critic')(batch['observations'], batch['actor_goals'], actions=actions)[0]
+            value, weight = self.bonus_value(batch, actions)
+            return -q.mean(), -(weight * value).mean(), (alpha * log_probs).mean()
+
+        grads = [jax.grad(lambda p, i=i: terms(p)[i])(actor_params) for i in range(3)]
+        flat = [jnp.concatenate([g.ravel() for g in jax.tree_util.tree_leaves(grad)]) for grad in grads]
+        norms = [jnp.linalg.norm(f) for f in flat]
+
+        def cosine(a, b):
+            return jnp.dot(a, b) / jnp.maximum(jnp.linalg.norm(a) * jnp.linalg.norm(b), 1e-20)
+
+        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'])
+        actions = jax.lax.stop_gradient(dist.sample(seed=rng))
+        dq_da = jax.grad(
+            lambda a: self.network.select('critic')(batch['observations'], batch['actor_goals'], actions=a)[0].sum()
+        )(actions)
+        db_da = jax.grad(lambda a: self.bonus_value(batch, a)[0].sum())(actions)
+        _, weight = self.bonus_value(batch, actions)
+        num_rows = jnp.maximum(weight.sum(), 1.0)
+        dq_norm = (jnp.linalg.norm(dq_da, axis=-1) * weight).sum() / num_rows
+        db_norm = (jnp.linalg.norm(db_da, axis=-1) * weight).sum() / num_rows
+        return {
+            'param_norm_crl': norms[0],
+            'param_norm_bonus': norms[1],
+            'param_norm_entropy': norms[2],
+            'scale_equal_param': norms[0] / jnp.maximum(norms[1], 1e-20),
+            'cos_crl_bonus': cosine(flat[0], flat[1]),
+            'action_norm_crl': dq_norm,
+            'action_norm_bonus': db_norm,
+            'scale_equal_action': dq_norm / jnp.maximum(db_norm, 1e-20),
+        }
+
     def bonus_scale_at(self, env_steps):
         """Actor's current weight on Q_x(s, a): constant `bonus_scale` unless
         `explore_reward_time_frac` is set, in which case it linearly decays to 0 by env step
@@ -493,16 +651,17 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             target_entropy = jnp.full_like(entropy, self.config['target_entropy'])
 
         if self.uses_explore_bonus:
-            # Exploration bonus: + bonus_scale(t) * Q_x(s, a_pi), Q_x at its stored params (twin-min),
-            # on every row. bonus_scale(t) is the env-step-annealed weight (bonus_scale_at); with
+            # Exploration bonus: + bonus_scale(t) * B(s, a_pi), B = Q_x or the distilled E' at its stored
+            # params (twin-min), on the rows `bonus_value` weights in (every row, or online rows only
+            # for 'distill'). bonus_scale(t) is the env-step-annealed weight (bonus_scale_at); with
             # env_steps=None (no schedule wired up) it is just the constant bonus_scale.
-            bonus_qs = self.network.select('bonus_critic')(batch['observations'], actions=actions)
-            q_bonus = jnp.min(bonus_qs, axis=0)
+            q_bonus, bonus_weight = self.bonus_value(batch, actions)
             scale = self.bonus_scale_at(env_steps)
-            q_total = q + scale * q_bonus
+            q_total = q + scale * bonus_weight * q_bonus
             info['bonus_scale_effective'] = scale
-            info['q_bonus_pi_mean'] = q_bonus.mean()
-            info['bonus_term_mean'] = (scale * q_bonus).mean()
+            info['q_bonus_pi_mean'] = (bonus_weight * q_bonus).sum() / jnp.maximum(bonus_weight.sum(), 1.0)
+            info['bonus_term_mean'] = (scale * bonus_weight * q_bonus).mean()
+            info['bonus_frac_rows'] = bonus_weight.mean()
         else:
             q_total = q
 
@@ -531,7 +690,7 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
-        rng, actor_rng, bonus_rng = jax.random.split(rng, 3)
+        rng, actor_rng, bonus_rng, diag_rng = jax.random.split(rng, 4)
 
         critic_loss, critic_info = self.contrastive_loss(batch, grad_params)
         for k, v in critic_info.items():
@@ -542,12 +701,21 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             info[f'actor/{k}'] = v
 
         loss = critic_loss + actor_loss
-        if self.uses_explore_bonus:
+        if self.uses_q_bonus:
             # Disjoint parameters again (bonus_critic only), so one shared Adam step equals a separate update.
             bonus_loss, bonus_info = self.bonus_critic_loss(batch, grad_params, bonus_rng)
             for k, v in bonus_info.items():
                 info[f'bonus_critic/{k}'] = v
             loss = loss + bonus_loss
+        if self.uses_distill_bonus:
+            # Disjoint parameters once more (distill_critic only).
+            distill_loss, distill_info = self.distill_loss(batch, grad_params)
+            for k, v in distill_info.items():
+                info[f'distill/{k}'] = v
+            loss = loss + distill_loss
+        if self.uses_explore_bonus and self.config['bonus_grad_diagnostics']:
+            for k, v in self.bonus_grad_stats(batch, diag_rng).items():
+                info[f'bonus_grad/{k}'] = jax.lax.stop_gradient(v)
         return loss, info
 
     def target_update(self, network, module_name):
@@ -573,7 +741,7 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             return self.total_loss(batch, grad_params, rng=rng, env_steps=env_steps)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        if self.uses_explore_bonus:
+        if self.uses_q_bonus:
             self.target_update(new_network, 'bonus_critic')
         return self.replace(network=new_network, rng=new_rng), info
 
@@ -660,14 +828,18 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         elif add_explore not in ADD_EXPLORE_MODES:
             raise ValueError(f'online_crl: add_explore must be one of {ADD_EXPLORE_MODES} or none, got {add_explore!r}')
         if add_explore is not None:
-            if config['explore_reward'] not in EXPLORE_REWARDS:
+            if add_explore in Q_BONUS_MODES and config['explore_reward'] not in EXPLORE_REWARDS:
                 raise ValueError(
                     f"online_crl: explore_reward must be one of {EXPLORE_REWARDS}, got {config['explore_reward']!r}"
                 )
-            if config['emp_checkpoint_path'] is None:  # both rewards are functions of E(s)
+            if add_explore in DISTILL_MODES and config['distill_target'] not in DISTILL_TARGETS:
                 raise ValueError(
-                    f"online_crl: add_explore with explore_reward={config['explore_reward']!r} needs "
-                    '--agent.emp_checkpoint_path (the frozen estimator that supplies E(s)).'
+                    f"online_crl: distill_target must be one of {DISTILL_TARGETS}, got {config['distill_target']!r}"
+                )
+            if config['emp_checkpoint_path'] is None:  # every bonus is a function of E(s)
+                raise ValueError(
+                    f'online_crl: add_explore={add_explore!r} needs --agent.emp_checkpoint_path '
+                    '(the frozen estimator that supplies E(s)).'
                 )
 
         # Frozen offline empowerment estimator (optional): per-bin entropy temperatures when
@@ -688,7 +860,8 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             alpha=(alpha_def, ()),
         )
         if add_explore is not None:
-            # Non-goal-conditioned twin critic Q_x(s, a) for the exploration reward + its Polyak target copy.
+            # Non-goal-conditioned twin MLP over (s, a): Q_x for the exploration reward (+ its Polyak
+            # target copy), or the distilled future-max empowerment E' (plain regression, no target copy).
             bonus_encoder = None
             if config['encoder'] is not None:
                 bonus_encoder = GCEncoder(state_encoder=encoder_modules[config['encoder']]())
@@ -698,15 +871,21 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
                 ensemble=True,
                 gc_encoder=bonus_encoder,
             )
-            network_info['bonus_critic'] = (bonus_critic_def, (ex_observations, None, ex_actions))
-            network_info['target_bonus_critic'] = (copy.deepcopy(bonus_critic_def), (ex_observations, None, ex_actions))
+            if add_explore in DISTILL_MODES:
+                network_info['distill_critic'] = (bonus_critic_def, (ex_observations, None, ex_actions))
+            else:
+                network_info['bonus_critic'] = (bonus_critic_def, (ex_observations, None, ex_actions))
+                network_info['target_bonus_critic'] = (
+                    copy.deepcopy(bonus_critic_def),
+                    (ex_observations, None, ex_actions),
+                )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
         network_def = ModuleDict(networks)
         network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
-        if add_explore is not None:
+        if add_explore in Q_BONUS_MODES:
             network_params['modules_target_bonus_critic'] = network_params['modules_bonus_critic']
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
@@ -749,12 +928,21 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             else:
                 frac = float(frac)
                 schedule = f'linearly decayed to 0 by env step {int(round(frac * total))} (explore_reward_time_frac={frac})'
-            print(
-                f"[online_crl] exploration bonus: add_explore={add_explore} (Q_x fit on {rows}), "
-                f"explore_reward={config['explore_reward']} (r_x = {formula}), actor += "
-                f"bonus_scale(t) * Q_x(s, a), bonus_scale(0)={float(config['bonus_scale'])}, {schedule}, "
-                f"bonus_discount={stored_config['bonus_discount']}, bonus_tau={float(config['bonus_tau'])}"
-            )
+            if add_explore in DISTILL_MODES:
+                rows = 'online rows only' if add_explore == 'distill' else 'online + RLPD rows'
+                print(
+                    f"[online_crl] distilled empowerment bonus: add_explore={add_explore}, E'(s_t, a_t) regressed "
+                    f"onto {'max_k' if config['distill_target'] == 'episode_max' else 'max_{k>t}'} E(s_k) - E_mean "
+                    f"(distill_target={config['distill_target']}) over closed trajectories ({rows}), actor += bonus_scale(t) * "
+                    f"E'(s, a) on {rows}, bonus_scale(0)={float(config['bonus_scale'])}, {schedule}"
+                )
+            else:
+                print(
+                    f"[online_crl] exploration bonus: add_explore={add_explore} (Q_x fit on {rows}), "
+                    f"explore_reward={config['explore_reward']} (r_x = {formula}), actor += "
+                    f"bonus_scale(t) * Q_x(s, a), bonus_scale(0)={float(config['bonus_scale'])}, {schedule}, "
+                    f"bonus_discount={stored_config['bonus_discount']}, bonus_tau={float(config['bonus_tau'])}"
+                )
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**stored_config), emp_agent=emp_agent)
 
@@ -784,9 +972,13 @@ def get_config():
             emp_fast_path=True,  # Einsum rewrite of the skill estimator (False -> the checkpoint's own method).
             emp_entropy_target=True,  # Per-state entropy target from E(s) (above); False -> scalar alpha, E unused there.
             # Exploration reward bonus (None -> off; see the module docstring).
-            add_explore=ml_collections.config_dict.placeholder(str),  # 'reward' (Q_x on online rows) | 'reward-to-rlpd'.
+            add_explore=ml_collections.config_dict.placeholder(str),  # 'reward' (Q_x on online rows) | 'reward-to-rlpd'
+            # | 'distill' (regressed future-max E'(s, a), online rows only) | 'distill-to-rlpd' (online + RLPD rows).
             explore_reward='empowerment',  # Bonus reward r_x: 'empowerment' (E(s') - E_mean) | 'max_episodic_empowerment'.
-            bonus_scale=1.0,  # Actor weight on Q_x(s, a) next to the CRL critic ("alpha" of the bonus).
+            bonus_scale=1.0,  # Actor weight on Q_x(s, a) / E'(s, a) next to the CRL critic ("alpha" of the bonus).
+            distill_target='episode_max',  # E' target: 'episode_max' (max of E over the WHOLE trajectory, one value per
+            # trajectory) | 'future_max' (max over the states after s_t only). Distill modes only.
+            bonus_grad_diagnostics=False,  # Log per-term actor gradient norms under bonus_grad/* (3 extra backward passes).
             bonus_discount=ml_collections.config_dict.placeholder(float),  # Bellman discount of Q_x (None -> discount).
             bonus_tau=0.005,  # Polyak rate of Q_x's target copy (SAC default).
             explore_reward_time_frac=ml_collections.config_dict.placeholder(float),  # None (default) ->

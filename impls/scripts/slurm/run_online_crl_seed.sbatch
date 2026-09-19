@@ -111,6 +111,9 @@ if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH")
 # the running max of E over the episode; tag "max"); needs EMP_CKPT_DIR. BONUS_TIME_FRAC (empty ->
 # agent default, no annealing) linearly decays bonus_scale to 0 by that fraction of total_env_steps (tag "_ann<frac>").
 # Tag "_rb[max]<scale>[_ann<frac>]" / "_rbrlpd[max]<scale>[_ann<frac>]".
+# ADD_EXPLORE=distill | distill-to-rlpd: the alternative bonus, E'(s, a) regressed onto the max of E over the whole trajectory (DISTILL_TARGET=future_max: states after s_t only, tag "_fut")
+# along the trajectory and added to the actor loss (online rows only | online + RLPD rows); same BONUS_SCALE /
+# BONUS_TIME_FRAC, EXPLORE_REWARD unused. Tag "_ed<scale>" / "_edrlpd<scale>".
 EMP_FLAG=()
 if [[ -n "${EMP_CKPT_DIR:-}" ]]; then
     EMP_FLAG=(
@@ -144,7 +147,15 @@ if [[ -n "${ADD_EXPLORE:-}" ]]; then
     case "$ADD_EXPLORE" in
         reward) TAG="${TAG}_rb${RB_KIND}${BONUS_SCALE:-1.0}" ;;
         reward-to-rlpd) TAG="${TAG}_rbrlpd${RB_KIND}${BONUS_SCALE:-1.0}" ;;
-        *) echo "[run_online_crl_seed] unknown ADD_EXPLORE=$ADD_EXPLORE (reward | reward-to-rlpd)" >&2; exit 1 ;;
+        # Distilled trajectory-max empowerment E'(s, a) added straight to the actor loss (EXPLORE_REWARD unused).
+        distill) TAG="${TAG}_ed${BONUS_SCALE:-1.0}" ;;&
+        distill-to-rlpd) TAG="${TAG}_edrlpd${BONUS_SCALE:-1.0}" ;;&
+        distill|distill-to-rlpd)
+            if [[ -n "${DISTILL_TARGET:-}" ]]; then
+                EMP_FLAG+=(--agent.distill_target="$DISTILL_TARGET")
+                if [[ "$DISTILL_TARGET" == "future_max" ]]; then TAG="${TAG}_fut"; fi
+            fi ;;
+        *) echo "[run_online_crl_seed] unknown ADD_EXPLORE=$ADD_EXPLORE (reward | reward-to-rlpd | distill | distill-to-rlpd)" >&2; exit 1 ;;
     esac
 fi
 

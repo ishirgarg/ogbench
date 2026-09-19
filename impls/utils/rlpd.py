@@ -46,6 +46,11 @@ checkpoint (`<ckpt>/empowerment_values/`), and 0 otherwise. Marker rows get a va
 too, so `next_empowerment` (E(s') of a trajectory's last transition) is always real.
 `episodic_max_empowerment` is the running max of E along each trajectory (marker
 included), the `max_episodic_empowerment` bonus reward.
+`distill_target` is the regression target of the distilled bonus E'(s, a) (`add_explore=distill*`):
+the max of E over the row's WHOLE trajectory (`agent.distill_target='episode_max'`, one value per
+trajectory) or over the states after the row only (`'future_max'`), marker included. Offline
+trajectories are complete, so it is one pass over the cached E values at load time and
+`distill_target_ready` is 1 on every offline row.
 Flat rows also carry `is_offline` (1 here, 0 for online rows): the flat agent's
 exploration bonus critic (`add_explore='reward'`) trains on online rows only and
 masks on this field; `'reward-to-rlpd'` trains on both.
@@ -181,7 +186,9 @@ def _capacity(seq_dataset):
     return int(seq_dataset.size)
 
 
-def make_offline_flat_source(seq_dataset, example_transition, goal_discount, empowerment=None):
+def make_offline_flat_source(
+    seq_dataset, example_transition, goal_discount, empowerment=None, distill_target='episode_max'
+):
     """One offline row per env step: (s_t, a_t, s_{t+1}) with the flat agent's goal discount.
 
     `empowerment` (a `[size]` float array, or None) fills each row's `empowerment` field
@@ -198,6 +205,12 @@ def make_offline_flat_source(seq_dataset, example_transition, goal_discount, emp
         f'empowerment values {empowerment.shape} do not cover the dataset ({seq_dataset.size} rows)'
     )
     episodic_max = episodic_running_max(empowerment, seq_dataset)
+    if distill_target == 'episode_max':
+        distill = episodic_total_max(empowerment, seq_dataset)
+    elif distill_target == 'future_max':
+        distill = episodic_future_max(empowerment, seq_dataset)
+    else:
+        raise ValueError(f'unknown distill_target {distill_target!r}')
 
     def row(t, start, marker, observations):
         return dict(
@@ -209,6 +222,8 @@ def make_offline_flat_source(seq_dataset, example_transition, goal_discount, emp
             empowerment=empowerment[t],
             episodic_max_empowerment=episodic_max[t],
             is_offline=np.float32(1.0),
+            distill_target=distill[t],
+            distill_target_ready=np.float32(1.0),
         )
 
     def marker_fields(marker):
@@ -225,6 +240,24 @@ def episodic_running_max(values, seq_dataset):
     out = np.array(values, copy=True)
     for start, marker in offline_trajectories(seq_dataset):
         out[start : marker + 1] = np.maximum.accumulate(values[start : marker + 1])
+    return out
+
+
+def episodic_total_max(values, seq_dataset):
+    """Per-trajectory max over ALL its rows (marker included), broadcast to every row of the trajectory."""
+    values = np.asarray(values, dtype=np.float32)
+    out = np.array(values, copy=True)
+    for start, marker in offline_trajectories(seq_dataset):
+        out[start : marker + 1] = values[start : marker + 1].max()
+    return out
+
+
+def episodic_future_max(values, seq_dataset):
+    """Per-trajectory strict future max: out[t] = max(values[t + 1 : marker + 1]); the marker row keeps its own value."""
+    values = np.asarray(values, dtype=np.float32)
+    out = np.array(values, copy=True)
+    for start, marker in offline_trajectories(seq_dataset):
+        out[start:marker] = np.maximum.accumulate(values[start + 1 : marker + 1][::-1])[::-1]
     return out
 
 
@@ -272,7 +305,11 @@ def make_offline_source(dataset_name, agent, example_transition, label_seed=0):
         if getattr(agent, 'uses_empowerment', False):
             empowerment = offline_empowerment_values(agent, seq_dataset, dataset_name, seed=label_seed)
         source, num_rows = make_offline_flat_source(
-            seq_dataset, example_transition, config['goal_discount'], empowerment=empowerment
+            seq_dataset,
+            example_transition,
+            config['goal_discount'],
+            empowerment=empowerment,
+            distill_target=config.get('distill_target', 'episode_max'),
         )
         print(f'[{name}] offline dataset {dataset_name}: {num_rows} env-step rows in {seq_dataset.size} slots')
         return source

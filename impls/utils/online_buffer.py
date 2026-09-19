@@ -88,6 +88,11 @@ class TrajectoryReplayBuffer:
     def _oldest_abs(self):
         return max(0, self.total - self.capacity)
 
+    @property
+    def oldest_abs(self):
+        """Absolute index of the oldest row still held."""
+        return self._oldest_abs()
+
     def _slot(self, abs_idx):
         return abs_idx % self.capacity
 

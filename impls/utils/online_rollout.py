@@ -16,6 +16,13 @@ into a `TrajectoryReplayBuffer`:
     from the freshly written E values and the row before it. Agents without an
     estimator store 0 and never read either field. `is_offline` is 0 on every online
     row and 1 on RLPD rows (utils/rlpd.py); the exploration bonus critic masks on it.
+    For the distilled bonus (`add_explore=distill*`, the agent's `uses_distill_bonus`) rows
+    also carry `distill_target`, the max of E over the row's own episode (final observation
+    included; the agent's `distill_target` config: 'episode_max' = the whole episode, one value
+    shared by all its rows, 'future_max' = only the states after the row) and a
+    `distill_target_ready` flag: the target is only known once the episode has ended, so rows are
+    written NaN / 0 and the first `flush_empowerment` after the episode closes fills the whole
+    episode and sets the flag. Other agents store 0 / 0 and never read them.
   * `MacroCollector`  -- one SMDP macro-step per row: the high-level agent picks a
     skill z, which the frozen low-level policy executes for `k` env steps (or
     until the episode ends). The row is (s_t, z, R, mask, done) with
@@ -71,6 +78,8 @@ class FlatCollector:
         self._pending_empowerment = []  # abs indices of rows whose `empowerment` is still the NaN placeholder
         self._pending_first = []  # parallel to the above: does the row start a new episode?
         self._episode_first_row = True  # the next row written starts a new episode
+        self._episode_start_abs = None  # abs index of the current episode's first row (distilled bonus only)
+        self._closed_episodes = []  # (first row abs, marker abs) of episodes closed since the last flush
         self._reset_episode()
 
     def _reset_episode(self):
@@ -92,6 +101,8 @@ class FlatCollector:
             empowerment=np.float32(0.0),
             episodic_max_empowerment=np.float32(0.0),
             is_offline=np.float32(0.0),
+            distill_target=np.float32(0.0),
+            distill_target_ready=np.float32(0.0),
         )
 
     def _mark_pending(self, abs_idx):
@@ -132,7 +143,33 @@ class FlatCollector:
                 running[i] = max(values[i], prev)
         assert np.all(np.isfinite(running)), 'episodic running max hit an unfilled predecessor row'
         self.buffer.write_field('episodic_max_empowerment', abs_idxs, running)
+        if getattr(agent, 'uses_distill_bonus', False):
+            self._flush_distill_targets(agent.config['distill_target'])
         return int(len(abs_idxs))
+
+    def _flush_distill_targets(self, kind):
+        """Distilled bonus: write the E' target onto every row of the episodes closed since the last flush.
+
+        `kind='episode_max'`: max_k E(s_k) over the whole episode, the same value on every row;
+        `'future_max'`: max_{k>t} E(s_k), one reverse cummax. Runs right after the E values were
+        written, so a closed episode's rows (marker included) all hold a real E. The marker
+        row keeps its placeholder (it is never an anchor).
+        """
+        closed, self._closed_episodes = self._closed_episodes, []
+        for start_abs, end_abs in closed:
+            start_abs = max(start_abs, self.buffer.oldest_abs)  # rows already evicted need no target
+            if start_abs >= end_abs:
+                continue
+            rows = np.arange(start_abs, end_abs + 1)
+            values = self.buffer.read_field('empowerment', rows)
+            assert np.all(np.isfinite(values)), 'distill target: a closed episode still holds an unfilled E'
+            if kind == 'episode_max':
+                # Rows evicted before the episode closed (episode longer than the buffer) drop out of the max.
+                target = np.full(len(rows) - 1, values.max())
+            else:
+                target = np.maximum.accumulate(values[::-1])[::-1][1:]  # [t] = max(values[t + 1:])
+            self.buffer.write_field('distill_target', rows[:-1], target.astype(np.float32))
+            self.buffer.write_field('distill_target_ready', rows[:-1], np.ones(len(rows) - 1, dtype=np.float32))
 
     def step(self, agent):
         self.rng, key = jax.random.split(self.rng)
@@ -146,6 +183,7 @@ class FlatCollector:
         self.tracker.add(reward, info)
 
         uses_empowerment = bool(getattr(agent, 'uses_empowerment', False))
+        uses_distill = bool(getattr(agent, 'uses_distill_bonus', False))
         abs_idx = self.buffer.add_transition(
             dict(
                 observations=self.observation,
@@ -158,8 +196,14 @@ class FlatCollector:
                 empowerment=np.float32(np.nan if uses_empowerment else 0.0),
                 episodic_max_empowerment=np.float32(np.nan if uses_empowerment else 0.0),
                 is_offline=np.float32(0.0),
+                # NaN + ready=0 until the episode closes (`_flush_distill_targets`); the agent's regression
+                # masks on the flag, so a NaN can only surface if a row is flagged ready without a target.
+                distill_target=np.float32(np.nan if uses_distill else 0.0),
+                distill_target_ready=np.float32(0.0),
             )
         )
+        if uses_distill and self._episode_start_abs is None:
+            self._episode_start_abs = abs_idx
         if uses_empowerment:
             self._mark_pending(abs_idx)
         self.observation = next_observation
@@ -174,6 +218,9 @@ class FlatCollector:
                 self.buffer.write_field('empowerment', [end_abs], nan)
                 self.buffer.write_field('episodic_max_empowerment', [end_abs], nan)
                 self._mark_pending(end_abs)
+            if uses_distill:
+                self._closed_episodes.append((self._episode_start_abs, end_abs))
+                self._episode_start_abs = None
             episode = self.tracker.summary()
             self._reset_episode()
         return dict(env_steps=1, rows=1, episode=episode)

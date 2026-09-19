@@ -22,6 +22,10 @@
 # (running max of E over the episode). BONUS_TIME_FRAC (agent default: unset, no annealing) linearly decays
 # bonus_scale to 0 by that fraction of TOTAL_ENV_STEPS, held at 0 after; 0 disables the bonus
 # from the start, 1.0 decays over the whole run. Tag suffix "_rb[max]<scale>[_ann<frac>]".
+# ADD_EXPLORE=distill (online rows only) | distill-to-rlpd (online + RLPD rows) is the alternative
+# bonus: E'(s, a) regressed onto the max of E over the whole trajectory (DISTILL_TARGET=future_max: only
+# the states after s_t; tag "_fut"), added to the actor loss
+# with the same BONUS_SCALE / BONUS_TIME_FRAC (EXPLORE_REWARD unused). Tag suffix "_ed[rlpd]<scale>".
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -130,7 +134,15 @@ for i in "${!ENVS[@]}"; do
         case "$ADD_EXPLORE" in
             reward) TAG="${TAG}_rb${RB_KIND}${BONUS_SCALE}" ;;
             reward-to-rlpd) TAG="${TAG}_rbrlpd${RB_KIND}${BONUS_SCALE}" ;;
-            *) echo "unknown ADD_EXPLORE=$ADD_EXPLORE (reward | reward-to-rlpd)" >&2; exit 1 ;;
+            # Distilled trajectory-max empowerment E'(s, a) added straight to the actor loss (EXPLORE_REWARD unused).
+            distill) TAG="${TAG}_ed${BONUS_SCALE}" ;;&
+            distill-to-rlpd) TAG="${TAG}_edrlpd${BONUS_SCALE}" ;;&
+            distill|distill-to-rlpd)
+                if [[ -n "${DISTILL_TARGET:-}" ]]; then
+                    EMP_FLAG+=(--agent.distill_target="$DISTILL_TARGET")
+                    if [[ "$DISTILL_TARGET" == "future_max" ]]; then TAG="${TAG}_fut"; fi
+                fi ;;
+            *) echo "unknown ADD_EXPLORE=$ADD_EXPLORE (reward | reward-to-rlpd | distill | distill-to-rlpd)" >&2; exit 1 ;;
         esac
     fi
     LOG="$LOG_DIR/${ENV_NAME}_${TAG}_s${SEED}.log"

@@ -41,6 +41,11 @@ The same E(s) feeds the exploration reward bonus (`--agent.add_explore=reward` o
 current env step count is passed into every `update` call of an agent with the bonus on,
 which anneals the actor's weight on Q_x to 0 by `agent.explore_reward_time_frac` of
 `--total_env_steps` (agents/online_crl.py `bonus_scale_at`).
+`--agent.add_explore=distill | distill-to-rlpd` is the alternative bonus: a network E'(s, a)
+regressed onto the max of E over each row's trajectory (`agent.distill_target`: the whole
+trajectory by default, or only the states after the row) and added straight to the
+actor loss (online rows only / online + RLPD rows); the collector fills an online row's
+target when its episode closes, RLPD rows get theirs at load time.
 """
 
 import json
@@ -206,6 +211,8 @@ def main(_):
 
     if agent.config.get('add_explore') == 'reward-to-rlpd' and FLAGS.offline_dataset is None:
         print('[main_online] add_explore=reward-to-rlpd without --offline_dataset: no RLPD rows, same as add_explore=reward')
+    if agent.config.get('add_explore') == 'distill-to-rlpd' and FLAGS.offline_dataset is None:
+        print('[main_online] add_explore=distill-to-rlpd without --offline_dataset: no RLPD rows, same as add_explore=distill')
 
     def finalise_empowerment_stats(agent):
         """E_mean + quantile bin edges from the calibration rows (offline rows under RLPD, else online rows)."""
