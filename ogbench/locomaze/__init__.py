@@ -333,6 +333,31 @@ register(
     ),
 )
 register(
+    # Ant at the arena center (10, 10) but the ball far away in the lower-left at (1, 1), ~12.7 units
+    # off -- unlike the center/corner multigoal envs the agent must first cross the arena to reach the
+    # ball. 8 ball goals: every integer offset (dx, dy) in [-1, 1]^2 from the ball except (0, 0) (a
+    # goal on the ball's start would be solved at reset), i.e. x in 0..2, y in 0..2 -- all inside the
+    # arena's free space (x, y in (-2, 22)). Pass as `antsoccer-arena-far-multigoal-online-v0`, or
+    # with a dataset-type token (`-navigate-` / `-stitch-`) like any OGBench name; it shares the
+    # arena, observation and action spaces with the antsoccer-arena navigate/stitch datasets, so they
+    # work for RLPD.
+    id='antsoccer-arena-far-multigoal-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='ball',
+        maze_type='arena',
+        tasks=[
+            dict(agent_init_xy=(10.0, 10.0), ball_init_xy=(1.0, 1.0), goal_xy=(1.0 + dx, 1.0 + dy))
+            for dx in range(-1, 2)
+            for dy in range(-1, 2)
+            if (dx, dy) != (0, 0)
+        ],
+        **online_dict,
+    ),
+)
+register(
     # Ant at cell (3, 4) = xy (12, 8); goal = the center of every other free cell (25 tasks).
     id='antmaze-medium-center-v0',
     entry_point='ogbench.locomaze.maze:make_maze_env',
