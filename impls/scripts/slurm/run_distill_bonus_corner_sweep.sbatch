@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32gb
 #SBATCH --gpus=1
-#SBATCH --time=24:00:00
+#SBATCH --time=20:00:00
 #SBATCH --qos=default
 #SBATCH --array=0-89
 #SBATCH --output=/nas/ucb/ishirgarg/ogbench/impls/logs/distill_bonus_corner_slurm/%A_%a.out
@@ -57,7 +57,7 @@
 #   --mem=32gb (not 16gb): a run holds the 1M-row offline dataset + a 1M-row replay buffer
 #     (~3-5 GiB RSS) and the empowerment pass over the calibration rows allocates on top; the
 #     equivalent Savio runs were OOM-killed at the 8000M default.
-#   --time=24:00:00 (not 08:00:00): 1M env steps with RLPD does not finish in 8 hours.
+#   --time=20:00:00 (not 08:00:00): 1M env steps with RLPD does not finish in 8 hours.
 #
 # WHICH CHECKOUT -- this matters. The distilled-bonus code exists ONLY on the worktree branch
 # claude/empowerment-bonus-network-crl-daeab5; the main checkout at /nas/ucb/ishirgarg/ogbench is on
