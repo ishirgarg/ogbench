@@ -358,7 +358,7 @@ register(
     ),
 )
 register(
-    # Ant at cell (3, 4) = xy (12, 8); goal = the center of every other free cell (22 tasks).
+    # Ant at cell (3, 4) = xy (12, 8); goal = the center of every other free cell (25 tasks).
     id='antmaze-medium-center-v0',
     entry_point='ogbench.locomaze.maze:make_maze_env',
     max_episode_steps=1000,
@@ -427,6 +427,65 @@ register(
             dict(init_xy=(0.0, 0.0), goal_xy=(0.0, 20.0), task_name='top_left'),
             dict(init_xy=(0.0, 0.0), goal_xy=(20.0, 20.0), task_name='top_right'),
         ],
+        **online_dict,
+    ),
+)
+
+register(
+    # Point at the teleport maze's bottom-left corner (1, 1) = xy (0, 0); goals at the 3
+    # far corners, i.e. the goal set of `pointmaze-teleport-sparse-v0` minus the corner
+    # that is this env's start: bottom-right (1, 10) = (36, 0), top-left (7, 1) = (0, 24),
+    # and (7, 6) = (20, 24) -- straight up column j=6, past the teleport-in pad at (4, 6),
+    # to the far wall. Point moves <= 0.2/step, so keep the registered 1000-step horizon.
+    id='pointmaze-teleport-corner-sparse-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='point',
+        maze_env_type='maze',
+        maze_type='teleport',
+        tasks=[
+            dict(init_xy=(0.0, 0.0), goal_xy=(36.0, 0.0), task_name='bottom_right'),
+            dict(init_xy=(0.0, 0.0), goal_xy=(0.0, 24.0), task_name='top_left'),
+            dict(init_xy=(0.0, 0.0), goal_xy=(20.0, 24.0), task_name='past_teleporter'),
+        ],
+        **online_dict,
+    ),
+)
+register(
+    # Ant at the medium maze's bottom-left corner (1, 1) = xy (0, 0); goal = the center of
+    # every other free cell (25 tasks). Same start as `antmaze-medium-corner-sparse-v0`,
+    # but with that env's 3 corner goals widened to the whole maze.
+    id='antmaze-medium-corner-all-squares-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='maze',
+        maze_type='medium',
+        tasks=functools.partial(center_to_free_cells_tasks, start_ij=(1, 1)),
+        **online_dict,
+    ),
+)
+register(
+    # Point at the teleport maze's bottom-left corner (1, 1) = xy (0, 0) -- the same start
+    # as `pointmaze-teleport-corner-sparse-v0` -- with that env's 3 corner goals widened to
+    # the whole maze: the center of every other free cell, minus the same 3 cells
+    # `pointmaze-teleport-center-v0` drops (41 tasks). Those are the two teleport-IN pads
+    # (4, 6) and (5, 1), where a point (<= 0.2/step, under the 1.5-unit teleport trigger)
+    # can never settle inside the goal tolerance, and the walled-off (1, 7) pocket at the
+    # bottom, which is reachable only by a lucky teleport and traps the agent once entered.
+    # The two teleport-OUT pads (6, 1) and (6, 10) are ordinary cells and ARE goals.
+    id='pointmaze-teleport-corner-all-squares-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='point',
+        maze_env_type='maze',
+        maze_type='teleport',
+        tasks=functools.partial(
+            center_to_free_cells_tasks, start_ij=(1, 1), exclude_ijs=((4, 6), (5, 1), (1, 7))
+        ),
         **online_dict,
     ),
 )
