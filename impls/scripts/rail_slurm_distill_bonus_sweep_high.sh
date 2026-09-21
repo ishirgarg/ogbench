@@ -5,6 +5,7 @@
 #SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
+#SBATCH --mem=64gb
 #SBATCH --time=72:00:00
 #SBATCH --array=0-44
 
@@ -57,6 +58,9 @@
 # 5 MuJoCo+JAX processes on 4 cores is ~0.8 core each (env stepping + CPU evals are CPU-bound), a
 # deliberate oversubscription: 4 cores is the CPU:GPU ratio every rail script here uses, so it is
 # known to schedule. 5 x ~1.1 GiB = ~5.5 GiB of the 24 GB A5000; host RSS ~15-25 GiB per task.
+# Hence --mem=64gb: WITHOUT an explicit --mem the savio4_gpu default of 8000M applies to the whole
+# task (all five packed runs share it) and they are OOM-killed a minute in, right after the step-0
+# eval, before logging a single training metric -- the failure that killed the 2026-09-19 submission.
 #
 # BEFORE SUBMITTING, confirm on BRC (written on the rnn side, cannot see /global/*; each item is
 # preflighted below and fails with a specific message):

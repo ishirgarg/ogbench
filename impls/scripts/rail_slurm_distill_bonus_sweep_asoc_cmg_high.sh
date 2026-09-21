@@ -5,6 +5,7 @@
 #SBATCH --qos=rail_gpu4_high
 #SBATCH --gres=gpu:A5000:1
 #SBATCH --cpus-per-task=4
+#SBATCH --mem=32gb
 #SBATCH --time=72:00:00
 #SBATCH --array=0-74
 
@@ -47,6 +48,12 @@
 # concurrent runs cannot read a partial file). $CKPT_ROOT must therefore be writable.
 #
 # ONE run per GPU (no packing), so XLA preallocation is left at JAX default (the flag below is harmless).
+#
+# --mem=32gb is REQUIRED, not decoration. A run holds the 1M-row offline dataset + a 1M-row replay
+# buffer (~3-5 GiB RSS) and the empowerment pass over the calibration rows allocates on top of that.
+# Without an explicit --mem the savio4_gpu default of 8000M applies and jobs are OOM-killed a minute
+# in, right after the step-0 eval, before logging a single training metric (seen 2026-09-20: 8 of the
+# first 16 array tasks died this way). Every other Slurm script in this repo sets 16-32gb.
 #
 # BEFORE SUBMITTING, confirm on BRC (written on the rnn side, cannot see /global/*; each item is
 # preflighted below and fails with a specific message):
