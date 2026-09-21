@@ -74,7 +74,11 @@ set -uo pipefail
 
 export MUJOCO_GL=egl
 # Mandatory for GPU packing -- see above.
-export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-true}
+# One run per GPU would allow preallocation, but every other script in this repo sets false and the
+# 2026-09-20 deaths scaled with array tasks per NODE -- which is what GPU sharing would look like if
+# a task ever sees a device another task already grabbed 75% of. Cheap insurance; false costs only
+# allocator overhead.
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
 
 # The checkout is wherever you ran `sbatch` from (same convention as the other rail scripts).
 IMPLS_DIR=${IMPLS_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
