@@ -66,16 +66,40 @@ def get_flag_dict():
     return flag_dict
 
 
+def _wandb_settings():
+    """`wandb.Settings` with the system-stats monitor on, across wandb versions.
+
+    wandb renamed `_disable_stats` -> `x_disable_stats` and dropped `start_method`
+    entirely (it is a pydantic model since ~0.19, so unknown keys now raise instead
+    of being ignored). Pass only the keys the installed version declares.
+    """
+    wanted = dict(start_method='thread', _disable_stats=False, x_disable_stats=False)
+    fields = getattr(wandb.Settings, 'model_fields', None)
+    if fields is None:  # pre-pydantic wandb: the old names are the right ones
+        wanted.pop('x_disable_stats')
+    else:
+        wanted = {k: v for k, v in wanted.items() if k in fields}
+    return wandb.Settings(**wanted)
+
+
 def setup_wandb(
     entity=None,
     project='project',
     group=None,
     name=None,
-    mode='online',
+    mode=None,
     run_id=None,
     resume=None,
 ):
-    """Set up Weights & Biases for logging."""
+    """Set up Weights & Biases for logging.
+
+    `mode=None` (the default) honours the standard `WANDB_MODE` env var, falling back to
+    'online'. Without that, `mode='online'` was passed explicitly on every call and so
+    overrode `WANDB_MODE`, making `WANDB_MODE=offline` a no-op that still hard-failed on
+    a machine with no API key.
+    """
+    if mode is None:
+        mode = os.environ.get('WANDB_MODE', 'online')
     wandb_output_dir = tempfile.mkdtemp()
     tags = [group] if group is not None else None
 
@@ -87,10 +111,7 @@ def setup_wandb(
         group=group,
         dir=wandb_output_dir,
         name=name,
-        settings=wandb.Settings(
-            start_method='thread',
-            _disable_stats=False,
-        ),
+        settings=_wandb_settings(),
         mode=mode,
         save_code=True,
         id=run_id,
