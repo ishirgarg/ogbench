@@ -430,6 +430,65 @@ register(
         **online_dict,
     ),
 )
+register(
+    # Point version of `antmaze-medium-corner-sparse-v0`: the same medium maze, the same
+    # `maze_unit=4` grid and therefore the exact same xy coordinates -- point at the
+    # bottom-left corner (1, 1) = xy (0, 0), goals at the other 3 corners: bottom-right
+    # (1, 6) = (20, 0), top-left (6, 1) = (0, 20), and top-right (6, 6) = (20, 20).
+    # Shares the medium maze's observation and action spaces with the pointmaze-medium
+    # navigate/stitch/explore datasets, so they work for RLPD.
+    id='pointmaze-medium-corner-sparse-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='point',
+        maze_env_type='maze',
+        maze_type='medium',
+        tasks=[
+            dict(init_xy=(0.0, 0.0), goal_xy=(20.0, 0.0), task_name='bottom_right'),
+            dict(init_xy=(0.0, 0.0), goal_xy=(0.0, 20.0), task_name='top_left'),
+            dict(init_xy=(0.0, 0.0), goal_xy=(20.0, 20.0), task_name='top_right'),
+        ],
+        **online_dict,
+    ),
+)
+register(
+    # The dense counterpart of `antmaze-medium-corner-sparse-v0`: same bottom-left corner
+    # start (1, 1) = xy (0, 0), but the goal is the center of EVERY other free cell of the
+    # medium maze (25 tasks) instead of just the 3 far corners. Built like
+    # `antmaze-medium-center-v0`, only from the corner cell. Pass as
+    # `antmaze-medium-corner-online-v0`, or with a dataset-type token
+    # (`-navigate-` / `-stitch-` / `-explore-`) like any OGBench name; it shares the medium
+    # maze's observation and action spaces with those antmaze-medium datasets, so they work
+    # for RLPD.
+    id='antmaze-medium-corner-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='maze',
+        maze_type='medium',
+        tasks=functools.partial(center_to_free_cells_tasks, start_ij=(1, 1)),
+        **online_dict,
+    ),
+)
+register(
+    # Point version of `antmaze-medium-corner-v0`: bottom-left corner start (1, 1) = xy
+    # (0, 0), goal = the center of every other free cell of the medium maze (25 tasks).
+    # Pass as `pointmaze-medium-corner-online-v0`, or with a dataset-type token
+    # (`-navigate-` / `-stitch-`) like any OGBench name; it shares the medium maze's
+    # observation and action spaces with the pointmaze-medium datasets, so they work for RLPD.
+    id='pointmaze-medium-corner-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=1000,
+    kwargs=dict(
+        loco_env_type='point',
+        maze_env_type='maze',
+        maze_type='medium',
+        tasks=functools.partial(center_to_free_cells_tasks, start_ij=(1, 1)),
+        **online_dict,
+    ),
+)
 
 # Environments for reward-based single-task offline RL.
 for task_id in [None, 1, 2, 3, 4, 5]:
