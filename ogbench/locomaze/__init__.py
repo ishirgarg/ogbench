@@ -306,6 +306,41 @@ register(
         **online_dict,
     ),
 )
+
+# Goals for `antsoccer-arena-easy-v0`: eight targets in the up-right quadrant around the ball at (11, 11),
+# each 1 to 2.8 units from it. Task IDs follow this order (task1 = the first entry).
+antsoccer_arena_easy_goal_xys = [
+    (11.0, 12.0),
+    (12.0, 11.0),
+    (12.0, 12.0),
+    (13.0, 12.0),
+    (12.0, 13.0),
+    (13.0, 13.0),
+    (11.0, 13.0),
+    (13.0, 11.0),
+]
+register(
+    # Easy antsoccer: ant at the arena center (10, 10), ball just up-right of it at (11, 11), and one
+    # of eight nearby goals (see `antsoccer_arena_easy_goal_xys`). Short pushes only, so the ant never has to
+    # dribble the ball far. Pass as e.g. `antsoccer-arena-easy-online-v0`.
+    #
+    # Registered at 500 steps, not the 1000 the other antsoccer envs use: every run script drives
+    # `antsoccer-arena-{center,corner}` with `--episode_length=500` anyway, so baking it into the
+    # registration makes 500 the default here and keeps a script that forgets the override honest.
+    id='antsoccer-arena-easy-v0',
+    entry_point='ogbench.locomaze.maze:make_maze_env',
+    max_episode_steps=500,
+    kwargs=dict(
+        loco_env_type='ant',
+        maze_env_type='ball',
+        maze_type='arena',
+        tasks=[
+            dict(agent_init_xy=(10.0, 10.0), ball_init_xy=(11.0, 11.0), goal_xy=goal_xy)
+            for goal_xy in antsoccer_arena_easy_goal_xys
+        ],
+        **online_dict,
+    ),
+)
 register(
     # Same single start as `antsoccer-arena-corner-v0` (ant (2, 2), ball (5, 5)) but 48 ball goals,
     # built exactly like `antsoccer-arena-multigoal-v0` is from the center env: every integer offset
