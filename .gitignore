@@ -6,3 +6,6 @@ dist/
 .DS_Store
 .idea/
 .ruff_cache/
+impls/.jax_cache/
+impls/exp/
+impls/logs/
