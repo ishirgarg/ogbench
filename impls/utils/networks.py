@@ -153,6 +153,56 @@ class RunningMeanStd(flax.struct.PyTreeNode):
 
         return self.replace(mean=new_mean, var=new_var, count=total_count)
 
+    def update_masked(self, batch, mask):
+        """`update` restricted to the rows of `batch` where `mask` (float [n], 1 = use) is set.
+
+        Same parallel-variance merge as `update`; the stats are untouched when no row is
+        selected. Traceable with a fixed batch shape, so padded chunks can be jitted.
+        """
+        mask = jnp.asarray(mask, dtype=jnp.float32)
+        batch_count = mask.sum()
+        w = mask.reshape((-1,) + (1,) * (batch.ndim - 1))
+        safe_batch = jnp.maximum(batch_count, 1.0)
+        batch_mean = (batch * w).sum(axis=0) / safe_batch
+        batch_var = (jnp.square(batch - batch_mean) * w).sum(axis=0) / safe_batch
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        safe_total = jnp.maximum(total_count, 1.0)
+        new_mean = self.mean + delta * batch_count / safe_total
+        m_2 = self.var * self.count + batch_var * batch_count + delta**2 * self.count * batch_count / safe_total
+        new_var = m_2 / safe_total
+
+        empty = batch_count == 0
+        return self.replace(
+            mean=jnp.where(empty, self.mean, new_mean),
+            var=jnp.where(empty, self.var, new_var),
+            count=total_count,
+        )
+
+
+class RNDEmbedding(nn.Module):
+    """Random-network-distillation embedding (Burda et al. 2019), the state-based analogue of the paper's nets.
+
+    Leaky-ReLU trunk (`hidden_dims`), then -- for the PREDICTOR -- `extra_hidden_dims` ReLU
+    layers, then a linear map to `rep_dim`. The paper's target is trunk + linear and its
+    predictor trunk + 2 x ReLU(512) + linear; every layer is orthogonally initialised with
+    gain sqrt(2) and zero bias, and the leaky slope is TF's default 0.2, as in its code.
+    """
+
+    hidden_dims: Sequence[int]
+    rep_dim: int
+    extra_hidden_dims: Sequence[int] = ()
+
+    @nn.compact
+    def __call__(self, x):
+        init = nn.initializers.orthogonal(scale=2.0**0.5)
+        for size in self.hidden_dims:
+            x = nn.leaky_relu(nn.Dense(size, kernel_init=init)(x), negative_slope=0.2)
+        for size in self.extra_hidden_dims:
+            x = nn.relu(nn.Dense(size, kernel_init=init)(x))
+        return nn.Dense(self.rep_dim, kernel_init=init)(x)
+
 
 class GCActor(nn.Module):
     """Goal-conditioned actor.

@@ -99,6 +99,9 @@ if [[ -n "${RLPD_FRAC_TIME:-}" && ${#RLPD_FLAG[@]} -gt 0 ]]; then
     RLPD_FLAG+=(--rlpd_frac_time="$RLPD_FRAC_TIME")
     TAG="${TAG}_ft${RLPD_FRAC_TIME}"
 fi
+# EVAL_INTERVAL / EVAL_EPISODES (env vars, optional; default 20000 / 20, this script's long-standing
+# default): --eval_interval / --eval_episodes. Not tagged -- callers that change these track it
+# themselves (e.g. in the submitter's own job names/logs), same as total_env_steps isn't tagged.
 EP_FLAG=()
 if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH"); fi
 # EMP_CKPT_DIR (env var, optional; sbatch exports the submitter's environment): a frozen
@@ -111,6 +114,9 @@ if [[ -n "$EPISODE_LENGTH" ]]; then EP_FLAG=(--episode_length="$EPISODE_LENGTH")
 # the running max of E over the episode; tag "max"); needs EMP_CKPT_DIR. BONUS_TIME_FRAC (empty ->
 # agent default, no annealing) linearly decays bonus_scale to 0 by that fraction of total_env_steps (tag "_ann<frac>").
 # Tag "_rb[max]<scale>[_ann<frac>]" / "_rbrlpd[max]<scale>[_ann<frac>]".
+# EXPLORE_REWARD=rnd (random network distillation, agents/online_crl.py module docstring) needs NO
+# EMP_CKPT_DIR and only ADD_EXPLORE=reward (its predictor, Q_x and actor bonus are online-only by
+# design); the agent's rnd_* flags stay at the paper's defaults. Tag "_rbrnd<scale>[_ann<frac>]".
 EMP_FLAG=()
 if [[ -n "${EMP_CKPT_DIR:-}" ]]; then
     EMP_FLAG=(
@@ -125,11 +131,16 @@ if [[ -n "${EMP_CKPT_DIR:-}" ]]; then
     esac
 fi
 if [[ -n "${ADD_EXPLORE:-}" ]]; then
-    if [[ -z "${EMP_CKPT_DIR:-}" ]]; then
-        echo "[run_online_crl_seed] ADD_EXPLORE=$ADD_EXPLORE needs EMP_CKPT_DIR (the empowerment reward's estimator)" >&2
+    EXPLORE_REWARD=${EXPLORE_REWARD:-empowerment}
+    if [[ "$EXPLORE_REWARD" == "rnd" ]]; then
+        if [[ "$ADD_EXPLORE" != "reward" ]]; then
+            echo "[run_online_crl_seed] EXPLORE_REWARD=rnd is online-only: use ADD_EXPLORE=reward, not $ADD_EXPLORE" >&2
+            exit 1
+        fi
+    elif [[ -z "${EMP_CKPT_DIR:-}" ]]; then
+        echo "[run_online_crl_seed] ADD_EXPLORE=$ADD_EXPLORE with EXPLORE_REWARD=$EXPLORE_REWARD needs EMP_CKPT_DIR (the empowerment reward's estimator)" >&2
         exit 1
     fi
-    EXPLORE_REWARD=${EXPLORE_REWARD:-empowerment}
     EMP_FLAG+=(
         --agent.add_explore="$ADD_EXPLORE"
         --agent.bonus_scale="${BONUS_SCALE:-1.0}"
@@ -140,7 +151,10 @@ if [[ -n "${ADD_EXPLORE:-}" ]]; then
         TAG="${TAG}_ann${BONUS_TIME_FRAC}"
     fi
     RB_KIND=""
-    if [[ "$EXPLORE_REWARD" == "max_episodic_empowerment" ]]; then RB_KIND=max; fi
+    case "$EXPLORE_REWARD" in
+        max_episodic_empowerment) RB_KIND=max ;;
+        rnd) RB_KIND=rnd ;;
+    esac
     case "$ADD_EXPLORE" in
         reward) TAG="${TAG}_rb${RB_KIND}${BONUS_SCALE:-1.0}" ;;
         reward-to-rlpd) TAG="${TAG}_rbrlpd${RB_KIND}${BONUS_SCALE:-1.0}" ;;
@@ -148,7 +162,7 @@ if [[ -n "${ADD_EXPLORE:-}" ]]; then
     esac
 fi
 
-echo "[run_online_crl_seed] env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} emp=${EMP_CKPT_DIR:-off} add_explore=${ADD_EXPLORE:-off} tag=$TAG job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
+echo "[run_online_crl_seed] env=$ENV_NAME offline=$OFFLINE_DATASET seed=$SEED episode_length=${EPISODE_LENGTH:-<registered>} emp=${EMP_CKPT_DIR:-off} add_explore=${ADD_EXPLORE:-off} eval_interval=${EVAL_INTERVAL:-20000} eval_episodes=${EVAL_EPISODES:-20} tag=$TAG job=${SLURM_JOB_ID:-<none>} node=$(hostname)"
 
 srun "$PYTHON" -u main_online.py \
     --env_name="$ENV_NAME" \
@@ -159,7 +173,7 @@ srun "$PYTHON" -u main_online.py \
     "${RLPD_FLAG[@]}" \
     "${EMP_FLAG[@]}" \
     --log_interval=5000 \
-    --eval_interval=20000 \
+    --eval_interval="${EVAL_INTERVAL:-20000}" \
     --save_interval=100000 \
-    --eval_episodes=20 \
+    --eval_episodes="${EVAL_EPISODES:-20}" \
     --video_episodes=0

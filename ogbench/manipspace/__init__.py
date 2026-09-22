@@ -122,6 +122,29 @@ register(
         **cube_online_dict,
     ),
 )
+# One cube, ONE fixed start (0.425, 0.1), but 30 goals: a 5 x 6 grid of table positions (x in
+# {0.325, 0.375, 0.425, 0.475, 0.525}, y in {-0.25, -0.15, -0.05, 0.05, 0.15, 0.25}, all inside the
+# [0.3, 0.55] x [-0.3, 0.3] object bounds). The closest goals to the start are 0.05 m away, just
+# outside the 0.04 m success radius. Each eval episode draws a random goal, so 100 eval episodes
+# average over the goals instead of repeating one deterministic rollout.
+register(
+    id='cube-single-multigoal-v0',
+    entry_point='ogbench.manipspace.envs.cube_env:CubeEnv',
+    max_episode_steps=200,
+    kwargs=dict(
+        env_type='single',
+        tasks=[
+            dict(
+                task_name=f'goal_x{gx}_y{gy}',
+                init_xyzs=[[0.425, 0.1, 0.02]],
+                goal_xyzs=[[gx, gy, 0.02]],
+            )
+            for gx in (0.325, 0.375, 0.425, 0.475, 0.525)
+            for gy in (-0.25, -0.15, -0.05, 0.05, 0.15, 0.25)
+        ],
+        **cube_online_dict,
+    ),
+)
 register(
     # Two cubes, one task: BOTH cubes move 0.2 m across the table, in separate y lanes so
     # neither one's path or goal is blocked by the other. Success requires both to be on

@@ -41,6 +41,10 @@ The same E(s) feeds the exploration reward bonus (`--agent.add_explore=reward` o
 current env step count is passed into every `update` call of an agent with the bonus on,
 which anneals the actor's weight on Q_x to 0 by `agent.explore_reward_time_frac` of
 `--total_env_steps` (agents/online_crl.py `bonus_scale_at`).
+With `--agent.explore_reward=rnd` (random network distillation, no estimator) the same
+Q_x is fed the RND intrinsic reward instead; before every update round the collector hands
+the states visited since the last round to the agent's running RND statistics
+(`collector.flush_rnd`, which returns the updated agent), logged under `training/rnd_stream/*`.
 """
 
 import json
@@ -317,6 +321,12 @@ def main(_):
             collector.flush_empowerment(agent)
             if getattr(agent, 'uses_empowerment', False) and not agent.config['emp_stats_ready']:
                 agent = finalise_empowerment_stats(agent)
+            if getattr(agent, 'uses_rnd', False):
+                # RND running obs / return stats absorb the states visited since the last round
+                # (the first call seeds them from the warm-up rows, the paper's random-agent init).
+                agent, rnd_info = collector.flush_rnd(agent)
+                for name, value in rnd_info.items():
+                    round_infos[f'rnd_stream/{name}'].append(value)
             for _ in range(updates_per_round):
                 batch = sampler.sample(batch_size)
                 # env_steps only matters to online_crl's exploration-bonus annealing
