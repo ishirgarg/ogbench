@@ -103,14 +103,19 @@ Random network distillation bonus (`--agent.add_explore=reward --agent.explore_r
 Burda et al. 2019 (arXiv:1810.12894) as the exploration reward, through the same Q_x
 machinery above (own critic, `bonus_scale`, annealing) and needing no empowerment
 estimator. The paper's recipe, state-based:
-  * A fixed random target f and a trained predictor f_hat embed the LANDING state s'
-    (`utils/networks.RNDEmbedding`: leaky-ReLU trunk, the predictor with two extra ReLU
-    layers, orthogonal init with gain sqrt(2), as the paper's networks; `rnd_rep_dim` 512).
-    r_x(s') = mean_d (f_hat(s') - f(s'))^2 (the paper's code averages over the dims).
-  * Input normalisation: s' is whitened by a RUNNING mean/std of the online observations and
-    clipped to +-`rnd_obs_clip` (paper: 5). The stats are seeded by the warm-up rows before
-    the first update (the paper's random-agent steps) and updated every round with the rows
-    collected since (`FlatCollector.flush_rnd` -> `rnd_update_stats`).
+  * A fixed random target f and a trained predictor f_hat, ONE architecture for both
+    (`utils/networks.RNDEmbedding`: ReLU MLP trunk `rnd_hidden_dims` -> linear `rnd_rep_dim`;
+    the paper's Appendix A.5 fixes only "encoder followed by dense layers" and defers the
+    rest to its code), embed the LANDING state s'. r_x(s') = ||f_hat(s') - f(s')||^2, the
+    squared L2 norm over the k embedding dims (the paper's Sec. 2.2 / Algorithm 1), and the
+    predictor minimises that same MSE.
+  * Input normalisation (paper Sec. 2.4, Table 4): s' is whitened per dimension by a RUNNING
+    mean/std of the online observations and clipped to +-`rnd_obs_clip` (5); the policy
+    never sees it. The stats are seeded by the warm-up rows before the first update (the
+    paper initialises them from a random agent's steps; here the untrained stochastic actor's,
+    decision of 2026-09-21) and updated every round with the states visited since
+    (`FlatCollector.flush_rnd` -> `rnd_update_stats`), AFTER those states' rewards are
+    computed, as in Algorithm 1.
   * Reward normalisation: r_x is divided by the running std of the discounted intrinsic
     RETURN (the paper's RewardForwardFilter, ret <- bonus_discount * ret + r_x, run over the
     online stream in visit order and never reset at episode ends) -- no mean subtraction.
@@ -457,11 +462,11 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         return self.rnd_state['obs_rms'].normalize(observations)
 
     def rnd_raw_reward(self, next_observations):
-        """Un-normalised intrinsic reward mean_d (f_hat(s') - f(s'))^2 at the landing states, [B]."""
+        """Un-normalised intrinsic reward ||f_hat(s') - f(s')||^2 at the landing states, [B] (paper Algorithm 1)."""
         x = self.rnd_normalize(next_observations)
         target = self.network.select('rnd_target')(x)
         pred = self.network.select('rnd_predictor')(x)
-        return jnp.mean(jnp.square(pred - target), axis=-1)
+        return jnp.sum(jnp.square(pred - target), axis=-1)
 
     def rnd_predictor_loss(self, batch, grad_params, rng):
         """Predictor regression onto the fixed target on the ONLINE rows of the batch (the paper's aux loss).
@@ -473,7 +478,7 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
         x = self.rnd_normalize(batch['next_observations'])
         target = self.network.select('rnd_target')(x)  # stored params: fixed, no gradient
         pred = self.network.select('rnd_predictor')(x, params=grad_params)
-        per_row = jnp.mean(jnp.square(pred - target), axis=-1)  # [B]
+        per_row = jnp.sum(jnp.square(pred - target), axis=-1)  # [B], ||f_hat - f||^2 as the paper's MSE
         keep = jax.random.uniform(rng, per_row.shape) < self.config['rnd_update_proportion']
         online = 1.0 - batch['is_offline']
         weight = online * keep.astype(jnp.float32)
@@ -497,18 +502,18 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
 
         `observations` [P, ...] are the states as visited, `valid` [P] masks padding and
         `is_next` [P] marks the ones that are some transition's landing state s' (an
-        episode's reset state is not). The paper's per-rollout bookkeeping:
-          1. the obs running mean/std absorbs every valid state;
-          2. r_x(s') is computed for the `is_next` states with the current predictor and the
-             updated obs stats;
-          3. the reward-forward filter ret <- bonus_discount * ret + r_x runs over them in
+        episode's reset state is not). The paper's per-rollout bookkeeping (Algorithm 1):
+          1. r_x(s') is computed for the `is_next` states with the current predictor and the
+             obs stats as they stand (a rollout's rewards precede its stats update);
+          2. the reward-forward filter ret <- bonus_discount * ret + r_x runs over them in
              order (never reset at episode ends; `ret_carry` continues across calls) and the
-             returns' running std -- the intrinsic reward's normaliser -- absorbs its values.
+             returns' running std -- the intrinsic reward's normaliser -- absorbs its values;
+          3. the obs running mean/std then absorbs every valid state.
         Returns `(agent, info)`.
         """
         state = self.rnd_state
+        raw = self.rnd_raw_reward(observations)  # [P], with the stats before this chunk
         obs_rms = state['obs_rms'].update_masked(observations, valid)
-        raw = self.replace(rnd_state=dict(state, obs_rms=obs_rms)).rnd_raw_reward(observations)  # [P]
         emit = jnp.asarray(valid, jnp.float32) * jnp.asarray(is_next, jnp.float32)
         gamma = self.config['bonus_discount']
 
@@ -839,13 +844,10 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             network_info['bonus_critic'] = (bonus_critic_def, (ex_observations, None, ex_actions))
             network_info['target_bonus_critic'] = (copy.deepcopy(bonus_critic_def), (ex_observations, None, ex_actions))
         if uses_rnd:
-            # Fixed random target f and trained predictor f_hat over the (whitened) landing state.
+            # Fixed random target f and trained predictor f_hat, same architecture, over the whitened landing state.
             rnd_kwargs = dict(hidden_dims=tuple(config['rnd_hidden_dims']), rep_dim=int(config['rnd_rep_dim']))
             network_info['rnd_target'] = (RNDEmbedding(**rnd_kwargs), (ex_observations,))
-            network_info['rnd_predictor'] = (
-                RNDEmbedding(**rnd_kwargs, extra_hidden_dims=tuple(config['rnd_predictor_extra_hidden_dims'])),
-                (ex_observations,),
-            )
+            network_info['rnd_predictor'] = (RNDEmbedding(**rnd_kwargs), (ex_observations,))
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -895,7 +897,7 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
             formula = {
                 'empowerment': "E(s') - E_mean",
                 'max_episodic_empowerment': "max_{t' <= t+1} E(s_t') - E_mean (episode running max)",
-                'rnd': "mean_d (f_hat(s') - f(s'))^2 / running std of the intrinsic return (RND)",
+                'rnd': "||f_hat(s') - f(s')||^2 / running std of the intrinsic return (RND)",
             }[config['explore_reward']]
             frac = config['explore_reward_time_frac']
             total = config['total_env_steps']
@@ -929,9 +931,9 @@ class OnlineCRLAgent(flax.struct.PyTreeNode):
                 ret_carry=jnp.float32(0.0),
             )
             print(
-                f"[online_crl] RND: target/predictor trunk {tuple(config['rnd_hidden_dims'])} -> {int(config['rnd_rep_dim'])}-d "
-                f"(predictor +{tuple(config['rnd_predictor_extra_hidden_dims'])} ReLU), input whitened by running obs stats "
-                f"and clipped to +-{float(config['rnd_obs_clip'])}, reward / running std of the discounted intrinsic return "
+                f"[online_crl] RND: target and predictor both ReLU MLP {tuple(config['rnd_hidden_dims'])} -> "
+                f"{int(config['rnd_rep_dim'])}-d, input whitened by running obs stats and clipped to "
+                f"+-{float(config['rnd_obs_clip'])}, reward ||f_hat - f||^2 / running std of the discounted intrinsic return "
                 f"(gamma={stored_config['bonus_discount']}), predictor Adam lr={float(config['rnd_lr'])} on a "
                 f"{float(config['rnd_update_proportion'])} share of the online rows, "
                 f"{'non-episodic' if config['rnd_nonepisodic'] else 'episodic'} Q_x, actor bonus on online rows only"
@@ -977,11 +979,11 @@ def get_config():
             # bonus_scale to 0 by that fraction of total_env_steps, held at 0 after (<=0 -> bonus
             # off from the start); needs total_env_steps (set by main_online.py from --total_env_steps).
             total_env_steps=ml_collections.config_dict.placeholder(int),  # Set by main_online.py; None -> no decay.
-            # Random network distillation (explore_reward='rnd'; module docstring). Defaults are the paper's.
-            rnd_hidden_dims=(512, 512),  # Leaky-ReLU trunk of both target and predictor.
-            rnd_rep_dim=512,  # Embedding size (paper: 512).
-            rnd_predictor_extra_hidden_dims=(512, 512),  # ReLU layers the predictor has over the target (paper: 2 x 512).
-            rnd_lr=1e-4,  # The predictor's own Adam learning rate (paper: 1e-4); the target is never updated.
+            # Random network distillation (explore_reward='rnd'; module docstring). Defaults follow the paper
+            # where its text is explicit (Sec. 2.4, Tables 4-5) and its code where the text is silent (net sizes).
+            rnd_hidden_dims=(512, 512),  # ReLU MLP trunk shared by target and predictor (paper: "encoder + dense layers").
+            rnd_rep_dim=512,  # Embedding size k (the paper's code uses 512; its text leaves k open).
+            rnd_lr=1e-4,  # The predictor's own Adam learning rate (paper Table 5: 1e-4); the target is never updated.
             rnd_update_proportion=1.0,  # Share of the online rows in the predictor loss (paper: 1 single-env, 0.25 at 128 envs).
             rnd_obs_clip=5.0,  # Clip of the whitened RND input (paper: [-5, 5]).
             rnd_nonepisodic=True,  # Q_x bootstraps through episode ends (paper: the intrinsic reward is non-episodic).

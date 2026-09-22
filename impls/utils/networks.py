@@ -182,24 +182,22 @@ class RunningMeanStd(flax.struct.PyTreeNode):
 
 
 class RNDEmbedding(nn.Module):
-    """Random-network-distillation embedding (Burda et al. 2019), the state-based analogue of the paper's nets.
+    """Random-network-distillation embedding f: O -> R^k (Burda et al. 2019), one architecture for
+    both the fixed target and the trained predictor.
 
-    Leaky-ReLU trunk (`hidden_dims`), then -- for the PREDICTOR -- `extra_hidden_dims` ReLU
-    layers, then a linear map to `rep_dim`. The paper's target is trunk + linear and its
-    predictor trunk + 2 x ReLU(512) + linear; every layer is orthogonally initialised with
-    gain sqrt(2) and zero bias, and the leaky slope is TF's default 0.2, as in its code.
+    The paper fixes only the shape (Appendix A.5: an encoder "followed by dense layers", the
+    encoder being Mnih et al. 2015's ReLU network) and defers the rest to its code. Here: a
+    ReLU MLP trunk (`hidden_dims`) and a linear map to `rep_dim`. Orthogonal init with gain
+    sqrt(2) and zero bias follows the official code; the paper text names no initialiser.
     """
 
     hidden_dims: Sequence[int]
     rep_dim: int
-    extra_hidden_dims: Sequence[int] = ()
 
     @nn.compact
     def __call__(self, x):
         init = nn.initializers.orthogonal(scale=2.0**0.5)
         for size in self.hidden_dims:
-            x = nn.leaky_relu(nn.Dense(size, kernel_init=init)(x), negative_slope=0.2)
-        for size in self.extra_hidden_dims:
             x = nn.relu(nn.Dense(size, kernel_init=init)(x))
         return nn.Dense(self.rep_dim, kernel_init=init)(x)
 
