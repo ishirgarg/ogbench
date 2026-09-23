@@ -28,6 +28,7 @@ from agents.skill_dt_controller import SkillDTControllerAgent
 from agents.skill_match import SkillMatchAgent
 from agents.skill_restricted_iql import SkillRestrictedIQLAgent
 from agents.skill_value_controller import SkillValueControllerAgent
+from agents.supe import SUPEAgent
 from agents.vq_bet import VQBeTAgent
 
 agents = dict(
@@ -61,5 +62,6 @@ agents = dict(
     skill_match=SkillMatchAgent,
     skill_restricted_iql=SkillRestrictedIQLAgent,
     skill_value_controller=SkillValueControllerAgent,
+    supe=SUPEAgent,
     vq_bet=VQBeTAgent,
 )

@@ -10,6 +10,10 @@ its own rollouts in the OGBench env. Three agents plug in today:
   * `agents/online_composed_skill_policy.py` -- the same two levels COMPOSED into one
     flat policy and trained together (no skill horizon, low level not frozen, its own
     learning rate). Flat rows, so it uses the same collector and RLPD path as `online_crl`.
+  * `agents/supe.py`                        -- SUPE (arXiv:2410.18076): SAC over the continuous
+    latent of a frozen OPAL VAE, RLPD with learned reward/termination relabelling of the
+    offline windows and an RND bonus. Macro rows (float skill), same collector as the
+    controller; its update() takes `env_steps` (warm-up / RND schedules, bonus annealing).
 
 Loop (JaxGCRL structure, single env): collect `unroll_length` rows (env steps for
 the flat agents, SMDP macro-steps for the controller), then run
@@ -132,14 +136,6 @@ def main(_):
     eval_env = make_online_env(FLAGS.env_name, frame_stack=config['frame_stack'], episode_length=FLAGS.episode_length)
     horizon = env_horizon(env)
     assert horizon is not None, 'The env has no TimeLimit horizon; pass --episode_length.'
-    rows_per_episode = horizon  # buffer rows one full episode can occupy
-    if config['rollout_type'] == 'macro':
-        k = int(config['skill_commitment_k'])
-        assert horizon % k == 0, (
-            f'episode horizon ({horizon}) must be divisible by skill_commitment_k ({k}) so macro-steps tile the '
-            f'episode; pass --episode_length.'
-        )
-        rows_per_episode = horizon // k
     print(f'[main_online] env={FLAGS.env_name} horizon={horizon} rollout_type={config["rollout_type"]}')
 
     # Initialize agent.
@@ -155,6 +151,16 @@ def main(_):
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
+    rows_per_episode = horizon  # buffer rows one full episode can occupy
+    if config['rollout_type'] == 'macro':
+        # Read from the created agent: supe resolves a None skill_commitment_k to the checkpoint's chunk_size.
+        k = int(agent.config['skill_commitment_k'])
+        assert horizon % k == 0, (
+            f'episode horizon ({horizon}) must be divisible by skill_commitment_k ({k}) so macro-steps tile the '
+            f'episode; pass --episode_length.'
+        )
+        rows_per_episode = horizon // k
+
     # Replay buffer + collector (row layout is the collector's; capacity is the agent's).
     collector, buffer = make_collector(
         agent,
@@ -168,17 +174,19 @@ def main(_):
         f'whole trajectory (plus its final-observation marker) fits in the buffer.'
     )
 
-    unroll_length = int(config['unroll_length'])
+    # Schedule keys are read from the CREATED agent's config: supe resolves a None utd_ratio to its
+    # skill horizon k (one update per env step) and min_replay_size to its warm-up.
+    unroll_length = int(agent.config['unroll_length'])
     # Fractional utd_ratio is allowed (e.g. 0.1 -> one update every 10 rows), so a flat agent
     # can be run on the same gradient-step budget as a macro agent at the same env steps.
     # Integer values are unchanged: 50 * 1 == int(50 * 1.0).
-    updates_per_round = int(unroll_length * float(config['utd_ratio']))
+    updates_per_round = int(unroll_length * float(agent.config['utd_ratio']))
     assert updates_per_round >= 1, (
-        f"unroll_length ({unroll_length}) * utd_ratio ({config['utd_ratio']}) rounds down to 0 updates "
+        f"unroll_length ({unroll_length}) * utd_ratio ({agent.config['utd_ratio']}) rounds down to 0 updates "
         f'per round; raise either.'
     )
-    min_replay_size = int(config['min_replay_size'])
-    batch_size = int(config['batch_size'])
+    min_replay_size = int(agent.config['min_replay_size'])
+    batch_size = int(agent.config['batch_size'])
     goal_discount = float(agent.config['goal_discount'])
     print(
         f'[main_online] unroll_length={unroll_length} rows -> {updates_per_round} updates/round, '
@@ -195,7 +203,7 @@ def main(_):
         offline_source = make_offline_source(
             FLAGS.offline_dataset,
             agent,
-            example_transition(config['rollout_type'], example_batch),
+            example_transition(config['rollout_type'], example_batch, agent),
             label_seed=FLAGS.seed,
         )
         mixed_sampler = MixedBatchSampler(online_sampler, offline_source, float(config['offline_ratio']))

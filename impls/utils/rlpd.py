@@ -13,7 +13,9 @@ controller (JaxGCRL has no offline path for it). Decisions taken by the user on
     rows (rather than `GCDataset`'s goal mixture).
   * Flat agents store one offline row per env step, exactly like online rows.
   * The skill controller labels every stride-1 window [t, t + k) of each offline
-    trajectory with the frozen skill agent's own labeller -- the recipe of
+    trajectory with the frozen skill agent's own labeller (SUPE, agents/supe.py: the
+    continuous OPAL posterior mean in tanh space, a float `[D]` label per window, only
+    windows that fit inside one trajectory as anchors) -- the recipe of
     `skill_bc_relabel_controller` (empowerment: argmax window BC log-likelihood),
     `dds_controller` (DDS: encoder + codebook nearest neighbour) and
     `opal_controller` (discrete OPAL: z ~ p(z | tau), the clustering posterior over
@@ -54,6 +56,9 @@ trajectories are complete, so it is one pass over the cached E values at load ti
 Flat rows also carry `is_offline` (1 here, 0 for online rows): the flat agent's
 exploration bonus critic (`add_explore='reward'`) trains on online rows only and
 masks on this field; `'reward-to-rlpd'` trains on both.
+Macro rows carry the same five extra fields (E of the window's start state, its running
+max, `is_offline`, the distill target and flag), so a macro agent (SUPE) can use the
+distilled bonus and relabel offline rows exactly as the flat agent does.
 """
 
 import dataclasses
@@ -261,30 +266,72 @@ def episodic_future_max(values, seq_dataset):
     return out
 
 
-def make_offline_macro_source(seq_dataset, labels, example_transition, k, goal_discount, keep=None):
+def make_offline_macro_source(
+    seq_dataset, labels, example_transition, k, goal_discount, keep=None, empowerment=None, distill_target='episode_max'
+):
     """One offline macro row per env step t: (s_t, z_t, s_{min(t+k, end)}), `z_t` the window label.
 
+    `labels` is `[size]` (an int skill index, the CRL controllers) or `[size, D]` (a float
+    latent, SUPE); the row's `actions` takes the dtype of `example_transition['actions']`.
     `goal_discount` is the per-env-step discount (rows are env steps); the k-step
     next observation comes from `next_offset=k` at sample time. `keep` restricts which
-    rows are sampled as anchors (see `_fill_buffer`).
+    rows are sampled as anchors (see `_fill_buffer`). `empowerment` / `distill_target` fill
+    the same extra fields as `make_offline_flat_source` (E of the row's start state, its
+    per-trajectory running max, the E' regression target); `is_offline` is 1.
     """
     labels = np.asarray(labels)
-    assert labels.shape == (seq_dataset.size,), f'expected one label per dataset row, got {labels.shape}'
+    assert labels.shape[0] == seq_dataset.size and labels.ndim in (1, 2), (
+        f'expected one label per dataset row ([size] or [size, D]), got {labels.shape}'
+    )
+    action_dtype = np.asarray(example_transition['actions']).dtype
     buffer = TrajectoryReplayBuffer.create(example_transition, _capacity(seq_dataset))
     terminals = np.asarray(seq_dataset.dataset['terminals'], dtype=np.float32)
+    if empowerment is None:
+        empowerment = np.zeros((seq_dataset.size,), dtype=np.float32)
+    empowerment = np.asarray(empowerment, dtype=np.float32)
+    assert empowerment.shape == (seq_dataset.size,), (
+        f'empowerment values {empowerment.shape} do not cover the dataset ({seq_dataset.size} rows)'
+    )
+    episodic_max = episodic_running_max(empowerment, seq_dataset)
+    if distill_target == 'episode_max':
+        distill = episodic_total_max(empowerment, seq_dataset)
+    elif distill_target == 'future_max':
+        distill = episodic_future_max(empowerment, seq_dataset)
+    else:
+        raise ValueError(f'unknown distill_target {distill_target!r}')
 
     def row(t, start, marker, observations):
         last = min(t + k - 1, marker - 1)  # last env step inside the window
         return dict(
             observations=observations[t],
-            actions=np.int32(labels[t]),
+            actions=np.asarray(labels[t], dtype=action_dtype),
             rewards=np.float32(0.0),
             masks=np.float32(1.0 - terminals[last]),
             terminals=terminals[last],
+            empowerment=empowerment[t],
+            episodic_max_empowerment=episodic_max[t],
+            is_offline=np.float32(1.0),
+            distill_target=distill[t],
+            distill_target_ready=np.float32(1.0),
         )
 
-    num_rows = _fill_buffer(buffer, seq_dataset, row, keep=keep)
+    def marker_fields(marker):
+        return dict(empowerment=empowerment[marker], episodic_max_empowerment=episodic_max[marker])
+
+    num_rows = _fill_buffer(buffer, seq_dataset, row, keep=keep, marker_fields=marker_fields)
     return BufferSource(buffer, discount=float(goal_discount), next_offset=int(k)), num_rows
+
+
+def full_window_mask(seq_dataset, k):
+    """`[size]` bool: rows t whose window [t, t + k) lies inside one trajectory (t + k <= marker).
+
+    SUPE's `ChunkDataset` only labels such windows; the clamped partial windows at a
+    trajectory's end are still written (non-anchor) so the trajectory stays contiguous.
+    """
+    keep = np.zeros((seq_dataset.size,), dtype=bool)
+    for start, marker in offline_trajectories(seq_dataset):
+        keep[start : max(start, marker - k + 1)] = True
+    return keep
 
 
 def make_offline_source(dataset_name, agent, example_transition, label_seed=0):
@@ -320,15 +367,31 @@ def make_offline_source(dataset_name, agent, example_transition, label_seed=0):
         _check_observation_shape(seq_dataset, example_transition)
         labels, stats = agent.label_offline_windows(seq_dataset, seed=label_seed)
         counts = stats.pop('label_counts', None)
+        label_desc = f'K={config["num_skills"]}' if np.asarray(labels).ndim == 1 else f'D={np.asarray(labels).shape[-1]} (latent)'
         print(
-            f'[{name}] labelled {seq_dataset.size} offline windows (k={k}, K={config["num_skills"]}, '
+            f'[{name}] labelled {seq_dataset.size} offline windows (k={k}, {label_desc}, '
             f'labeller={config["skill_agent_name"]}): ' + ', '.join(f'{key}={v:.3f}' for key, v in stats.items())
         )
         if counts is not None:
             print(f'[{name}]   per-skill counts: {counts.tolist()}')
         keep = _loglik_keep_mask(seq_dataset, config, name)
+        if config.get('offline_full_windows_only', False):
+            full = full_window_mask(seq_dataset, k)
+            num_full, num_windows = int(full.sum()), int((np.asarray(seq_dataset.dataset['valids']) > 0).sum())
+            print(f'[{name}] offline_full_windows_only: {num_full} / {num_windows} windows lie inside one trajectory')
+            keep = full if keep is None else (keep & full)
+        empowerment = None
+        if getattr(agent, 'uses_empowerment', False):
+            empowerment = offline_empowerment_values(agent, seq_dataset, dataset_name, seed=label_seed)
         source, num_rows = make_offline_macro_source(
-            seq_dataset, labels, example_transition, k, config['discount'], keep=keep
+            seq_dataset,
+            labels,
+            example_transition,
+            k,
+            config['discount'],
+            keep=keep,
+            empowerment=empowerment,
+            distill_target=config.get('distill_target', 'episode_max'),
         )
         print(f'[{name}] offline dataset {dataset_name}: {num_rows} macro rows (stride 1) in {seq_dataset.size} slots')
         return source

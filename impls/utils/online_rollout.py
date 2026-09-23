@@ -26,12 +26,20 @@ into a `TrajectoryReplayBuffer`:
   * `MacroCollector`  -- one SMDP macro-step per row: the high-level agent picks a
     skill z, which the frozen low-level policy executes for `k` env steps (or
     until the episode ends). The row is (s_t, z, R, mask, done) with
-    R = sum_i gamma_low^i r_i over the steps actually taken, mirroring
-    `rollout_macro_step` in JaxGCRL's crl_skill_controller. Used by the online
-    CRL skill controller. A frozen policy that keeps per-episode state (Skill-DT's
-    Transformer context) exposes `init_low_level_state(max_steps)` /
-    `low_level_actions_with_state(...)`; the collector threads that state through
-    every env step of the episode and rebuilds it at reset.
+    R = sum_i gamma_low^i (r_i + reward_shift) over the steps actually taken, mirroring
+    `rollout_macro_step` in JaxGCRL's crl_skill_controller (`reward_shift` is 0 there;
+    SUPE's agent sets -1 to train on -1/0 rewards, see agents/supe.py). Used by the online
+    CRL skill controller (integer skill index) and by SUPE (a float latent u in (-1, 1)^D:
+    the row's `actions` field takes the dtype/shape of the agent's `example_skill()` hook
+    when it has one, else an int32 index). An agent with `sample_skills_takes_env_steps`
+    gets the running env-step count in `sample_skills(env_steps=...)` (SUPE's prior warm-up).
+    A frozen policy that keeps per-episode state (Skill-DT's Transformer context) exposes
+    `init_low_level_state(max_steps)` / `low_level_actions_with_state(...)`; the collector
+    threads that state through every env step of the episode and rebuilds it at reset.
+    Macro rows carry the same `empowerment` / `episodic_max_empowerment` / `is_offline` /
+    `distill_target` / `distill_target_ready` fields as flat rows, filled the same way
+    (E of the macro-step's start state; the marker holds the episode's final state), so a
+    macro agent can run the distilled bonus unchanged. Agents without an estimator store 0.
 
 Both condition the behaviour policy on the episode's task goal (`info['goal']`,
 the full goal observation) and never store it: training goals are relabelled
@@ -66,21 +74,30 @@ class _EpisodeTracker:
         return dict(episode_return=self.ep_return, episode_length=self.ep_length, episode_success=self.ep_success)
 
 
-class FlatCollector:
-    """Per-env-step collector for flat goal-conditioned agents."""
+def _extra_row_fields():
+    """The per-row fields (beyond s, a, r, mask, done) both collectors store; see the module docstring."""
+    return dict(
+        empowerment=np.float32(0.0),
+        episodic_max_empowerment=np.float32(0.0),
+        is_offline=np.float32(0.0),
+        distill_target=np.float32(0.0),
+        distill_target_ready=np.float32(0.0),
+    )
 
-    def __init__(self, env, buffer, seed, discrete=False):
+
+class _Collector:
+    """Shared state and the empowerment / distilled-bonus row bookkeeping of both collectors."""
+
+    def __init__(self, env, buffer, seed):
         self.env = env
         self.buffer = buffer
         self.rng = jax.random.PRNGKey(seed)
-        self.discrete = discrete
         self.tracker = _EpisodeTracker()
         self._pending_empowerment = []  # abs indices of rows whose `empowerment` is still the NaN placeholder
         self._pending_first = []  # parallel to the above: does the row start a new episode?
         self._episode_first_row = True  # the next row written starts a new episode
         self._episode_start_abs = None  # abs index of the current episode's first row (distilled bonus only)
         self._closed_episodes = []  # (first row abs, marker abs) of episodes closed since the last flush
-        self._reset_episode()
 
     def _reset_episode(self):
         observation, info = self.env.reset()
@@ -89,27 +106,49 @@ class FlatCollector:
         self.tracker.reset()
         self._episode_first_row = True
 
-    @staticmethod
-    def example_transition(example_batch):
-        """Example row (used to allocate the buffer) in this collector's layout."""
-        return dict(
-            observations=example_batch['observations'][0],
-            actions=example_batch['actions'][0],
-            rewards=np.float32(0.0),
-            masks=np.float32(1.0),
-            terminals=np.float32(0.0),
-            empowerment=np.float32(0.0),
-            episodic_max_empowerment=np.float32(0.0),
-            is_offline=np.float32(0.0),
-            distill_target=np.float32(0.0),
-            distill_target_ready=np.float32(0.0),
-        )
-
     def _mark_pending(self, abs_idx):
         """Queue a row for `flush_empowerment` (NaN placeholders until then)."""
         self._pending_empowerment.append(abs_idx)
         self._pending_first.append(self._episode_first_row)
         self._episode_first_row = False
+
+    def _row_extras(self, agent):
+        """The extra fields of a fresh online row: NaN placeholders where the agent will fill them."""
+        uses_empowerment = bool(getattr(agent, 'uses_empowerment', False))
+        uses_distill = bool(getattr(agent, 'uses_distill_bonus', False))
+        return dict(
+            # NaN until `flush_empowerment`: sampling an unfilled row would surface as a NaN loss
+            # rather than silently training on a wrong entropy target.
+            empowerment=np.float32(np.nan if uses_empowerment else 0.0),
+            episodic_max_empowerment=np.float32(np.nan if uses_empowerment else 0.0),
+            is_offline=np.float32(0.0),
+            # NaN + ready=0 until the episode closes (`_flush_distill_targets`); the agent's regression
+            # masks on the flag, so a NaN can only surface if a row is flagged ready without a target.
+            distill_target=np.float32(np.nan if uses_distill else 0.0),
+            distill_target_ready=np.float32(0.0),
+        )
+
+    def _after_add(self, agent, abs_idx):
+        """Bookkeeping after a real row was written at `abs_idx`."""
+        if getattr(agent, 'uses_distill_bonus', False) and self._episode_start_abs is None:
+            self._episode_start_abs = abs_idx
+        if getattr(agent, 'uses_empowerment', False):
+            self._mark_pending(abs_idx)
+
+    def _close_episode(self, agent, final_observation):
+        """Write the marker row for the episode's final observation (+ its placeholders); returns its abs index."""
+        end_abs = self.buffer.end_trajectory(final_observation)
+        if getattr(agent, 'uses_empowerment', False):
+            # The marker row is never an anchor but it IS the last transition's next state,
+            # whose E(s') the exploration bonus reads: give it the same NaN-until-flushed slots.
+            nan = np.array([np.nan], dtype=np.float32)
+            self.buffer.write_field('empowerment', [end_abs], nan)
+            self.buffer.write_field('episodic_max_empowerment', [end_abs], nan)
+            self._mark_pending(end_abs)
+        if getattr(agent, 'uses_distill_bonus', False):
+            self._closed_episodes.append((self._episode_start_abs, end_abs))
+            self._episode_start_abs = None
+        return end_abs
 
     def flush_empowerment(self, agent):
         """Fill `empowerment` and `episodic_max_empowerment` of every row added since the last flush.
@@ -171,6 +210,27 @@ class FlatCollector:
             self.buffer.write_field('distill_target', rows[:-1], target.astype(np.float32))
             self.buffer.write_field('distill_target_ready', rows[:-1], np.ones(len(rows) - 1, dtype=np.float32))
 
+
+class FlatCollector(_Collector):
+    """Per-env-step collector for flat goal-conditioned agents."""
+
+    def __init__(self, env, buffer, seed, discrete=False):
+        super().__init__(env, buffer, seed)
+        self.discrete = discrete
+        self._reset_episode()
+
+    @staticmethod
+    def example_transition(example_batch, agent=None):
+        """Example row (used to allocate the buffer) in this collector's layout."""
+        return dict(
+            observations=example_batch['observations'][0],
+            actions=example_batch['actions'][0],
+            rewards=np.float32(0.0),
+            masks=np.float32(1.0),
+            terminals=np.float32(0.0),
+            **_extra_row_fields(),
+        )
+
     def step(self, agent):
         self.rng, key = jax.random.split(self.rng)
         action = agent.sample_actions(observations=self.observation, goals=self.goal, seed=key, temperature=1.0)
@@ -182,8 +242,6 @@ class FlatCollector:
         done = bool(terminated or truncated)
         self.tracker.add(reward, info)
 
-        uses_empowerment = bool(getattr(agent, 'uses_empowerment', False))
-        uses_distill = bool(getattr(agent, 'uses_distill_bonus', False))
         abs_idx = self.buffer.add_transition(
             dict(
                 observations=self.observation,
@@ -191,51 +249,29 @@ class FlatCollector:
                 rewards=np.float32(reward),
                 masks=np.float32(1.0 - float(terminated)),
                 terminals=np.float32(done),
-                # NaN until `flush_empowerment`: sampling an unfilled row would surface as a NaN loss
-                # rather than silently training on a wrong entropy target.
-                empowerment=np.float32(np.nan if uses_empowerment else 0.0),
-                episodic_max_empowerment=np.float32(np.nan if uses_empowerment else 0.0),
-                is_offline=np.float32(0.0),
-                # NaN + ready=0 until the episode closes (`_flush_distill_targets`); the agent's regression
-                # masks on the flag, so a NaN can only surface if a row is flagged ready without a target.
-                distill_target=np.float32(np.nan if uses_distill else 0.0),
-                distill_target_ready=np.float32(0.0),
+                **self._row_extras(agent),
             )
         )
-        if uses_distill and self._episode_start_abs is None:
-            self._episode_start_abs = abs_idx
-        if uses_empowerment:
-            self._mark_pending(abs_idx)
+        self._after_add(agent, abs_idx)
         self.observation = next_observation
 
         episode = None
         if done:
-            end_abs = self.buffer.end_trajectory(next_observation)
-            if uses_empowerment:
-                # The marker row is never an anchor but it IS the last transition's next state,
-                # whose E(s') the exploration bonus reads: give it the same NaN-until-flushed slots.
-                nan = np.array([np.nan], dtype=np.float32)
-                self.buffer.write_field('empowerment', [end_abs], nan)
-                self.buffer.write_field('episodic_max_empowerment', [end_abs], nan)
-                self._mark_pending(end_abs)
-            if uses_distill:
-                self._closed_episodes.append((self._episode_start_abs, end_abs))
-                self._episode_start_abs = None
+            self._close_episode(agent, next_observation)
             episode = self.tracker.summary()
             self._reset_episode()
         return dict(env_steps=1, rows=1, episode=episode)
 
 
-class MacroCollector:
+class MacroCollector(_Collector):
     """Per-macro-step collector for a high-level skill controller over a frozen skill policy."""
 
-    def __init__(self, env, buffer, seed, skill_commitment_k, gamma_low=1.0):
-        self.env = env
-        self.buffer = buffer
-        self.rng = jax.random.PRNGKey(seed)
+    def __init__(self, env, buffer, seed, skill_commitment_k, gamma_low=1.0, reward_shift=0.0):
+        super().__init__(env, buffer, seed)
         self.k = int(skill_commitment_k)
         self.gamma_low = float(gamma_low)
-        self.tracker = _EpisodeTracker()
+        self.reward_shift = float(reward_shift)
+        self.env_steps = 0  # env steps taken so far (handed to agents whose skill choice depends on it)
         # Episode horizon handed to a STATEFUL frozen low-level policy (Skill-DT sizes its
         # rollout histogram with it); None if the env has no TimeLimit.
         self.horizon = env_horizon(env)
@@ -244,28 +280,26 @@ class MacroCollector:
         # episode because the agent is not known at construction time.
         self.low_state = None
         self._low_state_stale = True
+        # Integer skill index (the CRL controllers) or a float latent (SUPE), from the buffer's layout.
+        self._integer_skills = np.issubdtype(buffer.read_field('actions', []).dtype, np.integer)
         self._reset_episode()
 
-    def flush_empowerment(self, agent):
-        """Macro rows carry no empowerment field (the flat agent's entropy bonus only); nothing to fill."""
-        return 0
-
     def _reset_episode(self):
-        observation, info = self.env.reset()
-        self.observation = observation
-        self.goal = info['goal']
-        self.tracker.reset()
+        super()._reset_episode()
         self.low_state = None
         self._low_state_stale = True
 
     @staticmethod
-    def example_transition(example_batch):
+    def example_transition(example_batch, agent=None):
+        example_skill = getattr(agent, 'example_skill', None)
+        actions = np.int32(0) if example_skill is None else np.asarray(example_skill())  # skill index | latent
         return dict(
             observations=example_batch['observations'][0],
-            actions=np.int32(0),  # skill index
+            actions=actions,
             rewards=np.float32(0.0),
             masks=np.float32(1.0),
             terminals=np.float32(0.0),
+            **_extra_row_fields(),
         )
 
     def step(self, agent):
@@ -275,7 +309,13 @@ class MacroCollector:
             self._low_state_stale = False
 
         self.rng, skill_key, low_key = jax.random.split(self.rng, 3)
-        skill = int(agent.sample_skills(observations=self.observation, goals=self.goal, seed=skill_key, temperature=1.0))
+        skill_kwargs = {}
+        if getattr(agent, 'sample_skills_takes_env_steps', False):
+            skill_kwargs['env_steps'] = self.env_steps
+        skill = agent.sample_skills(
+            observations=self.observation, goals=self.goal, seed=skill_key, temperature=1.0, **skill_kwargs
+        )
+        skill = int(skill) if self._integer_skills else np.asarray(skill, dtype=np.float32)
 
         start_observation = self.observation
         macro_return = 0.0
@@ -297,27 +337,30 @@ class MacroCollector:
             next_observation, reward, terminated, truncated, info = self.env.step(action)
             env_steps += 1
             self.tracker.add(reward, info)
-            macro_return += disc * float(reward)
+            macro_return += disc * (float(reward) + self.reward_shift)
             disc *= self.gamma_low
             terminated_any = terminated_any or bool(terminated)
             self.observation = next_observation
             done = bool(terminated or truncated)
             if done:
                 break
+        self.env_steps += env_steps
 
-        self.buffer.add_transition(
+        abs_idx = self.buffer.add_transition(
             dict(
                 observations=start_observation,
-                actions=np.int32(skill),
+                actions=np.int32(skill) if self._integer_skills else skill,
                 rewards=np.float32(macro_return),
                 masks=np.float32(1.0 - float(terminated_any)),
                 terminals=np.float32(done),
+                **self._row_extras(agent),
             )
         )
+        self._after_add(agent, abs_idx)
 
         episode = None
         if done:
-            self.buffer.end_trajectory(self.observation)
+            self._close_episode(agent, self.observation)
             episode = self.tracker.summary()
             self._reset_episode()
         return dict(env_steps=env_steps, rows=1, episode=episode)
@@ -326,11 +369,15 @@ class MacroCollector:
 COLLECTOR_CLASSES = dict(flat=FlatCollector, macro=MacroCollector)
 
 
-def example_transition(rollout_type, example_batch):
-    """The row layout (one unbatched transition) of the collector for `rollout_type`."""
+def example_transition(rollout_type, example_batch, agent=None):
+    """The row layout (one unbatched transition) of the collector for `rollout_type`.
+
+    `agent` lets a macro agent fix the dtype/shape of the stored skill (`example_skill()`);
+    without it (or without the hook) skills are int32 indices.
+    """
     if rollout_type not in COLLECTOR_CLASSES:
         raise ValueError(f'Unknown rollout_type {rollout_type!r}; expected one of {sorted(COLLECTOR_CLASSES)}.')
-    return COLLECTOR_CLASSES[rollout_type].example_transition(example_batch)
+    return COLLECTOR_CLASSES[rollout_type].example_transition(example_batch, agent)
 
 
 def make_collector(agent, env, example_batch, buffer_factory, seed):
@@ -340,7 +387,7 @@ def make_collector(agent, env, example_batch, buffer_factory, seed):
     pick the capacity while the collector fixes the row layout.
     """
     rollout_type = agent.config['rollout_type']
-    buffer = buffer_factory(example_transition(rollout_type, example_batch))
+    buffer = buffer_factory(example_transition(rollout_type, example_batch, agent))
     if rollout_type == 'flat':
         collector = FlatCollector(env, buffer, seed, discrete=bool(agent.config['discrete']))
     else:
@@ -348,5 +395,6 @@ def make_collector(agent, env, example_batch, buffer_factory, seed):
             env, buffer, seed,
             skill_commitment_k=agent.config['skill_commitment_k'],
             gamma_low=agent.config['gamma_low'],
+            reward_shift=agent.config.get('reward_shift', 0.0),
         )
     return collector, buffer
