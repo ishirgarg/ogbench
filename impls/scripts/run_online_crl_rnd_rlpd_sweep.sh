@@ -117,6 +117,28 @@ EVAL_INTERVAL=${EVAL_INTERVAL:-50000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-500000}
 LOG_INTERVAL=${LOG_INTERVAL:-5000}
 RUN_GROUP_PREFIX=${RUN_GROUP_PREFIX:-crlrnd}
+# Resume support. SKIP_FILE: a file with one run NAME per line (the "<cell>_<arm>_s<seed>" the
+# script builds below); those jobs are skipped. Use it to relaunch a partially-done sweep
+# without redoing finished runs, or to avoid double-launching runs still in flight from an
+# earlier driver. MAX_TOTAL_JOBS caps concurrency across the WHOLE machine rather than
+# per-GPU, counting main_online.py processes this driver did not start (e.g. orphans left
+# by a previous driver) -- without it a new driver would happily add its own
+# GPUS*JOBS_PER_GPU on top of whatever is already running. 0 disables the global cap.
+SKIP_FILE=${SKIP_FILE:-}
+MAX_TOTAL_JOBS=${MAX_TOTAL_JOBS:-0}
+declare -A SKIP=()
+if [[ -n "$SKIP_FILE" ]]; then
+    [[ -f "$SKIP_FILE" ]] || { echo "ERROR: SKIP_FILE=$SKIP_FILE does not exist" >&2; exit 1; }
+    while read -r _n; do [[ -n "$_n" ]] && SKIP["$_n"]=1; done < "$SKIP_FILE"
+    echo "[sweep] SKIP_FILE=$SKIP_FILE: ${#SKIP[@]} run names will be skipped"
+fi
+total_running() {  # main_online.py processes owned by this user, machine-wide
+    pgrep -u "$(id -u)" -f '[m]ain_online\.py' 2>/dev/null | wc -l
+}
+await_global_slot() {
+    [[ "$MAX_TOTAL_JOBS" -le 0 ]] && return 0
+    while (( $(total_running) >= MAX_TOTAL_JOBS )); do sleep 20; done
+}
 
 # Cells that ALSO get a no-bonus control arm (plain online CRL + RLPD): the cube-noisy,
 # antmaze-explore and stitch datasets. Set BASELINE_CELLS="" to skip them entirely.
@@ -252,6 +274,10 @@ run_one() {  # GPU JOB_SPEC
         GROUP="${RUN_GROUP_PREFIX}_${KEY}_c${COEF}"
         NAME="${KEY}_c${COEF}_s${SEED}"
     fi
+    if [[ -n "${SKIP[$NAME]:-}" ]]; then
+        echo "[sweep] gpu=$GPU skipping $NAME (in SKIP_FILE)"
+        return 0
+    fi
     local LOG="$LOG_DIR/${NAME}.log"
     local cmd=(
         "$PYTHON" -u main_online.py
@@ -268,6 +294,7 @@ run_one() {  # GPU JOB_SPEC
         echo "gpu=$GPU $NAME (env=$ENV_NAME rlpd=$OFFLINE): ${cmd[*]}"
         return 0
     fi
+    await_global_slot
     echo "[sweep] gpu=$GPU launching $NAME env=$ENV_NAME rlpd=$OFFLINE -> $LOG"
     CUDA_VISIBLE_DEVICES=$GPU SLURM_JOB_ID="local-$IDX" \
     XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_per_fusion_autotune_cache_dir=$TMPDIR/autotune_${NAME}" \
