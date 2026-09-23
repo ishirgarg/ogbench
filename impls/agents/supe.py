@@ -58,6 +58,21 @@ onto this repo's online path (`main_online.py`, `utils/online_rollout.MacroColle
       * Offline chunks: SUPE labels stride-1 windows that fit inside a trajectory and discards the rest;
         `offline_full_windows_only=True` does the same via the RLPD `keep` mask.
 
+  Goal-conditioned variant (`goal_conditioned=True`, NOT in the paper, which is single-task): the
+  multigoal online envs draw a random task goal per episode, so the high-level actor, the critic and
+  the reward/termination model take concat(s, g), g = the episode's goal observation (`info['goal']`,
+  stored on every online macro row as `task_goals`). Offline rows have no goal: each sampled offline
+  row gets a uniformly drawn task goal from the env's task list (`utils/rlpd.GoalBankSource`), keeping
+  the constant 'min' reward. The RND bonus, the OPAL prior warm-up and the distilled E'(s, u) stay
+  goal-free (novelty / empowerment are properties of the state, not of the task).
+
+  Paper auxiliary schedule (`aux_schedule='paper'`, SUPE `train_finetuning_supe.py`): the reward model
+  and the RND predictor are NOT trained inside `update` but once per macro step by main_online.py:
+  `update_rm` = `rm_updates_per_macro` sequential minibatch steps of `rm_batch_size` online rows (SUPE:
+  rm.update(online_batch, utd_ratio) = 20 x 128), `update_rnd` = one step on the single newest online
+  transition. With `minibatch_split='interleave'` every critic minibatch is exactly half online / half
+  offline rows (SUPE `combine` + contiguous reshape), instead of a random permutation.
+
   Combining with the empowerment distillation bonus (agents/online_crl.py `add_explore=distill |
   distill-to-rlpd`, the same config keys and the same launcher env vars): a twin-head E'(s, u) is
   regressed onto each row's trajectory-max empowerment `distill_target` (online rows once their episode
@@ -230,6 +245,17 @@ class SUPEAgent(flax.struct.PyTreeNode):
     def _single_obs(self, observations):
         return observations.ndim == 1
 
+    @property
+    def stores_task_goals(self):
+        """MacroCollector / RLPD rows carry `task_goals` (the episode's goal observation) for this agent."""
+        return bool(self.config['goal_conditioned'])
+
+    def _hi(self, observations, goals):
+        """High-level network input: concat(s, g) when goal-conditioned, else s."""
+        if not self.config['goal_conditioned']:
+            return observations
+        return jnp.concatenate([observations, goals], axis=-1)
+
     def _lr(self, group):
         return float({'rm': self.config['rm_lr'], 'rnd': self.config['rnd_lr'], 'distill': self.config['distill_lr']}.get(group, self.config['lr']))
 
@@ -299,15 +325,16 @@ class SUPEAgent(flax.struct.PyTreeNode):
         (rewards_with_bonus, masks, task_rewards, rnd_bonus).
         """
         obs, u = batch['observations'], batch['actions']
+        obs_g = self._hi(obs, batch.get('task_goals'))
         is_offline = batch['is_offline']
         if self.config['offline_relabel'] == 'min':
             offline_reward = jnp.full_like(batch['rewards'], float(self.config['offline_min_reward']))
         else:
-            offline_reward = self.network.select('rm_reward')(obs, u, params=params)
-        offline_mask = jax.nn.sigmoid(self.network.select('rm_mask')(obs, u, params=params))
+            offline_reward = self.network.select('rm_reward')(obs_g, u, params=params)
+        offline_mask = jax.nn.sigmoid(self.network.select('rm_mask')(obs_g, u, params=params))
         rewards = jnp.where(is_offline > 0, offline_reward, batch['rewards'])
         masks = jnp.where(is_offline > 0, offline_mask, batch['masks'])
-        bonus = self.rnd_reward(params, obs, u)
+        bonus = self.rnd_reward(params, obs, u)  # goal-free novelty
         use = float(self.config['use_rnd_online']) * (1.0 - is_offline) + float(self.config['use_rnd_offline']) * is_offline
         return rewards + use * bonus, masks, rewards, bonus
 
@@ -317,9 +344,11 @@ class SUPEAgent(flax.struct.PyTreeNode):
         """Clipped-double-Q-free SAC target (SUPE `update_critic`): r + gamma * mask * min_{M random heads} Q_targ(s', u')."""
         sample_rng, subset_rng = jax.random.split(rng)
         rewards, masks, task_rewards, bonus = self.relabel(params, batch)
-        next_dist = self.network.select('actor')(batch['next_observations'], params=params)
+        goals = batch.get('task_goals')
+        next_obs_g = self._hi(batch['next_observations'], goals)  # the goal is fixed within an episode
+        next_dist = self.network.select('actor')(next_obs_g, params=params)
         next_u, next_log_prob = next_dist.sample_and_log_prob(seed=sample_rng)
-        next_qs = self.network.select('target_critic')(batch['next_observations'], next_u, params=params)  # [num_qs, B]
+        next_qs = self.network.select('target_critic')(next_obs_g, next_u, params=params)  # [num_qs, B]
         num_qs, num_min_qs = int(self.config['num_qs']), int(self.config['num_min_qs'])
         if num_min_qs < num_qs:
             idx = jax.random.choice(subset_rng, num_qs, shape=(num_min_qs,), replace=False)
@@ -331,7 +360,7 @@ class SUPEAgent(flax.struct.PyTreeNode):
             target_q = target_q - self.config['discount'] * masks * alpha * next_log_prob
         target_q = jax.lax.stop_gradient(target_q)
 
-        qs = self.network.select('critic')(batch['observations'], batch['actions'], params=params)  # [num_qs, B]
+        qs = self.network.select('critic')(self._hi(batch['observations'], goals), batch['actions'], params=params)  # [num_qs, B]
         critic_loss = jnp.mean(jnp.square(qs - target_q[None]))
         online = 1.0 - batch['is_offline']
         num_online = jnp.maximum(online.sum(), 1.0)
@@ -353,11 +382,11 @@ class SUPEAgent(flax.struct.PyTreeNode):
 
     def rm_loss(self, batch, params, active):
         """Reward model (SUPE `RM._update`): MSE reward head + BCE termination head on the ONLINE rows, RND-free."""
-        obs, u = batch['observations'], batch['actions']
+        obs_g, u = self._hi(batch['observations'], batch.get('task_goals')), batch['actions']
         weight = (1.0 - batch['is_offline']) * active
         num_rows = jnp.maximum(weight.sum(), 1.0)
-        r_hat = self.network.select('rm_reward')(obs, u, params=params)
-        m_logit = self.network.select('rm_mask')(obs, u, params=params)
+        r_hat = self.network.select('rm_reward')(obs_g, u, params=params)
+        m_logit = self.network.select('rm_mask')(obs_g, u, params=params)
         r_loss = (jnp.square(r_hat - batch['rewards']) * weight).sum() / num_rows
         m_loss = (optax.sigmoid_binary_cross_entropy(m_logit, batch['masks']) * weight).sum() / num_rows
         # Validation on the offline rows against their STORED (dataset) mask -- SUPE `RM.evaluate`.
@@ -419,9 +448,10 @@ class SUPEAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, params, rng, env_steps):
         """SUPE `update_actor`: alpha log pi - mean_over_heads Q(s, u ~ pi), plus the optional distilled bonus."""
-        dist = self.network.select('actor')(batch['observations'], params=params)
+        obs_g = self._hi(batch['observations'], batch.get('task_goals'))
+        dist = self.network.select('actor')(obs_g, params=params)
         u, log_probs = dist.sample_and_log_prob(seed=rng)
-        qs = self.network.select('critic')(batch['observations'], u, params=params)
+        qs = self.network.select('critic')(obs_g, u, params=params)
         q = qs.mean(axis=0)
         alpha = self.network.select('alpha')(params=params)
         info = {'entropy': -log_probs.mean(), 'q_pi_mean': q.mean(), 'u_abs_mean': jnp.abs(u).mean()}
@@ -482,9 +512,21 @@ class SUPEAgent(flax.struct.PyTreeNode):
         rm_active = (env_steps >= float(self.config['rm_start_env_steps'])).astype(jnp.float32)
         rnd_active = (env_steps >= float(self.config['rnd_start_env_steps'])).astype(jnp.float32)
 
-        # Random minibatches so every critic step sees online and offline rows (SUPE interleaves them).
-        perm = jax.random.permutation(perm_rng, batch_size)
-        minibatches = jax.tree_util.tree_map(lambda x: x[perm].reshape((num_steps, mini) + x.shape[1:]), batch)
+        if self.config['minibatch_split'] == 'interleave':
+            # SUPE `combine(offline, online)` then a contiguous reshape: minibatch j holds the j-th slice of the
+            # online rows and the j-th slice of the offline rows, so with a 50/50 batch every critic step sees
+            # exactly mini/2 of each. (Stable sort: online rows first, each part keeps the sampler's random order.)
+            order = jnp.argsort(batch['is_offline'], stable=True)
+            assert mini % 2 == 0, f'minibatch_split=interleave needs an even minibatch, got {mini}'
+            half = num_steps * (mini // 2)
+            order = jnp.concatenate(
+                [order[:half].reshape(num_steps, mini // 2), order[half:].reshape(num_steps, mini // 2)], axis=1
+            ).reshape(-1)
+        else:
+            # Random minibatches so every critic step sees online and offline rows.
+            order = jax.random.permutation(perm_rng, batch_size)
+        minibatches = jax.tree_util.tree_map(lambda x: x[order].reshape((num_steps, mini) + x.shape[1:]), batch)
+        fused_aux = self.config['aux_schedule'] == 'fused'
 
         def scan_step(carry, mb):
             params, opt_states, rng = carry
@@ -493,8 +535,10 @@ class SUPEAgent(flax.struct.PyTreeNode):
                 params, opt_states, 'critic', lambda p: self.critic_loss(mb, p, critic_rng)
             )
             params = self._polyak(params)
-            params, opt_states, rm_info = self._group_step(params, opt_states, 'rm', lambda p: self.rm_loss(mb, p, rm_active))
-            info = {**{f'critic/{k}': v for k, v in critic_info.items()}, **{f'rm/{k}': v for k, v in rm_info.items()}}
+            info = {f'critic/{k}': v for k, v in critic_info.items()}
+            if fused_aux:
+                params, opt_states, rm_info = self._group_step(params, opt_states, 'rm', lambda p: self.rm_loss(mb, p, rm_active))
+                info.update({f'rm/{k}': v for k, v in rm_info.items()})
             if self.uses_distill_bonus:
                 params, opt_states, distill_info = self._group_step(
                     params, opt_states, 'distill', lambda p: self.distill_loss(mb, p)
@@ -507,9 +551,9 @@ class SUPEAgent(flax.struct.PyTreeNode):
         )
         info = jax.tree_util.tree_map(lambda x: x.mean(axis=0), scan_info)
 
-        # RND predictor on the online rows of the last minibatch(es).
+        # RND predictor on the online rows of the last minibatch(es) ('fused' only; 'paper' -> update_rnd).
         rnd_info = {}
-        for i in range(int(self.config['rnd_updates_per_update'])):
+        for i in range(int(self.config['rnd_updates_per_update']) if fused_aux else 0):
             mb = jax.tree_util.tree_map(lambda x: x[num_steps - 1 - (i % num_steps)], minibatches)
             params, opt_states, rnd_info = self._group_step(params, opt_states, 'rnd', lambda p: self.rnd_loss(mb, p, rnd_active))
         info.update({f'rnd/{k}': v for k, v in rnd_info.items()})
@@ -529,19 +573,58 @@ class SUPEAgent(flax.struct.PyTreeNode):
         network = self.network.replace(params=params)
         return self.replace(network=network, opt_states=opt_states, rng=new_rng), info
 
+    @jax.jit
+    def update_rm(self, batch):
+        """aux_schedule='paper': SUPE `rm.update(online_batch, utd_ratio)` -- `rm_updates_per_macro` sequential
+        steps on contiguous slices of an ONLINE batch of rm_updates_per_macro x rm_batch_size rows. Called once
+        per macro step by main_online.py from `rm_start_env_steps` on."""
+        num_steps = int(self.config['rm_updates_per_macro'])
+        size = batch['observations'].shape[0]
+        assert size % num_steps == 0, f'rm batch ({size}) must be a multiple of rm_updates_per_macro ({num_steps})'
+        slices = jax.tree_util.tree_map(lambda x: x.reshape((num_steps, size // num_steps) + x.shape[1:]), batch)
+        one = jnp.ones((), dtype=jnp.float32)
+
+        def step(carry, mb):
+            params, opt_states = carry
+            params, opt_states, info = self._group_step(params, opt_states, 'rm', lambda p: self.rm_loss(mb, p, one))
+            return (params, opt_states), info
+
+        (params, opt_states), info = jax.lax.scan(step, (self.network.params, self.opt_states), slices)
+        info = jax.tree_util.tree_map(lambda x: x[-1], info)
+        return self.replace(network=self.network.replace(params=params), opt_states=opt_states), {f'rm/{k}': v for k, v in info.items()}
+
+    @jax.jit
+    def update_rnd(self, transition):
+        """aux_schedule='paper': SUPE `rnd.update` -- ONE predictor step on the single newest online (s, u).
+        `transition` holds unbatched `observations` / `actions`. Called once per macro step from
+        `rnd_start_env_steps` on."""
+        mb = dict(
+            observations=jnp.asarray(transition['observations'], dtype=jnp.float32)[None],
+            actions=jnp.asarray(transition['actions'], dtype=jnp.float32)[None],
+            is_offline=jnp.zeros((1,), dtype=jnp.float32),
+        )
+        one = jnp.ones((), dtype=jnp.float32)
+        params, opt_states, info = self._group_step(self.network.params, self.opt_states, 'rnd', lambda p: self.rnd_loss(mb, p, one))
+        return self.replace(network=self.network.replace(params=params), opt_states=opt_states), {f'rnd/{k}': v for k, v in info.items()}
+
     # ── Acting: high level ────────────────────────────────────────────────────
 
     @jax.jit
     def sample_skills(self, observations, goals=None, seed=None, temperature=1.0, env_steps=None):
-        """u ~ pi_hi(. | s) in tanh space (temperature=0 -> tanh(mean)). `goals` is unused (SUPE is
-        task-conditioned through the reward). With `env_steps` < `warmup_env_steps` the skill is drawn from
-        the OPAL prior p(z | s) instead (SUPE's `start_training` warm-up)."""
+        """u ~ pi_hi(. | s[, g]) in tanh space (temperature=0 -> tanh(mean)). `goals` is used only with
+        `goal_conditioned` (plain SUPE is task-conditioned through the reward). With `env_steps` <
+        `warmup_env_steps` the skill is drawn from the OPAL prior p(z | s) instead (SUPE's `start_training`
+        warm-up; goal-free, as in the paper)."""
         if seed is None:
             seed = self.rng
         single = self._single_obs(observations)
         obs_b = observations[None, ...] if single else observations
+        goals_b = None
+        if self.config['goal_conditioned']:
+            assert goals is not None, 'supe: goal_conditioned=True needs the goal at acting time'
+            goals_b = goals[None, ...] if single else goals
         prior_seed, actor_seed = jax.random.split(seed)
-        u = self.network.select('actor')(obs_b, temperature=temperature).sample(seed=actor_seed)
+        u = self.network.select('actor')(self._hi(obs_b, goals_b), temperature=temperature).sample(seed=actor_seed)
         if env_steps is not None:
             prior_u = to_tanh(self.skill_agent.network.select('prior')(obs_b, 1.0).sample(seed=prior_seed))
             warm = jnp.asarray(env_steps, dtype=jnp.float32) < float(self.config['warmup_env_steps'])
@@ -659,7 +742,7 @@ class SUPEAgent(flax.struct.PyTreeNode):
                 f'than the VAE saw. SUPE uses k == chunk_size (hpolicy_horizon == horizon_length).'
             )
         if config['gamma_low'] is None:
-            config['gamma_low'] = float(config['discount'])  # SUPE: the chunk reward uses `agent.discount`
+            config['gamma_low'] = float(config['discount'])  # NB SUPE sums a chunk with the OPAL agent's discount (0.99)
         if config['target_entropy'] is None:
             config['target_entropy'] = -skill_dim / 2.0  # SUPE `SACLearner.create`
         if config['rm_start_env_steps'] is None:
@@ -674,6 +757,12 @@ class SUPEAgent(flax.struct.PyTreeNode):
         # chunk's reward is reward_shift summed with the within-chunk discount.
         gamma_low = float(config['gamma_low'])
         config['offline_min_reward'] = float(config['reward_shift']) * float(sum(gamma_low**i for i in range(k)))
+        if config['aux_schedule'] not in ('fused', 'paper'):
+            raise ValueError(f"aux_schedule must be 'fused' or 'paper', got {config['aux_schedule']!r}")
+        if config['minibatch_split'] not in ('random', 'interleave'):
+            raise ValueError(f"minibatch_split must be 'random' or 'interleave', got {config['minibatch_split']!r}")
+        if config['minibatch_split'] == 'interleave' and float(config['offline_ratio']) != 0.5:
+            raise ValueError('minibatch_split=interleave assumes 50/50 RLPD batches (offline_ratio=0.5, SUPE combine).')
         if int(config['batch_size']) % int(config['critic_updates_per_update']) != 0:
             raise ValueError(
                 f"batch_size={config['batch_size']} must be a multiple of critic_updates_per_update="
@@ -689,16 +778,18 @@ class SUPEAgent(flax.struct.PyTreeNode):
 
         obs_dim = ex_observations.shape[-1]
         ex_obs = jnp.zeros((1, obs_dim), dtype=jnp.float32)
+        # Goal-conditioned: the goal is a full observation (`info['goal']`), so concat(s, g) is 2 x obs_dim.
+        ex_obs_g = jnp.zeros((1, 2 * obs_dim if config['goal_conditioned'] else obs_dim), dtype=jnp.float32)
         ex_u = jnp.zeros((1, skill_dim), dtype=jnp.float32)
         hidden = tuple(config['hidden_dims'])
         critic_def = EnsembleQ(hidden, num_qs=int(config['num_qs']), use_layer_norm=bool(config['critic_layer_norm']))
         network_info = dict(
-            actor=(TanhGaussianActor(hidden, skill_dim), (ex_obs,)),
-            critic=(critic_def, (ex_obs, ex_u)),
-            target_critic=(copy.deepcopy(critic_def), (ex_obs, ex_u)),
+            actor=(TanhGaussianActor(hidden, skill_dim), (ex_obs_g,)),
+            critic=(critic_def, (ex_obs_g, ex_u)),
+            target_critic=(copy.deepcopy(critic_def), (ex_obs_g, ex_u)),
             alpha=(LogParam(init_value=float(config['init_temperature'])), ()),
-            rm_reward=(StateActionMLP(tuple(config['rm_hidden_dims']), 1), (ex_obs, ex_u)),
-            rm_mask=(StateActionMLP(tuple(config['rm_hidden_dims']), 1), (ex_obs, ex_u)),
+            rm_reward=(StateActionMLP(tuple(config['rm_hidden_dims']), 1), (ex_obs_g, ex_u)),
+            rm_mask=(StateActionMLP(tuple(config['rm_hidden_dims']), 1), (ex_obs_g, ex_u)),
             rnd_predictor=(StateActionMLP(tuple(config['rnd_hidden_dims']), int(config['rnd_feature_dim'])), (ex_obs, ex_u)),
             rnd_target=(StateActionMLP(tuple(config['rnd_hidden_dims']), int(config['rnd_feature_dim'])), (ex_obs, ex_u)),
         )
@@ -755,6 +846,9 @@ class SUPEAgent(flax.struct.PyTreeNode):
             f"rows per update, {config['utd_ratio']} updates per macro row; warm-up {config['warmup_env_steps']} env steps "
             f"(prior skills, min_replay_size={config['min_replay_size']} rows); reward model from {config['rm_start_env_steps']}, "
             f"RND from {config['rnd_start_env_steps']} env steps\n"
+            f"[supe] goal_conditioned={config['goal_conditioned']} (actor/critic/reward model on concat(s, g); RND, prior, E' goal-free), "
+            f"aux_schedule={config['aux_schedule']} (paper: RM {config['rm_updates_per_macro']} x {config['rm_batch_size']} online rows and RND on the "
+            f"newest transition, once per macro step), minibatch_split={config['minibatch_split']}\n"
             f"[supe] offline rows: reward={config['offline_relabel']} (min -> {config['offline_min_reward']:.4f}), "
             f"mask=sigmoid(m_hat); RND bonus (coeff {config['rnd_coeff']}) on {rnd_rows} rows"
             + (f"\n[supe] distilled empowerment bonus: add_explore={add_explore}, bonus_scale={config['bonus_scale']}, "
@@ -802,7 +896,11 @@ def get_config():
             # batch_size=5120, critic_updates_per_update=20, utd_ratio=4 (see the module docstring).
             batch_size=1024,  # rows per update() call (= minibatch rows x critic_updates_per_update)
             critic_updates_per_update=1,  # critic minibatch steps per update() call
-            rnd_updates_per_update=1,  # RND predictor minibatch steps per update() call (see the deviations above)
+            rnd_updates_per_update=1,  # RND predictor minibatch steps per update() call (aux_schedule='fused' only)
+            aux_schedule='fused',  # 'fused': RM + RND trained inside update() | 'paper': update_rm / update_rnd once per macro step
+            rm_updates_per_macro=20,  # aux_schedule='paper': RM minibatch steps per macro step (SUPE utd_ratio)
+            rm_batch_size=128,  # aux_schedule='paper': online rows per RM step (SUPE batch_size * (1 - offline_ratio))
+            minibatch_split='random',  # 'random' permutation | 'interleave' (SUPE combine: exact 50/50 per critic minibatch)
             unroll_length=1,  # main_online.py: update every macro row ...
             utd_ratio=ml_collections.config_dict.placeholder(float),  # ... this many update() calls per macro row; None -> k (one per env step)
             min_replay_size=ml_collections.config_dict.placeholder(int),  # rows before the first update; None -> warmup_env_steps / k
@@ -810,6 +908,9 @@ def get_config():
             warmup_env_steps=5000,  # prior-skill warm-up (SUPE start_training)
             rm_start_env_steps=ml_collections.config_dict.placeholder(int),  # reward model trains from here; None -> 2 x warm-up
             rnd_start_env_steps=ml_collections.config_dict.placeholder(int),  # RND predictor trains from here; None -> 2 x warm-up
+            # ── Goal conditioning (multigoal envs; not in the paper) ──
+            goal_conditioned=False,  # actor / critic / reward model on concat(s, g); offline rows get a sampled task goal
+            goal_bank_resets_per_task=16,  # main_online.py: resets per task when collecting goal observations for offline rows
             # ── RLPD / offline pseudo-labels ──
             offline_ratio=0.5,  # share of every batch drawn from the offline buffer (SUPE offline_ratio)
             offline_relabel='min',  # 'min' (SUPE state-based default) | 'pred' (kitchen)

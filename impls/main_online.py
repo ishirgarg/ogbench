@@ -73,7 +73,7 @@ from utils.online_buffer import TrajectoryReplayBuffer
 from utils.online_env import env_horizon, make_online_env
 from utils.online_evaluation import evaluate_online, plot_skill_colored_trajectory, skill_usage_stats
 from utils.online_rollout import example_transition, make_collector
-from utils.rlpd import BufferSource, MixedBatchSampler, make_offline_source
+from utils.rlpd import BufferSource, GoalBankSource, MixedBatchSampler, make_offline_source
 
 FLAGS = flags.FLAGS
 
@@ -206,6 +206,22 @@ def main(_):
             example_transition(config['rollout_type'], example_batch, agent),
             label_seed=FLAGS.seed,
         )
+        if getattr(agent, 'stores_task_goals', False):
+            # Goal-conditioned SUPE: offline rows are paired with task goals drawn from the env's own task list.
+            # A task's goal observation can vary between resets (e.g. the ant's joint pose), so several resets
+            # per task are kept.
+            bank_env = make_online_env(FLAGS.env_name, frame_stack=config['frame_stack'], episode_length=FLAGS.episode_length)
+            num_tasks = int(bank_env.unwrapped.num_tasks)
+            resets = int(agent.config['goal_bank_resets_per_task'])
+            goal_bank = np.stack([
+                np.asarray(bank_env.reset(options=dict(task_id=task_id))[1]['goal'], dtype=np.float32)
+                for task_id in range(1, num_tasks + 1) for _ in range(resets)
+            ])
+            bank_env.close()
+            offline_source = GoalBankSource(
+                offline_source.buffer, offline_source.discount, offline_source.next_offset, goal_bank=goal_bank
+            )
+            print(f'[main_online] goal bank for offline rows: {num_tasks} tasks x {resets} resets -> {goal_bank.shape}')
         mixed_sampler = MixedBatchSampler(online_sampler, offline_source, float(config['offline_ratio']))
         rlpd_end_step = int(round(FLAGS.rlpd_frac_time * FLAGS.total_env_steps))
         if rlpd_end_step > 0:
@@ -295,6 +311,7 @@ def main(_):
     env_steps = 0
     num_updates = 0
     rows_since_update = 0
+    aux_keys = {}  # aux_schedule='paper': metric names of update_rm / update_rnd
     round_infos = defaultdict(list)  # update metrics of the current round(s), averaged at log time (as JaxGCRL)
     episode_stats = defaultdict(list)
     next_log = FLAGS.log_interval
@@ -344,6 +361,27 @@ def main(_):
                 num_updates += 1
                 for name, value in update_info.items():
                     round_infos[name].append(value)
+            # SUPE paper schedule: reward model (rm_updates_per_macro x rm_batch_size ONLINE rows) and RND (the
+            # single newest online transition) once per macro step, each from its own start step.
+            if agent.config.get('aux_schedule') == 'paper':
+                rm_rows = int(agent.config['rm_updates_per_macro']) * int(agent.config['rm_batch_size'])
+                rm_batch = online_sampler.sample(rm_rows)
+                aux_calls = [
+                    ('rm', int(agent.config['rm_start_env_steps']), lambda a: a.update_rm(rm_batch)),
+                    ('rnd', int(agent.config['rnd_start_env_steps']), lambda a: a.update_rnd(collector.last_transition)),
+                ]
+                for name, start, call in aux_calls:
+                    if env_steps >= start:
+                        agent, aux_info = call(agent)
+                        aux_keys[name] = list(aux_info)
+                        for key, value in aux_info.items():
+                            round_infos[key].append(value)
+                    else:
+                        # Not training yet: log zeros so the CSV header (fixed by the first logged row) has the columns.
+                        if name not in aux_keys:
+                            aux_keys[name] = list(jax.eval_shape(call, agent)[1])
+                        for key in aux_keys[name]:
+                            round_infos[key].append(0.0)
 
         # Log metrics. The CSV header is fixed by the first row, so wait for the first
         # update round before logging (otherwise the training/* columns would be lost).

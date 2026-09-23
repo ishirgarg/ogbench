@@ -85,6 +85,19 @@ class BufferSource:
         return self.buffer.sample(batch_size, self.discount, next_offset=self.next_offset)
 
 
+@dataclasses.dataclass
+class GoalBankSource(BufferSource):
+    """An offline source whose sampled rows get `task_goals` drawn uniformly from `goal_bank` [N, goal_dim]
+    (goal-conditioned SUPE: the offline data has no goal, so each row is paired with a random env task goal)."""
+
+    goal_bank: np.ndarray = None
+
+    def sample(self, batch_size):
+        batch = super().sample(batch_size)
+        batch['task_goals'] = self.goal_bank[np.random.randint(len(self.goal_bank), size=batch_size)]
+        return batch
+
+
 class MixedBatchSampler:
     """Exact-ratio mixing of an online and an offline source (RLPD symmetric sampling)."""
 
@@ -300,9 +313,16 @@ def make_offline_macro_source(
     else:
         raise ValueError(f'unknown distill_target {distill_target!r}')
 
+    # Goal-conditioned SUPE: offline rows have no goal; a placeholder is stored and `GoalBankSource` draws a
+    # task goal per sampled row.
+    goal_placeholder = (
+        {'task_goals': np.zeros_like(example_transition['task_goals'])} if 'task_goals' in example_transition else {}
+    )
+
     def row(t, start, marker, observations):
         last = min(t + k - 1, marker - 1)  # last env step inside the window
         return dict(
+            **goal_placeholder,
             observations=observations[t],
             actions=np.asarray(labels[t], dtype=action_dtype),
             rewards=np.float32(0.0),

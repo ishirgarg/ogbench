@@ -63,9 +63,24 @@ SAVE_ROOT=${SAVE_ROOT:-$MAIN_IMPLS/exp/supe_slurm}
 TOTAL_ENV_STEPS=${TOTAL_ENV_STEPS:-1000000}
 RLPD=${RLPD:-1}
 K=${K:-4}
+# PAPER_SCHEDULE=1: SUPE's own update schedule (train_finetuning_supe.py): 4 update() calls per macro step x
+# 20 critic minibatches of 256 rows (exactly half online / half offline) + 1 actor step each, the reward model
+# (20 x 128 online rows) and the RND predictor (the single newest transition) once per macro step, discount
+# 0.995 (every OGBench command in the SUPE README) with the within-chunk reward discount at 0.99 (OPAL's). Explicit UTD_RATIO / CRITIC_UPDATES / MINIBATCH / DISCOUNT win.
+# GOAL_CONDITIONED=1: actor / critic / reward model on concat(s, g) (multigoal envs; agents/supe.py docstring).
+PAPER_SCHEDULE=${PAPER_SCHEDULE:-0}
+GOAL_CONDITIONED=${GOAL_CONDITIONED:-0}
+if [[ "$PAPER_SCHEDULE" == "1" ]]; then
+    UTD_RATIO=${UTD_RATIO:-4}
+    CRITIC_UPDATES=${CRITIC_UPDATES:-20}
+    MINIBATCH=${MINIBATCH:-256}
+    DISCOUNT=${DISCOUNT:-0.995}
+fi
 UTD_RATIO=${UTD_RATIO:-}
 CRITIC_UPDATES=${CRITIC_UPDATES:-1}
 MINIBATCH=${MINIBATCH:-1024}
+LABEL_CHUNK_BYTES=${LABEL_CHUNK_BYTES:-4194304}   # offline-window labelling chunk: 64 MB peaks at ~13 GB of GPU memory
+EXTRA_AGENT_FLAGS=${EXTRA_AGENT_FLAGS:-}
 REWARD_SHIFT=${REWARD_SHIFT:--1.0}
 LOW_TEMPERATURE=${LOW_TEMPERATURE:-1.0}
 USE_RND_OFFLINE=${USE_RND_OFFLINE:-1}
@@ -97,7 +112,7 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export OGBENCH_DATASET_DIR=${OGBENCH_DATASET_DIR:-/nas/ucb/ishirgarg/.ogbench/data}
 
 cd "$IMPLS_DIR"
-source scripts/slurm/supe_cells.sh
+source "${SUPE_CELLS_FILE:-scripts/slurm/supe_cells.sh}"   # SUPE_CELLS_FILE: a machine-local copy (other estimator runs)
 supe_cell "$CELL" || exit 1
 NUM_MIN_QS=${NUM_MIN_QS:-$CELL_NUM_MIN_QS}
 DISCOUNT=${DISCOUNT:-$CELL_DISCOUNT}
@@ -130,14 +145,16 @@ PY
 
 # ── Flags + tag ──
 TAG=supe_rlpd
+[[ "$GOAL_CONDITIONED" == "1" ]] && TAG=supe_gc_rlpd
 RLPD_FLAG=()
 if [[ "$RLPD" == "1" ]]; then
     RLPD_FLAG=(--offline_dataset="$CELL_DATASET")
 else
-    TAG=supe_norlpd
+    TAG=${TAG/_rlpd/_norlpd}
 fi
 if [[ "$USE_RND_OFFLINE" != "1" && "$USE_RND_ONLINE" != "1" ]]; then TAG="${TAG}_nornd"; fi
 if [[ "$K" != "4" ]]; then TAG="${TAG}_k${K}"; fi
+if [[ "$PAPER_SCHEDULE" == "1" ]]; then TAG="${TAG}_paper"; fi
 bool() { [[ "$1" == "1" ]] && echo True || echo False; }
 AGENT_FLAGS=(
     --agent.skill_checkpoint_path="$OPAL_RUN"
@@ -152,8 +169,14 @@ AGENT_FLAGS=(
     --agent.use_rnd_online="$(bool "$USE_RND_ONLINE")"
     --agent.rnd_coeff="$RND_COEFF"
     --agent.offline_relabel="$OFFLINE_RELABEL"
+    --agent.label_chunk_bytes="$LABEL_CHUNK_BYTES"
+    --agent.goal_conditioned="$(bool "$GOAL_CONDITIONED")"
+    $EXTRA_AGENT_FLAGS
 )
 if [[ -n "$UTD_RATIO" ]]; then AGENT_FLAGS+=(--agent.utd_ratio="$UTD_RATIO"); fi
+# gamma_low 0.99: SUPE sums a chunk's rewards (and ds_minr) with the OPAL agent's discount (opal_config 0.99),
+# not the SAC discount (MetaPolicyActionWrapper / ChunkDataset get the OPAL agent).
+if [[ "$PAPER_SCHEDULE" == "1" ]]; then AGENT_FLAGS+=(--agent.aux_schedule=paper --agent.minibatch_split=interleave --agent.gamma_low=0.99); fi
 EMP_CKPT=""
 case "$ADD_EXPLORE" in
     none|"") ;;

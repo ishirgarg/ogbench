@@ -282,6 +282,9 @@ class MacroCollector(_Collector):
         self._low_state_stale = True
         # Integer skill index (the CRL controllers) or a float latent (SUPE), from the buffer's layout.
         self._integer_skills = np.issubdtype(buffer.read_field('actions', []).dtype, np.integer)
+        # Goal-conditioned SUPE: every row also stores the episode's goal observation (`task_goals`).
+        self._store_task_goals = 'task_goals' in buffer._data
+        self.last_transition = None  # newest (s, u) row -- SUPE's per-macro-step RND update (aux_schedule='paper')
         self._reset_episode()
 
     def _reset_episode(self):
@@ -293,7 +296,7 @@ class MacroCollector(_Collector):
     def example_transition(example_batch, agent=None):
         example_skill = getattr(agent, 'example_skill', None)
         actions = np.int32(0) if example_skill is None else np.asarray(example_skill())  # skill index | latent
-        return dict(
+        row = dict(
             observations=example_batch['observations'][0],
             actions=actions,
             rewards=np.float32(0.0),
@@ -301,6 +304,10 @@ class MacroCollector(_Collector):
             terminals=np.float32(0.0),
             **_extra_row_fields(),
         )
+        if getattr(agent, 'stores_task_goals', False):
+            # The env goal is a full observation (`info['goal']`, same layout as `observations`).
+            row['task_goals'] = np.zeros_like(example_batch['observations'][0])
+        return row
 
     def step(self, agent):
         if self._low_state_stale:
@@ -346,16 +353,18 @@ class MacroCollector(_Collector):
                 break
         self.env_steps += env_steps
 
-        abs_idx = self.buffer.add_transition(
-            dict(
-                observations=start_observation,
-                actions=np.int32(skill) if self._integer_skills else skill,
-                rewards=np.float32(macro_return),
-                masks=np.float32(1.0 - float(terminated_any)),
-                terminals=np.float32(done),
-                **self._row_extras(agent),
-            )
+        row = dict(
+            observations=start_observation,
+            actions=np.int32(skill) if self._integer_skills else skill,
+            rewards=np.float32(macro_return),
+            masks=np.float32(1.0 - float(terminated_any)),
+            terminals=np.float32(done),
+            **self._row_extras(agent),
         )
+        if self._store_task_goals:
+            row['task_goals'] = self.goal  # fixed for the whole episode (set in _reset_episode)
+        abs_idx = self.buffer.add_transition(row)
+        self.last_transition = dict(observations=start_observation, actions=row['actions'])
         self._after_add(agent, abs_idx)
 
         episode = None
