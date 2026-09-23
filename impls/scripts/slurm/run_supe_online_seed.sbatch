@@ -154,7 +154,12 @@ else
 fi
 if [[ "$USE_RND_OFFLINE" != "1" && "$USE_RND_ONLINE" != "1" ]]; then TAG="${TAG}_nornd"; fi
 if [[ "$K" != "4" ]]; then TAG="${TAG}_k${K}"; fi
-if [[ "$PAPER_SCHEDULE" == "1" ]]; then TAG="${TAG}_paper"; fi
+# _paper: the paper's schedule throughout; _paperaux: the paper's RM / RND / minibatch / discount schedule with
+# an explicitly overridden critic budget (e.g. the online CRL one: UTD_RATIO=4 CRITIC_UPDATES=1 MINIBATCH=1024).
+if [[ "$PAPER_SCHEDULE" == "1" ]]; then
+    if [[ "$UTD_RATIO" == "4" && "$CRITIC_UPDATES" == "20" && "$MINIBATCH" == "256" ]]; then TAG="${TAG}_paper"
+    else TAG="${TAG}_paperaux_u${UTD_RATIO:-k}c${CRITIC_UPDATES}b${MINIBATCH}"; fi
+fi
 bool() { [[ "$1" == "1" ]] && echo True || echo False; }
 AGENT_FLAGS=(
     --agent.skill_checkpoint_path="$OPAL_RUN"
