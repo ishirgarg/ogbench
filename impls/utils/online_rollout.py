@@ -23,6 +23,10 @@ into a `TrajectoryReplayBuffer`:
     `distill_target_ready` flag: the target is only known once the episode has ended, so rows are
     written NaN / 0 and the first `flush_empowerment` after the episode closes fills the whole
     episode and sets the flag. Other agents store 0 / 0 and never read them.
+    For an agent with the RND bonus (`uses_rnd`) the collector also remembers every row
+    it wrote (marker rows included) and `flush_rnd(agent)` feeds those states, in visit
+    order, to the agent's running RND statistics (`agent.rnd_update_stats`), returning
+    the updated agent; `main_online.py` runs it before every update round too.
   * `MacroCollector`  -- one SMDP macro-step per row: the high-level agent picks a
     skill z, which the frozen low-level policy executes for `k` env steps (or
     until the episode ends). The row is (s_t, z, R, mask, done) with
@@ -41,6 +45,7 @@ Which collector an agent needs is declared by its config (`rollout_type`).
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from utils.evaluation import env_horizon
@@ -77,6 +82,8 @@ class FlatCollector:
         self.tracker = _EpisodeTracker()
         self._pending_empowerment = []  # abs indices of rows whose `empowerment` is still the NaN placeholder
         self._pending_first = []  # parallel to the above: does the row start a new episode?
+        self._pending_rnd = []  # abs indices (rows + marker rows) not yet fed to the agent's RND running stats
+        self._pending_rnd_first = []  # parallel: is the row an episode's reset state (not any transition's s')?
         self._episode_first_row = True  # the next row written starts a new episode
         self._episode_start_abs = None  # abs index of the current episode's first row (distilled bonus only)
         self._closed_episodes = []  # (first row abs, marker abs) of episodes closed since the last flush
@@ -170,6 +177,39 @@ class FlatCollector:
                 target = np.maximum.accumulate(values[::-1])[::-1][1:]  # [t] = max(values[t + 1:])
             self.buffer.write_field('distill_target', rows[:-1], target.astype(np.float32))
             self.buffer.write_field('distill_target_ready', rows[:-1], np.ones(len(rows) - 1, dtype=np.float32))
+    RND_CHUNK = 128  # states per `rnd_update_stats` call (padded to one jit shape)
+
+    def flush_rnd(self, agent):
+        """Advance the agent's RND running stats with every state visited since the last flush.
+
+        The pending rows (transitions plus the marker rows that close episodes) are
+        contiguous and in write order, so their `observations` are the visited states in
+        temporal order. An episode's first row is its reset state, not any transition's
+        landing state s', so it feeds the observation stats but not the intrinsic-reward
+        stream. Returns `(agent, info)`; a no-op `(agent, {})` when nothing is pending.
+        """
+        if not self._pending_rnd:
+            return agent, {}
+        abs_idxs = np.asarray(self._pending_rnd, dtype=np.int64)
+        is_next = 1.0 - np.asarray(self._pending_rnd_first, dtype=np.float32)
+        self._pending_rnd = []
+        self._pending_rnd_first = []
+        observations = self.buffer.read_field('observations', abs_idxs)
+
+        chunk = self.RND_CHUNK
+        info = {}
+        for start in range(0, len(abs_idxs), chunk):
+            obs = observations[start : start + chunk]
+            nxt = is_next[start : start + chunk]
+            n = len(obs)
+            valid = np.ones((n,), dtype=np.float32)
+            if n < chunk:
+                pad = chunk - n
+                obs = np.concatenate([obs, np.zeros((pad,) + obs.shape[1:], dtype=obs.dtype)], axis=0)
+                nxt = np.concatenate([nxt, np.zeros((pad,), dtype=np.float32)], axis=0)
+                valid = np.concatenate([valid, np.zeros((pad,), dtype=np.float32)], axis=0)
+            agent, info = agent.rnd_update_stats(jnp.asarray(obs), jnp.asarray(nxt), jnp.asarray(valid))
+        return agent, {k: float(np.asarray(v)) for k, v in info.items()}
 
     def step(self, agent):
         self.rng, key = jax.random.split(self.rng)
@@ -184,6 +224,8 @@ class FlatCollector:
 
         uses_empowerment = bool(getattr(agent, 'uses_empowerment', False))
         uses_distill = bool(getattr(agent, 'uses_distill_bonus', False))
+        uses_rnd = bool(getattr(agent, 'uses_rnd', False))
+        first_row = self._episode_first_row
         abs_idx = self.buffer.add_transition(
             dict(
                 observations=self.observation,
@@ -206,6 +248,10 @@ class FlatCollector:
             self._episode_start_abs = abs_idx
         if uses_empowerment:
             self._mark_pending(abs_idx)
+        if uses_rnd:
+            self._pending_rnd.append(abs_idx)
+            self._pending_rnd_first.append(first_row)
+        self._episode_first_row = False
         self.observation = next_observation
 
         episode = None
@@ -221,6 +267,10 @@ class FlatCollector:
             if uses_distill:
                 self._closed_episodes.append((self._episode_start_abs, end_abs))
                 self._episode_start_abs = None
+            if uses_rnd:
+                # The final observation is the last transition's landing state s'.
+                self._pending_rnd.append(end_abs)
+                self._pending_rnd_first.append(False)
             episode = self.tracker.summary()
             self._reset_episode()
         return dict(env_steps=1, rows=1, episode=episode)
@@ -249,6 +299,10 @@ class MacroCollector:
     def flush_empowerment(self, agent):
         """Macro rows carry no empowerment field (the flat agent's entropy bonus only); nothing to fill."""
         return 0
+
+    def flush_rnd(self, agent):
+        """The RND bonus is the flat agent's only; nothing to feed."""
+        return agent, {}
 
     def _reset_episode(self):
         observation, info = self.env.reset()

@@ -46,6 +46,10 @@ regressed onto the max of E over each row's trajectory (`agent.distill_target`: 
 trajectory by default, or only the states after the row) and added straight to the
 actor loss (online rows only / online + RLPD rows); the collector fills an online row's
 target when its episode closes, RLPD rows get theirs at load time.
+With `--agent.explore_reward=rnd` (random network distillation, no estimator) the same
+Q_x is fed the RND intrinsic reward instead; before every update round the collector hands
+the states visited since the last round to the agent's running RND statistics
+(`collector.flush_rnd`, which returns the updated agent), logged under `training/rnd_stream/*`.
 """
 
 import json
@@ -324,6 +328,12 @@ def main(_):
             collector.flush_empowerment(agent)
             if getattr(agent, 'uses_empowerment', False) and not agent.config['emp_stats_ready']:
                 agent = finalise_empowerment_stats(agent)
+            if getattr(agent, 'uses_rnd', False):
+                # RND running obs / return stats absorb the states visited since the last round
+                # (the first call seeds them from the warm-up rows, the paper's random-agent init).
+                agent, rnd_info = collector.flush_rnd(agent)
+                for name, value in rnd_info.items():
+                    round_infos[f'rnd_stream/{name}'].append(value)
             for _ in range(updates_per_round):
                 batch = sampler.sample(batch_size)
                 # env_steps only matters to online_crl's exploration-bonus annealing
