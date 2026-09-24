@@ -143,6 +143,36 @@ register(
     ),
 )
 
+# Two cubes, the SAME fixed starts as cube-double-center-v0 (cube 0 at (0.325, -0.15), cube 1 at
+# (0.325, 0.15)), 4 goals each, and the cubes do NOT just stay on their own side: two of each
+# cube's goals are across the centre line (y = 0) on the other cube's half. Cube 0's set is
+#   (0.525, -0.15)  own side, straight ahead        (0.425, -0.25)  own side, outer edge
+#   (0.425,  0.05)  across the line, near           (0.525,  0.25)  far opposite corner
+# and cube 1's set is the mirror image (y -> -y). Tasks are the product: 4 x 4 = 16 goal pairs
+# (4 with both cubes home, 8 with one crossing, 4 with both swapping sides), one drawn at random
+# per eval episode; success needs both cubes on target. Every cross-cube goal pair is >= 0.1 m
+# apart (success radius 0.04 m, cube edge 0.04 m) and no goal is within 0.14 m of the OTHER
+# cube's start, so no pair collides and no cube has to be moved out of the way first.
+_CUBE_DOUBLE_MULTIGOAL_XY0 = ((0.525, -0.15), (0.425, -0.25), (0.425, 0.05), (0.525, 0.25))
+register(
+    id='cube-double-multigoal-v0',
+    entry_point='ogbench.manipspace.envs.cube_env:CubeEnv',
+    max_episode_steps=500,
+    kwargs=dict(
+        env_type='double',
+        tasks=[
+            dict(
+                task_name=f'goal0_x{gx0}_y{gy0}_goal1_x{gx1}_y{gy1}',
+                init_xyzs=[[0.325, -0.15, 0.02], [0.325, 0.15, 0.02]],
+                goal_xyzs=[[gx0, gy0, 0.02], [gx1, gy1, 0.02]],
+            )
+            for gx0, gy0 in _CUBE_DOUBLE_MULTIGOAL_XY0
+            for gx1, gy1 in ((x, -y) for x, y in _CUBE_DOUBLE_MULTIGOAL_XY0)
+        ],
+        **cube_online_dict,
+    ),
+)
+
 register(
     id='scene-v0',
     entry_point='ogbench.manipspace.envs.scene_env:SceneEnv',
